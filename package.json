@@ -1,0 +1,28 @@
+{
+  "name": "codex-multi-agent-delegation-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A small, safe delegation hub for local AI coding agents.",
+  "bin": {
+    "agent-hub": "./dist/cli.js",
+    "agent-hub-mcp": "./dist/mcp.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "delegate": "tsx src/cli.ts",
+    "mcp": "tsx src/mcp.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "tsx": "^4.20.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
+  }
+}
