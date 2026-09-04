@@ -76,6 +76,9 @@ describe("execution safety", () => {
 
       expect(result.status).toBe("success");
       expect(result.changed_files).toContain("isolated.txt");
+      expect(result.diff).toContain("isolated.txt");
+      expect(result.diff).toContain("+isolated");
+      expect(await runGit(repository, ["diff", "--cached", "--name-only"])).toBe("");
       await expect(access(join(repository, "isolated.txt"))).rejects.toThrow();
       await expect(access(result.execution_workspace)).rejects.toThrow();
       expect(await worktreeCount(repository)).toBe(1);
@@ -97,6 +100,24 @@ describe("execution safety", () => {
       expect(result.error?.code).toBe("AGENT_FAILED");
       expect(await worktreeCount(repository)).toBe(1);
       await expect(readFile(join(repository, "failed.txt"))).rejects.toThrow();
+    } finally {
+      await removeDirectory(repository);
+    }
+  });
+
+  it("captures tracked modifications in the returned patch", async () => {
+    const repository = await createGitRepository();
+
+    try {
+      const result = await delegate(
+        { task: "change tracked file", agent: "fake", mode: "isolated", workspace: repository },
+        { resolveAdapter: () => changingAdapter("README.md", "updated\n") },
+      );
+
+      expect(result.status).toBe("success");
+      expect(result.changed_files).toContain("README.md");
+      expect(result.diff).toContain("README.md");
+      expect(result.diff).toContain("+updated");
     } finally {
       await removeDirectory(repository);
     }

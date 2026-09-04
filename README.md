@@ -39,7 +39,9 @@ removed on both success and failure.
 
 `direct` runs in the caller's checkout and leaves the agent's edits there. Both
 modes reject a dirty repository by default. Pass `--allow-dirty` only when the
-existing changes are intentional and should remain in the result.
+existing changes are intentional. In direct mode they remain part of the
+result; isolated mode still starts from committed `HEAD`, so caller-local
+changes are left untouched and are not carried into the isolated result.
 
 ## MCP server
 

@@ -19,8 +19,13 @@ export interface TemporaryWorktree {
   revision: string;
 }
 
-async function runGit(cwd: string, args: string[], maxOutputBytes = GIT_OUTPUT_LIMIT) {
-  const result = await runProcess("git", args, { cwd, maxOutputBytes });
+async function runGit(
+  cwd: string,
+  args: string[],
+  maxOutputBytes = GIT_OUTPUT_LIMIT,
+  environment: NodeJS.ProcessEnv = process.env,
+) {
+  const result = await runProcess("git", args, { cwd, env: environment, maxOutputBytes });
   if (result.error || result.exitCode !== 0) {
     const detail = result.error ?? (result.stderr.trim() || `exit code ${result.exitCode}`);
     throw new AgentHubError("GIT_COMMAND_FAILED", `git ${args.join(" ")} failed: ${detail}`);
@@ -78,7 +83,23 @@ export async function gitSnapshot(cwd: string, maxOutputBytes = GIT_OUTPUT_LIMIT
     ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
     maxOutputBytes,
   );
-  const diff = await runGit(cwd, ["diff", "--binary", "HEAD", "--"], maxOutputBytes);
+  const indexDirectory = await mkdtemp(join(tmpdir(), "agent-hub-index-"));
+  const indexPath = join(indexDirectory, "index");
+  const temporaryIndexEnvironment = { ...process.env, GIT_INDEX_FILE: indexPath };
+  let diff;
+
+  try {
+    await runGit(cwd, ["read-tree", "HEAD"], maxOutputBytes, temporaryIndexEnvironment);
+    await runGit(cwd, ["add", "-A", "--", "."], maxOutputBytes, temporaryIndexEnvironment);
+    diff = await runGit(
+      cwd,
+      ["diff", "--cached", "--binary", "--no-ext-diff", "--"],
+      maxOutputBytes,
+      temporaryIndexEnvironment,
+    );
+  } finally {
+    await rm(indexDirectory, { recursive: true, force: true });
+  }
 
   return {
     changedFiles: parseChangedFiles(status.stdout),
