@@ -136,3 +136,51 @@ Continuation rules:
 
 The hub still does not merge plain `delegate` or `fanout` output on its own —
 adoption only ever happens through an explicit opt-in step you control.
+
+## Live sessions (v3, additive)
+
+When one agent should work interactively over many turns — steering mid-run,
+answering its permission requests, or cancelling a turn — use the live
+surface instead of one-shot delegation:
+
+```sh
+agent-hub live --agent <omp|agy|pi|hermes> --workspace "$PWD"
+agent-hub live --resume <hub-live-id> --workspace "$PWD"
+agent-hub live probe --agent <omp|agy|pi|hermes>
+```
+
+- The live vocabulary is `omp, agy, pi, hermes` and it is separate: `pi` and
+  `hermes` are live-only and stay rejected by `delegate`, `fanout`, and
+  `session`; `grok` is legacy-only and is not a live provider.
+- `live` is a long-lived NDJSON conversation, not a flag-per-turn command:
+  write one Hub command per line to stdin (`prompt` once, then `follow_up`
+  or `steer`, `cancel`, `status`, `permission_response`, `close`), read
+  `{type:"session"|"event"|"result"|"error"|"close"}` documents on stdout,
+  and treat stderr as human diagnostics. Closing stdin ends the session
+  gracefully. The MCP tools `live_session_start` / `_resume` / `_command` /
+  `_events` / `_close` are the same surface for tool-using clients.
+- Trust the capability report, not hope: commands are gated against the
+  transport's launch snapshot. An `outcome: "unsupported"` result with a
+  `stage: "capability"` error means the hub refused the command and nothing
+  reached the provider — do not retry it expecting a different result;
+  choose a different flow (e.g. a fresh `follow_up` at the next idle
+  boundary when only `steer` is unsupported).
+- Consume events by cursor (`live_session_events`) instead of assuming
+  delivery: `next_cursor` advances over per-session seqs with no gaps, and
+  `dropped: true` says the ring buffer already evicted past your cursor —
+  re-read from `earliest_seq` or take `status`.
+- A `cancelled` turn result means the hub stopped the provider before the
+  turn concluded (close or cancel): partial work may exist; it is not a
+  provider crash and not a success. An `orphaned` close means the hub could
+  not prove the process died — inspect before starting a sibling session.
+- Resume honesty: `--resume` needs the durable live-state store; until that
+  package is wired it fails with `LIVE_STATE_UNAVAILABLE`. Likewise a
+  provider with no registered transport fails `LIVE_TRANSPORT_UNAVAILABLE`
+  — the hub never guesses a command line. `probe` answers what is actually
+  installed; a not-found probe exits `1` as honest data.
+- Live sessions are process-local and transient by contract: hub live state
+  stores only the metadata record (no task text, transcripts, or event
+  bodies), and checkpoint pinning belongs to the durable package. Do not
+  plan a continuation from hub memory — inspect the workspace itself, as
+  with every isolated run, and run the relevant tests before accepting the
+  work.

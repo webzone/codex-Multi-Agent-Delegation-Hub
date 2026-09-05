@@ -468,3 +468,53 @@ describe("MCP server", () => {
     expect(document.competition).toBeUndefined();
   });
 });
+
+describe("live/legacy agent vocabulary (v3 additive)", () => {
+  it("pins legacy agent enums to omp|agy|grok and the live enum to omp|agy|pi|hermes", async () => {
+    const client = await connectClient();
+    const { tools } = await client.listTools();
+
+    function enumOf(toolName: string, property: string): string[] {
+      const tool = tools.find((entry) => entry.name === toolName);
+      const schema = tool?.inputSchema as
+        | { properties?: Record<string, { enum?: string[]; items?: { properties?: Record<string, { enum?: string[] }> } }> }
+        | undefined;
+      const target = schema?.properties?.[property];
+      return target?.enum ?? target?.items?.properties?.agent?.enum ?? [];
+    }
+
+    expect(enumOf("delegate_task", "agent")).toEqual(["omp", "agy", "grok"]);
+    expect(enumOf("fanout_candidates", "candidates")).toEqual(["omp", "agy", "grok"]);
+    expect(enumOf("compete_candidates", "judge_agent")).toEqual(["omp", "agy", "grok"]);
+    expect(enumOf("session_create", "agent")).toEqual(["omp", "agy", "grok"]);
+    expect(enumOf("live_session_start", "agent")).toEqual(["omp", "agy", "pi", "hermes"]);
+  });
+
+  it("refuses v3-only providers on legacy tools and grok on the live tool", async () => {
+    const client = await connectClient();
+
+    const piDelegate = await client.callTool({
+      name: "delegate_task",
+      arguments: { task: "x", agent: "pi" },
+    });
+    expect(piDelegate.isError).toBe(true);
+    expect((piDelegate.content as Array<{ text: string }>)[0]?.text).toContain(
+      'one of "omp"|"agy"|"grok"',
+    );
+
+    const hermesSession = await client.callTool({
+      name: "session_create",
+      arguments: { workspace: "/tmp/not-a-repo", agent: "hermes", task: "x" },
+    });
+    expect(hermesSession.isError).toBe(true);
+
+    const grokLive = await client.callTool({
+      name: "live_session_start",
+      arguments: { agent: "grok", workspace: "/tmp" },
+    });
+    expect(grokLive.isError).toBe(true);
+    expect((grokLive.content as Array<{ text: string }>)[0]?.text).toContain(
+      'one of "omp"|"agy"|"pi"|"hermes"',
+    );
+  });
+});

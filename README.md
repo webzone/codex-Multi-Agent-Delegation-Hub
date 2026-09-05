@@ -5,7 +5,9 @@ coding agents. Execution models are deliberately small: OMP, AGY, and Grok are
 replaceable command adapters, v1 tasks run either in the current checkout
 (`direct`) or in a temporary Git worktree (`isolated`), and v2 adds bounded
 fan-out, judged competition, resumable sessions, and strictly opt-in
-auto-merge.
+auto-merge. v3 adds additive live surfaces: long-lived interactive sessions
+(CLI `agent-hub live`, MCP `live_session_*`) for `omp`, `agy`, `pi`, and
+`hermes`, with a capability-honesty gate; no v1/v2 behavior changes.
 
 ## Requirements
 
@@ -145,6 +147,43 @@ when an adapter explicitly verifies its command syntax. Competition is a
 separate fan-out operation, available through `fanout --judge` or the MCP
 `compete_candidates` tool.
 
+### live sessions (v3 — additive)
+
+A live session is a long-lived interactive provider run driven over the hub
+wire, not a one-shot delegation:
+
+```sh
+npx agent-hub live --agent pi --workspace /path/to/worktree
+npx agent-hub live --resume <hub-live-id> --workspace /path/to/worktree
+npx agent-hub live probe --agent hermes
+```
+
+`live` reads one Hub NDJSON command per line on stdin —
+`prompt`, `follow_up`, `steer`, `cancel`, `status`, `permission_response`,
+and `close` (`{"action":"prompt","text":"..."}`,
+`{"action":"permission_response","request_id":"...","decision":"allow_once|allow_session|deny"}`,
+etc.) — writes normalized NDJSON documents on stdout
+(`{type:"session"|"event"|"result"|"error"|"close"}`), and keeps human
+diagnostics on stderr. Stdin EOF closes the session gracefully. Exit codes:
+`0` clean, `1` structured failure (launch refusal, a failed result, or an
+orphaned end), `2` usage error.
+
+Live providers are `omp, agy, pi, hermes` — this vocabulary is separate from
+the legacy `omp, agy, grok`: `pi` and `hermes` stay rejected by
+`delegate`/`fanout`/`session`, and `grok` is not a live provider. Every
+command is gated against the transport's launch capability snapshot: a
+command whose claim is `unsupported` comes back `outcome: "unsupported"`
+with a `stage: "capability"` error and is never delivered; claims short of
+`unsupported` must carry evidence or the transport is refused at launch.
+Turn results report `cancelled` when the hub stopped the provider mid-turn —
+an intentional exit never masquerades as `succeeded`.
+
+Seams, by design, until the other live packages land: transport factories
+register through `registerLiveTransport()` (an unregistered provider fails
+with `LIVE_TRANSPORT_UNAVAILABLE`, never a guessed command line), and
+`--resume` reads durable live state through `setLiveResumeSource()` (until
+wired, it fails with `LIVE_STATE_UNAVAILABLE`, never a fake continuation).
+
 ## MCP server
 
 Start the stdio server after building:
@@ -156,6 +195,11 @@ npx agent-hub-mcp
 It exposes `delegate_task` (schema and behavior unchanged from v1) plus the
 additive v2 tools `fanout_candidates`, `compete_candidates`, `session_create`,
 and `session_resume`. `compete_candidates.auto_merge` defaults to `false`.
+The additive v3 live tools — `live_session_start`, `live_session_resume`,
+`live_session_command` (the six hub actions), `live_session_events` (poll
+with a cursor, honest about ring-buffer eviction), and `live_session_close` —
+run on a process-local manager; `live_session_command` reports capability
+refusals as `outcome: "unsupported"` with `isError`, never as a delivery.
 Every tool returns structured JSON content with `isError`; a failing operation
 comes back as `{ error: { code, message } }` and never escapes as a
 transport-level exception — and when the failing `compete_candidates` operation
@@ -289,6 +333,19 @@ Sessions/continuation:
   all-zero OID at the repository's own hash width, derived from the commit being
   written rather than hard-coded, so sessions work on SHA-1 and SHA-256
   repositories alike.
+
+v3 live surfaces (additive; v1/v2 guarantees above are untouched):
+
+- Live sessions are process-local: the hub keeps events only in a bounded
+  ring per session (cursor polls report evictions), and the durable
+  `LiveSessionState` record type admits no task text, transcripts, or event
+  bodies by construction.
+- Capability claims are enforced at the boundary: a launch whose transport
+  claims `native`-class support without evidence is refused, and every
+  refused command names `stage: "capability"` instead of vanishing.
+- Shutdown honesty: `closed` is reported only with proof the provider
+  process is gone; a still-unproven end is `orphaned` (CLI exit `1`, MCP
+  `isError`) and an in-flight turn reports `cancelled`, not `succeeded`.
 
 Not in scope for v2: queued workflows, remote providers, or cross-repository
 merges.

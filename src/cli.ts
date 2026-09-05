@@ -6,6 +6,13 @@ import { fanOut, FANOUT_MAX_CANDIDATES } from "./fanout.js";
 import { autoMerge } from "./merge.js";
 import { releaseFanOutArtifactRefs } from "./artifacts.js";
 import { createSession, resumeSession } from "./session.js";
+import {
+  isLiveProvider,
+  iterateLiveCommands,
+  probeLiveAgent,
+  runLiveSession,
+  supportedLiveAgents,
+} from "./live/index.js";
 import { asDelegateError } from "./errors.js";
 import { supportedAgents } from "./adapters/index.js";
 import type {
@@ -18,6 +25,7 @@ import type {
   MergeOutcome,
 } from "./types.js";
 import type { CreateSessionRequest, ResumeSessionRequest } from "./session.js";
+import type { LiveProviderId } from "./live/types.js";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -26,6 +34,9 @@ const usage = `Usage:
   agent-hub fanout --agent <a> [--agent <a>...] --task "<text>" [--task "<text>"...] [options]
   agent-hub session create --agent <a> --task "<text>" [options]
   agent-hub session resume <session-id> --task "<text>" [options]
+  agent-hub live --agent <omp|agy|pi|hermes> [--workspace <path>] [options]
+  agent-hub live --resume <hub-live-id> [--workspace <path>] [options]
+  agent-hub live probe --agent <omp|agy|pi|hermes>
 
 Options:
   --workspace <path>   Workspace to operate on (default: current directory)
@@ -48,6 +59,18 @@ Fan-out options (fanout):
 Session options (session create/resume):
   --task "<text>"      Required agent turn; resume requires a new task
   --agent <a>          Agent for session create
+
+Live session (v3, live):
+  --agent <p>          Live provider (omp, agy, pi, hermes); pi/hermes are
+                       live-only and stay rejected by delegate/fanout/session
+  --resume <id>        Continue a durable live session (hub-live-id)
+  stdin: one Hub NDJSON command per line:
+    {"action":"prompt"|"follow_up"|"steer","text":"..."} |
+    {"action":"cancel","reason":"..."} | {"action":"status"} |
+    {"action":"permission_response","request_id":"...","decision":"allow_once|allow_session|deny","note":null} |
+    {"action":"close","terminate":false}
+  stdout: NDJSON — {type:"session"|"event"|"result"|"error"|"close"} documents
+  stderr: human-readable diagnostics
 
 Exit codes: 0 success, 1 structured operation failure (JSON on stdout),
 2 parse or usage error (message plus usage on stderr).
@@ -81,6 +104,21 @@ export interface SessionResumeInvocation {
   request: ResumeSessionRequest;
 }
 
+export interface LiveSessionInvocation {
+  kind: "live";
+  request: {
+    agent: LiveProviderId | null;
+    resumeId: string | null;
+    workspace: string;
+    maxTextBytes: number | undefined;
+  };
+}
+
+export interface LiveProbeInvocation {
+  kind: "live-probe";
+  agent: LiveProviderId;
+}
+
 export interface HelpInvocation {
   kind: "help";
 }
@@ -90,6 +128,8 @@ export type CliInvocation =
   | FanoutInvocation
   | SessionCreateInvocation
   | SessionResumeInvocation
+  | LiveSessionInvocation
+  | LiveProbeInvocation
   | HelpInvocation;
 
 function requireValue(argv: string[], index: number, option: string): string {
@@ -190,6 +230,100 @@ function assertSupportedAgent(agent: string, option: string): void {
   if (!(supportedAgents as readonly string[]).includes(agent)) {
     throw new Error(`${option} must be one of: ${supportedAgents.join(", ")}`);
   }
+}
+
+function assertLiveAgent(agent: string, option: string): asserts agent is LiveProviderId {
+  if (!isLiveProvider(agent)) {
+    throw new Error(`${option} must be one of: ${supportedLiveAgents.join(", ")}`);
+  }
+}
+
+/** Grammar for the long-lived live session commands (v3, additive). */
+function parseLiveArgs(args: string[]): LiveSessionInvocation["request"] {
+  let agent: LiveProviderId | null = null;
+  let resumeId: string | null = null;
+  let workspace = process.cwd();
+  let maxTextBytes: number | undefined;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    switch (argument) {
+      case "--agent":
+        if (agent !== null) {
+          throw new Error("--agent may be specified only once for a live session");
+        }
+        {
+          const value = requireValue(args, index, argument);
+          assertLiveAgent(value, argument);
+          agent = value;
+        }
+        index += 1;
+        break;
+      case "--resume":
+        if (resumeId !== null) {
+          throw new Error("--resume may be specified only once for a live session");
+        }
+        resumeId = requireValue(args, index, argument);
+        index += 1;
+        break;
+      case "--workspace":
+        workspace = requireValue(args, index, argument);
+        index += 1;
+        break;
+      case "--max-output-bytes": {
+        const value = requireValue(args, index, argument);
+        maxTextBytes = Number(value);
+        if (!Number.isInteger(maxTextBytes) || maxTextBytes < 1) {
+          throw new Error("--max-output-bytes must be a positive integer");
+        }
+        index += 1;
+        break;
+      }
+      case "--json":
+        break;
+      default:
+        if (argument.startsWith("--")) {
+          throw new Error(`Unknown option: ${argument}`);
+        }
+        throw new Error(`unexpected argument "${argument}"; live commands take no positional text`);
+    }
+  }
+
+  if (agent === null && resumeId === null) {
+    throw new Error(
+      `live requires --agent <${supportedLiveAgents.join("|")}> or --resume <hub-live-id>`,
+    );
+  }
+  if (agent !== null && resumeId !== null) {
+    throw new Error("live accepts either --agent or --resume, not both");
+  }
+  return { agent, resumeId, workspace, maxTextBytes };
+}
+
+/** Grammar for `agent-hub live probe --agent <provider>`. */
+function parseLiveProbeArgs(args: string[]): LiveProviderId {
+  let agent = "";
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    switch (argument) {
+      case "--agent":
+        if (agent) {
+          throw new Error("--agent may be specified only once for a live probe");
+        }
+        agent = requireValue(args, index, argument);
+        index += 1;
+        break;
+      case "--json":
+        break;
+      default:
+        throw new Error(`live probe accepts only --agent, got "${argument}"`);
+    }
+  }
+  if (!agent) {
+    throw new Error(`live probe requires --agent (${supportedLiveAgents.join(", ")})`);
+  }
+  assertLiveAgent(agent, "--agent");
+  return agent;
 }
 
 interface FanoutParse {
@@ -446,6 +580,15 @@ export function parseCliCommand(argv: string[]): CliInvocation {
 
     throw new Error(`session requires "create" or "resume", got "${action ?? ""}"`);
   }
+  if (command === "live") {
+    if (argv.includes("--help")) {
+      return { kind: "help" };
+    }
+    if (argv[1] === "probe") {
+      return { kind: "live-probe", agent: parseLiveProbeArgs(argv.slice(2)) };
+    }
+    return { kind: "live", request: parseLiveArgs(argv.slice(1)) };
+  }
 
   if (command === "compete") {
     throw new Error("compete is not a persisted-session command; use fanout with --judge");
@@ -475,7 +618,7 @@ export async function runCli(
   }
 
   try {
-    return await execute(invocation, output.stdout);
+    return await execute(invocation, output);
   } catch (error) {
     const failure = asDelegateError(error);
     output.stdout(`${JSON.stringify({ error: failure }, null, 2)}\n`);
@@ -485,8 +628,9 @@ export async function runCli(
 
 async function execute(
   invocation: Exclude<CliInvocation, HelpInvocation>,
-  emitLine: (value: string) => void,
+  output: { stdout: (value: string) => void; stderr: (value: string) => void },
 ): Promise<number> {
+  const emitLine = output.stdout;
   const emit = (document: unknown) => emitLine(`${JSON.stringify(document, null, 2)}\n`);
 
   switch (invocation.kind) {
@@ -584,6 +728,29 @@ async function execute(
       const session = await resumeSession(invocation.request);
       emit(session);
       return session.run.status === "success" && session.cleanup_error === null ? 0 : 1;
+    }
+
+    case "live-probe": {
+      const document = await probeLiveAgent(invocation.agent);
+      emit(document);
+      // Not-found is honest data, but operationally it is a failed probe.
+      return document.found ? 0 : 1;
+    }
+
+    case "live": {
+      return await runLiveSession(
+        {
+          provider: invocation.request.agent,
+          resumeId: invocation.request.resumeId,
+          workspace: invocation.request.workspace,
+          maxTextBytes: invocation.request.maxTextBytes,
+        },
+        {
+          stdin: iterateLiveCommands(process.stdin as AsyncIterable<unknown>),
+          stdout: (document) => output.stdout(`${JSON.stringify(document)}\n`),
+          stderr: output.stderr,
+        },
+      );
     }
   }
 }

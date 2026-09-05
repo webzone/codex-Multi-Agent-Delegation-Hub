@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { parseCliArgs, parseCliCommand, runCli } from "../src/cli.js";
+import { supportedAgents } from "../src/adapters/index.js";
 import { FANOUT_MAX_CANDIDATES } from "../src/fanout.js";
 import {
   BLOCKED_WRITE_IS_MEANINGFUL,
@@ -609,5 +610,48 @@ describe("CLI", () => {
         await removeDirectory(repository);
       }
     });
+  });
+});
+
+describe("legacy agent vocabulary (unchanged by v3 live surfaces)", () => {
+  it("keeps supportedAgents exactly omp, agy, grok", () => {
+    expect(supportedAgents).toEqual(["omp", "agy", "grok"]);
+  });
+  it("rejects pi and hermes at parse time on fanout and session", async () => {
+    const cases: string[][] = [
+      ["fanout", "--agent", "pi", "--task", "task"],
+      ["fanout", "--agent", "omp", "--task", "task", "--judge", "hermes"],
+      ["session", "create", "--agent", "hermes", "--task", "task", "--workspace", "/tmp"],
+    ];
+
+    for (const argv of cases) {
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const exitCode = await runCli(argv, {
+        stdout: (value) => stdout.push(value),
+        stderr: (value) => stderr.push(value),
+      });
+
+      expect(`${argv.join(" ")} → ${exitCode}`).toBe(`${argv.join(" ")} → 2`);
+      expect(stderr.join("")).toContain("must be one of: omp, agy, grok");
+      expect(stdout).toEqual([]);
+    }
+  });
+
+  it("rejects pi and hermes at execution time on the delegate path", async () => {
+    for (const agent of ["pi", "hermes"]) {
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const exitCode = await runCli(
+        ["delegate", "--agent", agent, "--mode", "isolated", "--workspace", "/tmp", "task"],
+        { stdout: (value) => stdout.push(value), stderr: (value) => stderr.push(value) },
+      );
+
+      expect(exitCode).toBe(1);
+      const document = JSON.parse(stdout.join(""));
+      expect(document.error).toMatchObject({ code: "UNKNOWN_AGENT" });
+      expect(document.error.message).toContain("Choose one of: omp, agy, grok");
+      expect(stderr).toEqual([]);
+    }
   });
 });

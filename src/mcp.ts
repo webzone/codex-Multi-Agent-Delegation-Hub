@@ -12,6 +12,12 @@ import { releaseFanOutArtifactRefs } from "./artifacts.js";
 import { createSession, resumeSession } from "./session.js";
 import { asDelegateError } from "./errors.js";
 import { supportedAgents } from "./adapters/index.js";
+import {
+  getLiveResumeSource,
+  LiveSessionManager,
+  supportedLiveAgents,
+} from "./live/index.js";
+import type { LiveResumeSource } from "./live/index.js";
 import type { DelegateError, MergeOutcome } from "./types.js";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -66,6 +72,13 @@ export interface HubToolDependencies {
   runCompetition?: typeof runCompetition;
   autoMerge?: typeof autoMerge;
   releaseRefs?: typeof releaseFanOutArtifactRefs;
+  /**
+   * v3 live surfaces: the process-local manager and the durable-state seam.
+   * By default each server owns its own process-local manager; focused
+   * tests inject an isolated manager wired to a scripted transport registry.
+   */
+  live?: LiveSessionManager;
+  liveResumeSource?: LiveResumeSource;
 }
 
 export function createHubServer(dependencies: HubToolDependencies = {}): McpServer {
@@ -73,6 +86,10 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
   const runCompetitionFn = dependencies.runCompetition ?? runCompetition;
   const autoMergeFn = dependencies.autoMerge ?? autoMerge;
   const releaseRefsFn = dependencies.releaseRefs ?? releaseFanOutArtifactRefs;
+  // Process-local by contract: one manager per server unless a caller
+  // injects one (focused tests wire a scripted transport registry).
+  const liveManager = dependencies.live ?? new LiveSessionManager();
+  const liveResumeSource = dependencies.liveResumeSource ?? getLiveResumeSource();
   const server = new McpServer({
     name: "codex-multi-agent-delegation-hub",
     version: "0.1.0",
@@ -285,6 +302,121 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
           maxOutputBytes: max_output_bytes,
         });
         return okTool(session, session.run.status !== "success" || session.cleanup_error !== null);
+      }),
+  );
+
+
+  // ---------------------------------------------------------------------
+  // v3 live surfaces (additive): a process-local manager, polling plus
+  // cursor event reads, and the six hub commands behind one tool.
+  // ---------------------------------------------------------------------
+
+  server.registerTool(
+    "live_session_start",
+    {
+      description:
+        "Start a long-lived interactive live session (v3) for one provider (omp, agy, pi, hermes). Providers are validated against the live vocabulary; pi/hermes stay live-only and remain rejected by the legacy tools. Fails honestly when the provider's transport is not wired into this build.",
+      inputSchema: {
+        agent: z.enum(supportedLiveAgents),
+        workspace: z.string().min(1).default(process.cwd()),
+        session_id: z.string().min(1).optional(),
+        max_output_bytes: z.number().int().positive().optional(),
+      },
+    },
+    async ({ agent, workspace, session_id, max_output_bytes }) =>
+      guardTool(async () => {
+        const summary = await liveManager.start({
+          provider: agent,
+          workspace,
+          sessionId: session_id ?? null,
+          maxTextBytes: max_output_bytes,
+        });
+        return okTool(summary);
+      }),
+  );
+
+  server.registerTool(
+    "live_session_resume",
+    {
+      description:
+        "Resume a durable live session (hub-live-id) by reopening its provider transport with the stored resume state. Until the durable live-state store is wired, this fails with LIVE_STATE_UNAVAILABLE — never with a fake continuation.",
+      inputSchema: {
+        live_session_id: z.string().min(1),
+        workspace: z.string().min(1).default(process.cwd()),
+        max_output_bytes: z.number().int().positive().optional(),
+      },
+    },
+    async ({ live_session_id, workspace, max_output_bytes }) =>
+      guardTool(async () => {
+        const state = await liveResumeSource.load(workspace, live_session_id);
+        const summary = await liveManager.resume({
+          state,
+          workspace,
+          maxTextBytes: max_output_bytes,
+        });
+        return okTool(summary);
+      }),
+  );
+
+  server.registerTool(
+    "live_session_command",
+    {
+      description:
+        "Inject one hub command into a live session: prompt (once, while idle), follow_up (native when idle or hub-queued mid-turn), steer (mid-turn, when claimed), cancel, status (answered from stream evidence), or permission_response (answering an observed permission_request). Returns the LiveTurnResult plus the session status; capability-refused commands come back outcome \"unsupported\" with a stage \"capability\" error and are never delivered.",
+      inputSchema: {
+        live_session_id: z.string().min(1),
+        action: z.enum(["prompt", "follow_up", "steer", "cancel", "status", "permission_response"]),
+        text: z.string().optional(),
+        reason: z.string().nullable().optional(),
+        request_id: z.string().optional(),
+        decision: z.enum(["allow_once", "allow_session", "deny"]).optional(),
+        note: z.string().nullable().optional(),
+      },
+    },
+    async ({ live_session_id, action, text, reason, request_id, decision, note }) =>
+      guardTool(async () => {
+        const result = await liveManager.command(live_session_id, {
+          action,
+          text: text ?? null,
+          reason: reason ?? null,
+          request_id: request_id ?? null,
+          decision: decision ?? null,
+          note: note ?? null,
+        });
+        const status = liveManager.get(live_session_id)?.status ?? "closed";
+        return okTool({ result, status }, result.outcome === "failed" || result.outcome === "unsupported");
+      }),
+  );
+
+  server.registerTool(
+    "live_session_events",
+    {
+      description:
+        "Poll normalized live events after a cursor (events are per-session, 1-based, no gaps). Returns the page, the next cursor, the oldest retained seq, and an honest `dropped` flag when the ring buffer already evicted what the cursor points before.",
+      inputSchema: {
+        live_session_id: z.string().min(1),
+        cursor: z.number().int().nonnegative().default(0),
+        limit: z.number().int().min(1).max(1000).default(200),
+      },
+    },
+    async ({ live_session_id, cursor, limit }) =>
+      guardTool(async () => okTool(liveManager.events(live_session_id, cursor, limit))),
+  );
+
+  server.registerTool(
+    "live_session_close",
+    {
+      description:
+        "Stop a live session's provider (graceful, or terminate with bounded SIGKILL escalation authorized) and report what shutdown proved: `closed` only with proof the process is gone, `orphaned` otherwise — an orphaned close is an isError.",
+      inputSchema: {
+        live_session_id: z.string().min(1),
+        terminate: z.boolean().default(false),
+      },
+    },
+    async ({ live_session_id, terminate }) =>
+      guardTool(async () => {
+        const close = await liveManager.close(live_session_id, terminate ? "terminate" : "graceful");
+        return okTool(close, close.stop.status === "orphaned");
       }),
   );
 

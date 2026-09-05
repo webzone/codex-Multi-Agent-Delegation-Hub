@@ -25,6 +25,81 @@ export * from "./competition.js";
 export * from "./session.js";
 export * from "./state.js";
 
+// v3 — Package 4: live surfaces (CLI `agent-hub live`, MCP `live_session_*`)
+// on the Gate 0 live contract. The live vocabulary is separate: legacy
+// `supportedAgents` stays `omp, agy, grok`; `supportedLiveAgents` adds
+// `pi`/`hermes` for live sessions only.
+export {
+  assertLiveSessionState,
+  getLiveResumeSource,
+  isLiveProvider,
+  isTerminalLiveStatus,
+  LIVE_DEFAULT_EVENT_BUFFER,
+  LIVE_DEFAULT_MAX_TEXT_BYTES,
+  LIVE_MAX_SESSIONS,
+  LIVE_TRANSPORT_PAIRINGS,
+  liveSessionManager,
+  liveTransportRegistry,
+  LiveSessionManager,
+  LiveTransportRegistry,
+  probeLiveAgent,
+  registerLiveTransport,
+  runLiveSession,
+  setLiveResumeSource,
+  supportedLiveAgents,
+  unwiredLiveResumeSource,
+  validateLiveCapabilities,
+} from "./live/index.js";
+export type {
+  LiveCloseReport,
+  LiveEventPage,
+  LiveIo,
+  LiveLaunchInvocation,
+  LiveProbeDocument,
+  LiveResumeRequest,
+  LiveResumeSource,
+  LiveRunnerDependencies,
+  LiveSessionManagerOptions,
+  LiveSessionSummary,
+  LiveStartRequest,
+  LiveTurnCommand,
+} from "./live/index.js";
+
+// v3 — the Gate 0 live contract types (identity, commands, events, durable
+// state, transport/factory interfaces).
+export type {
+  CapabilitySupport,
+  LiveBoundedText,
+  LiveCapabilities,
+  LiveCapabilityClaim,
+  LiveCapabilityName,
+  LiveCheckpoint,
+  LiveCommand,
+  LiveCommandKind,
+  LiveCommandOutcome,
+  LiveError,
+  LiveErrorStage,
+  LiveEvent,
+  LiveEventBody,
+  LiveEventKind,
+  LiveLaunchReport,
+  LiveLaunchRequest,
+  LivePermissionDecision,
+  LiveProbeResult,
+  LiveProviderFactory,
+  LiveProviderId,
+  LiveSessionState,
+  LiveStatus,
+  LiveStopMode,
+  LiveStopReport,
+  LiveTransport,
+  LiveTransportDescriptor,
+  LiveTransportFactory,
+  LiveTransportId,
+  LiveTurnResult,
+  LiveUsage,
+} from "./live/types.js";
+
 export type {
   AdapterExecutionResult,
   AdapterRequest,
