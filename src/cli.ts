@@ -3,6 +3,8 @@
 import { delegate } from "./delegate.js";
 import { supportedAgents } from "./adapters/index.js";
 import type { DelegateRequest, ExecutionMode } from "./types.js";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const usage = `Usage:
   agent-hub delegate --agent <omp|agy|grok> --mode <direct|isolated> [options] <task>
@@ -137,7 +139,19 @@ export async function runCli(
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+function isEntrypoint(): boolean {
+  if (!process.argv[1]) {
+    return false;
+  }
+
+  try {
+    return realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+}
+
+if (isEntrypoint()) {
   runCli(process.argv.slice(2)).then((exitCode) => {
     process.exitCode = exitCode;
   });
