@@ -1,4 +1,4 @@
-import { access, readFile, writeFile } from "node:fs/promises";
+import { access, chmod, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -118,6 +118,47 @@ describe("execution safety", () => {
       expect(result.changed_files).toContain("README.md");
       expect(result.diff).toContain("README.md");
       expect(result.diff).toContain("+updated");
+    } finally {
+      await removeDirectory(repository);
+    }
+  });
+
+  it("captures executable-bit changes and binary modifications in isolated runs", async () => {
+    const repository = await createGitRepository();
+    await writeFile(join(repository, "payload.bin"), Buffer.from([1, 2, 3, 0]));
+    await runGit(repository, ["add", "payload.bin"]);
+    await runGit(repository, ["commit", "-qm", "track binary"]);
+
+    try {
+      const result = await delegate(
+        { task: "make it runnable", agent: "fake", mode: "isolated", workspace: repository },
+        {
+          resolveAdapter: () => ({
+            id: "fake",
+            async execute({ cwd }) {
+              await chmod(join(cwd, "README.md"), 0o755);
+              await writeFile(join(cwd, "payload.bin"), Buffer.from([0, 7, 0, 255]));
+              return {
+                exit_code: 0,
+                stdout: "",
+                stderr: "",
+                session_id: null,
+                stdout_truncated: false,
+                stderr_truncated: false,
+                error: null,
+              };
+            },
+          }),
+        },
+      );
+
+      expect(result.status).toBe("success");
+      expect(result.changed_files).toContain("README.md");
+      expect(result.changed_files).toContain("payload.bin");
+      expect(result.diff).toContain("new mode 100755");
+      expect(result.diff).toContain("GIT binary patch");
+      expect(await runGit(repository, ["status", "--porcelain=v1", "--untracked-files=all"])).toBe("");
+      expect(await worktreeCount(repository)).toBe(1);
     } finally {
       await removeDirectory(repository);
     }
