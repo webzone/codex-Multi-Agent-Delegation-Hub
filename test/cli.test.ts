@@ -1,7 +1,50 @@
 import { describe, expect, it } from "vitest";
 
-import { parseCliArgs, runCli } from "../src/cli.js";
-import { createGitRepository, removeDirectory } from "./helpers.js";
+import { parseCliArgs, parseCliCommand, runCli } from "../src/cli.js";
+import { createGitRepository, removeDirectory, runGit } from "./helpers.js";
+
+async function withFakeAgents<T>(body: () => Promise<T>): Promise<T> {
+  const saved = {
+    OMP_BIN: process.env.AGENT_HUB_OMP_BIN,
+    OMP_ARGS: process.env.AGENT_HUB_OMP_ARGS,
+    GROK_BIN: process.env.AGENT_HUB_GROK_BIN,
+    GROK_ARGS: process.env.AGENT_HUB_GROK_ARGS,
+  };
+  process.env.AGENT_HUB_OMP_BIN = process.execPath;
+  process.env.AGENT_HUB_OMP_ARGS = JSON.stringify([
+    "-e",
+    "require('fs').writeFileSync('omp.txt', process.argv[1]);",
+    "{task}",
+  ]);
+  process.env.AGENT_HUB_GROK_BIN = process.execPath;
+  process.env.AGENT_HUB_GROK_ARGS = JSON.stringify([
+    "-e",
+    "require('fs').writeFileSync('grok.txt', process.argv[1]);",
+    "{task}",
+  ]);
+  try {
+    return await body();
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      const name = `AGENT_HUB_${key}`;
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
+function collectors() {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  return {
+    stdout,
+    stderr,
+    output: {
+      stdout: (value: string) => stdout.push(value),
+      stderr: (value: string) => stderr.push(value),
+    },
+  };
+}
 
 describe("CLI", () => {
   it("parses the delegation command", () => {
@@ -58,5 +101,245 @@ describe("CLI", () => {
       else process.env.AGENT_HUB_OMP_ARGS = previousArgs;
       await removeDirectory(repository);
     }
+  });
+
+  it("keeps the bare-argument v1 invocation on the delegate path", () => {
+    const invocation = parseCliCommand(["--agent", "omp", "--mode", "direct", "just a task"]);
+    expect(invocation.kind).toBe("delegate");
+    if (invocation.kind === "delegate") {
+      expect(invocation.options.request.task).toBe("just a task");
+    }
+  });
+
+  describe("fanout parsing", () => {
+    it("pairs agents with tasks one to one", () => {
+      const invocation = parseCliCommand([
+        "fanout",
+        "--agent",
+        "omp",
+        "--agent",
+        "grok",
+        "--task",
+        "alpha",
+        "--task",
+        "beta",
+        "--concurrency",
+        "2",
+      ]);
+
+      expect(invocation.kind).toBe("fanout");
+      if (invocation.kind === "fanout") {
+        expect(invocation.request.candidates).toEqual([
+          { agent: "omp", task: "alpha" },
+          { agent: "grok", task: "beta" },
+        ]);
+        expect(invocation.request.maxConcurrency).toBe(2);
+        expect(invocation.judge).toBeNull();
+        expect(invocation.autoMerge).toBe(false);
+      }
+    });
+
+    it("replicates a single shared task across agents", () => {
+      const invocation = parseCliCommand([
+        "fanout",
+        "--agent",
+        "omp",
+        "--agent",
+        "agy",
+        "--agent",
+        "grok",
+        "--task",
+        "same for all",
+      ]);
+
+      if (invocation.kind !== "fanout") throw new Error("expected fanout");
+      expect(invocation.request.candidates).toHaveLength(3);
+      expect(invocation.request.candidates.every((candidate) => candidate.task === "same for all")).toBe(true);
+    });
+
+    it("rejects a task count that matches neither one nor all agents", () => {
+      expect(() =>
+        parseCliCommand(["fanout", "--agent", "omp", "--agent", "agy", "--agent", "grok", "--task", "a", "--task", "b"]),
+      ).toThrow(/--task must be given once/);
+    });
+
+    it("requires --judge before --auto-merge may be requested", () => {
+      expect(() => parseCliCommand(["fanout", "--agent", "omp", "--task", "t", "--auto-merge"])).toThrow(
+        /--auto-merge requires --judge/,
+      );
+    });
+
+    it("keeps --auto-merge opt-in and validated against the judge", () => {
+      const invocation = parseCliCommand([
+        "fanout",
+        "--agent",
+        "omp",
+        "--task",
+        "t",
+        "--judge",
+        "omp",
+        "--auto-merge",
+      ]);
+      if (invocation.kind !== "fanout") throw new Error("expected fanout");
+      expect(invocation.judge).toBe("omp");
+      expect(invocation.autoMerge).toBe(true);
+
+      expect(() =>
+        parseCliCommand(["fanout", "--agent", "omp", "--task", "t", "--judge", "hal9000"]),
+      ).toThrow(/--judge must be one of/);
+    });
+
+    it("rejects bare positional text in favour of explicit --task", () => {
+      expect(() => parseCliCommand(["fanout", "--agent", "omp", "free text"])).toThrow(/must use --task/);
+    });
+
+    it("does not accept fan-out competition flags on session create", () => {
+      expect(() =>
+        parseCliCommand(["session", "create", "--agent", "omp", "--task", "t", "--judge", "omp"]),
+      ).toThrow(/Unknown option: --judge/);
+      expect(() =>
+        parseCliCommand(["session", "create", "--agent", "omp", "--task", "t", "--auto-merge"]),
+      ).toThrow(/Unknown option: --auto-merge/);
+    });
+  });
+
+  describe("session parsing", () => {
+    it("rejects the removed persisted competition command", () => {
+      expect(() => parseCliCommand(["compete", "--judge", "omp"])).toThrow(
+        /use fanout with --judge/,
+      );
+    });
+
+    it("parses session create and session resume", () => {
+      expect(parseCliCommand(["session", "create", "--agent", "omp", "--task", "t"])).toEqual({
+        kind: "session-create",
+        request: expect.objectContaining({
+          agent: "omp",
+          task: "t",
+          allowDirty: false,
+        }),
+      });
+      expect(parseCliCommand(["session", "resume", "sess-9", "--task", "continue", "--workspace", "/tmp/r"])).toEqual({
+        kind: "session-resume",
+        request: {
+          session_id: "sess-9",
+          task: "continue",
+          workspace: "/tmp/r",
+          maxOutputBytes: undefined,
+        },
+      });
+      expect(() => parseCliCommand(["session", "resume"])).toThrow(/session resume requires/);
+      expect(() => parseCliCommand(["session", "resume", "sess-9"])).toThrow(/requires --task/);
+      expect(() => parseCliCommand(["session", "teleport"])).toThrow(/session requires "create" or "resume"/);
+    });
+  });
+
+  describe("run conventions", () => {
+    it("prints usage and exits 0 on --help", async () => {
+      const io = collectors();
+      expect(await runCli(["--help"], io.output)).toBe(0);
+      expect(io.stdout.join("")).toContain("agent-hub fanout");
+      expect(io.stderr).toEqual([]);
+    });
+
+    it("exits 2 with usage on stderr for parse errors", async () => {
+      const io = collectors();
+      expect(await runCli(["fanout", "--agent", "robot", "--task", "t"], io.output)).toBe(2);
+      expect(io.stderr.join("")).toContain("Usage:");
+      expect(io.stdout).toEqual([]);
+    });
+
+    it("exits 1 with a structured JSON error for operation failures", async () => {
+      const io = collectors();
+      const repository = await createGitRepository();
+      await removeDirectory(repository); // gone again → NOT_GIT_REPOSITORY
+
+      const exitCode = await runCli(
+        ["fanout", "--agent", "omp", "--task", "t", "--workspace", repository],
+        io.output,
+      );
+      expect(exitCode).toBe(1);
+      expect(io.stderr).toEqual([]);
+      expect(JSON.parse(io.stdout.join("")).error.code).toBe("NOT_GIT_REPOSITORY");
+    });
+
+    it("runs a fan-out end to end and reports artifacts", async () => {
+      const repository = await createGitRepository();
+      const io = collectors();
+      try {
+        const exitCode = await withFakeAgents(() =>
+          runCli(
+            [
+              "fanout",
+              "--agent",
+              "omp",
+              "--agent",
+              "grok",
+              "--task",
+              "alpha",
+              "--task",
+              "beta",
+              "--workspace",
+              repository,
+            ],
+            io.output,
+          ),
+        );
+
+        expect(exitCode).toBe(0);
+        const document = JSON.parse(io.stdout.join(""));
+        expect(document.error).toBeNull();
+        expect(document.base.head).toBe((await runGit(repository, ["rev-parse", "HEAD"])).trim());
+        expect(document.candidates).toHaveLength(2);
+        expect(document.candidates[0].artifact.changed_files).toContain("omp.txt");
+        expect(document.candidates[1].artifact.changed_files).toContain("grok.txt");
+        expect(document.candidates.map((candidate: { status: string }) => candidate.status)).toEqual([
+          "success",
+          "success",
+        ]);
+      } finally {
+        await removeDirectory(repository);
+      }
+    });
+
+    it("creates and resumes a durable filesystem session", async () => {
+      const repository = await createGitRepository();
+      try {
+        await withFakeAgents(async () => {
+          const createdIo = collectors();
+          const createExit = await runCli(
+            ["session", "create", "--agent", "omp", "--task", "first turn", "--workspace", repository],
+            createdIo.output,
+          );
+          expect(createExit).toBe(0);
+          const created = JSON.parse(createdIo.stdout.join(""));
+          expect(created.run.status).toBe("success");
+          expect(created.session.revision).toBe(1);
+          expect(created.artifact.changed_files).toContain("omp.txt");
+
+          const resumedIo = collectors();
+          const resumeExit = await runCli(
+            [
+              "session",
+              "resume",
+              created.session.session_id,
+              "--task",
+              "second turn",
+              "--workspace",
+              repository,
+            ],
+            resumedIo.output,
+          );
+          expect(resumeExit).toBe(0);
+          const resumed = JSON.parse(resumedIo.stdout.join(""));
+          expect(resumed.run.status).toBe("success");
+          expect(resumed.session.revision).toBe(2);
+          expect(resumed.artifact.parent).toBe(created.artifact.commit);
+          expect(resumed.continuation.filesystem).toBe(true);
+        });
+      } finally {
+        await removeDirectory(repository);
+      }
+    });
   });
 });

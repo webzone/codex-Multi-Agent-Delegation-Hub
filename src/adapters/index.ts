@@ -21,3 +21,14 @@ export function resolveAdapter(agent: string, environment: NodeJS.ProcessEnv = p
       );
   }
 }
+
+export {
+  asNativeResumeCapableAdapter,
+  PROVIDER_SESSION_METADATA_KEY,
+  readProviderSessionId,
+} from "./types.js";
+export type {
+  AdapterFactory,
+  NativeResumeCapableAdapter,
+  NativeResumeCapability,
+} from "./types.js";
