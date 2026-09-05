@@ -18,8 +18,10 @@ import {
   sessionStatePath,
   sessionsRoot,
   withSessionLock,
+  zeroOidFor,
   type SessionState,
   type SessionTransaction,
+  type TransitionPhase,
 } from "../src/state.js";
 import { createGitRepository, removeDirectory, runGit } from "./helpers.js";
 
@@ -44,6 +46,22 @@ async function artifactCommit(repo: string, parent: string, message: string): Pr
   const tree = (await runGit(repo, ["rev-parse", `${parent}^{tree}`])).trim();
   const out = await runGit(repo, ["commit-tree", tree, "-p", parent, "-m", message]);
   return out.trim();
+}
+
+/**
+ * A repository whose object names are 64 hex wide. Everything in the state
+ * layer that assumes a hash width has to survive here, and nothing about the
+ * protocol is different apart from the width itself.
+ */
+async function createSha256Repository(): Promise<string> {
+  const repository = await mkdtemp(join(tmpdir(), "agent-hub-sha256-"));
+  await runGit(repository, ["init", "-q", "--object-format=sha256"]);
+  await runGit(repository, ["config", "user.email", "agent-hub@example.test"]);
+  await runGit(repository, ["config", "user.name", "Agent Hub Test"]);
+  await writeFile(join(repository, "README.md"), "initial\n");
+  await runGit(repository, ["add", "README.md"]);
+  await runGit(repository, ["commit", "-qm", "initial"]);
+  return repository;
 }
 
 function stateFor(repo: string, head: string, over: Partial<SessionState> = {}): SessionState {
@@ -187,6 +205,7 @@ describe("session state layer", { timeout: 20_000 }, () => {
     }
     expect(sessionRefFor(SESSION_ID)).toBe(`refs/agent-hub/sessions/${SESSION_ID}`);
     expectThrowCode(() => sessionStatePath("/abs/common", "../escape"), "SESSION_ID_INVALID");
+    expectThrowCode(() => sessionPendingPath("/abs/common", "../escape"), "SESSION_ID_INVALID");
     expectThrowCode(() => sessionLockName("foo/bar"), "SESSION_ID_INVALID");
     expect(sessionLockName(SESSION_ID)).toBe(`session-${SESSION_ID}`);
   });
@@ -464,5 +483,134 @@ describe("session state layer", { timeout: 20_000 }, () => {
     ]);
 
     await removeDirectory(repo);
+  });
+
+  it("derives the zero OID at the object-name width of the commit being written", () => {
+    expect(zeroOidFor("f".repeat(40))).toBe("0".repeat(40));
+    expect(zeroOidFor("f".repeat(64))).toBe("0".repeat(64));
+    // Anything between the two real widths, or outside both, is not a commit
+    // id, so its zero OID cannot be derived and the caller is refused.
+    for (const notACommitId of [
+      "",
+      "f".repeat(39),
+      "f".repeat(41),
+      "f".repeat(63),
+      "f".repeat(65),
+      "F".repeat(40),
+    ]) {
+      expectThrowCode(() => zeroOidFor(notACommitId), "SESSION_STATE_INCONSISTENT");
+    }
+  });
+
+  it("refuses a transition whose new commit id is not a full object name", async () => {
+    const repo = await createGitRepository();
+    try {
+      const { common_dir: commonDir, head } = await resolveRepositoryIdentity(repo);
+      // 41 hex: one character past SHA-1 and one short of SHA-256. Git has no
+      // object name of that width, so the plan must die at validation instead
+      // of putting a value no repository can compare into the CAS.
+      const padded = `${head}f`;
+      expect(padded).toHaveLength(41);
+      const phases: TransitionPhase[] = [];
+      await expectErrorCode(
+        applySessionTransition(
+          {
+            commonDir,
+            repositoryCwd: repo,
+            observePhase: async (phase) => {
+              phases.push(phase);
+            },
+          },
+          planFor("create", null, padded, stateFor(repo, padded)),
+        ),
+        "SESSION_STATE_INCONSISTENT",
+      );
+      // Turned away before the transaction opened: no sidecar phase, no ref,
+      // no state record.
+      expect(phases).toEqual([]);
+      expect(await refSha(repo, sessionRefFor(SESSION_ID))).toBeNull();
+      expect(await exists(sessionStatePath(commonDir, SESSION_ID))).toBe(false);
+      expect(await exists(sessionPendingPath(commonDir, SESSION_ID))).toBe(false);
+    } finally {
+      await removeDirectory(repo);
+    }
+  });
+
+  it("refuses to load a persisted record carrying an out-of-width commit id", async () => {
+    const repo = await createGitRepository();
+    try {
+      const { common_dir: commonDir, head } = await resolveRepositoryIdentity(repo);
+      const commit = await artifactCommit(repo, head, "artifact");
+      const created = stateFor(repo, head, { current_commit: commit });
+      await applySessionTransition(
+        { commonDir, repositoryCwd: repo },
+        planFor("create", null, commit, created),
+      );
+
+      const statePath = sessionStatePath(commonDir, SESSION_ID);
+
+      // identity.head is a field the session ref can never contradict, so only
+      // the width rule alone can reject a padded value there, and a padded
+      // value is exactly what a truncated write or a hand-edited record gives.
+      await writeFile(
+        statePath,
+        JSON.stringify({ ...created, identity: { ...created.identity, head: `${head}0` } }),
+      );
+      await expectErrorCode(
+        loadSessionState({ commonDir, repositoryCwd: repo, sessionId: SESSION_ID }),
+        "SESSION_STATE_INCONSISTENT",
+      );
+
+      // The same rule rejects a padded current_commit, whatever the ref holds.
+      await writeFile(statePath, JSON.stringify({ ...created, current_commit: `${commit}0` }));
+      await expectErrorCode(
+        loadSessionState({ commonDir, repositoryCwd: repo, sessionId: SESSION_ID }),
+        "SESSION_STATE_INCONSISTENT",
+      );
+
+      // An unloadable record does not take the ref with it.
+      expect(await refSha(repo, created.ref)).toBe(commit);
+    } finally {
+      await removeDirectory(repo);
+    }
+  });
+
+  it("creates and advances a session in a SHA-256 repository", async () => {
+    // The regression the derived zero OID exists for: a hard-coded 40-zero
+    // "must not exist yet" value is refused outright by Git in this repository
+    // ("not a valid old SHA1"), which failed every session create here.
+    const repo = await createSha256Repository();
+    try {
+      const { common_dir: commonDir, head } = await resolveRepositoryIdentity(repo);
+      expect(head).toMatch(/^[0-9a-f]{64}$/);
+
+      const commit = await artifactCommit(repo, head, "sha256 artifact");
+      expect(commit).toHaveLength(64);
+      const created = stateFor(repo, head, { current_commit: commit });
+      await applySessionTransition(
+        { commonDir, repositoryCwd: repo },
+        planFor("create", null, commit, created),
+      );
+      expect(await refSha(repo, created.ref)).toBe(commit);
+      expect(await readStateFile(commonDir, SESSION_ID)).toMatchObject({
+        revision: 1,
+        current_commit: commit,
+      });
+
+      // The advance path passes the real old value, so it rides the same width.
+      const next = await artifactCommit(repo, commit, "sha256 advance");
+      await applySessionTransition(
+        { commonDir, repositoryCwd: repo },
+        planFor("advance", commit, next, stateFor(repo, head, { current_commit: next, revision: 2 })),
+      );
+      expect(await refSha(repo, created.ref)).toBe(next);
+      expect(await readStateFile(commonDir, SESSION_ID)).toMatchObject({
+        revision: 2,
+        current_commit: next,
+      });
+      expect(await exists(sessionPendingPath(commonDir, SESSION_ID))).toBe(false);
+    } finally {
+      await removeDirectory(repo);
+    }
   });
 });

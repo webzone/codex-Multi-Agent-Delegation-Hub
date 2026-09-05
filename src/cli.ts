@@ -504,7 +504,9 @@ async function execute(
             ref_cleanup_errors?: DelegateError[];
           }
         | undefined = undefined;
-      let failure: boolean;
+      let failure = false;
+      let operationError: DelegateError | null = null;
+      let cleanupErrors: DelegateError[] = [];
       try {
         if (invocation.judge === null) {
           document = fan;
@@ -535,22 +537,34 @@ async function execute(
               !merge.clean;
           }
         }
+      } catch (error) {
+        operationError = asDelegateError(error);
       } finally {
         // Terminal path: once this command's document exists, nothing else
         // can consume the candidate artifact refs, so release them CAS-safe
-        // (refs already re-targeted by someone else are left untouched).
-        const cleanupErrors = await releaseFanOutArtifactRefs(
+        // (refs already re-targeted by someone else are left untouched) — on
+        // the error path too, which is exactly when leaked refs matter most.
+        cleanupErrors = await releaseFanOutArtifactRefs(
           invocation.request.workspace,
           fan,
         );
-        if (cleanupErrors.length > 0 && document !== undefined) {
-          // Cleanup trouble rides along on the document; it never masks the
-          // operation's own result.
-          document = { ...document, ref_cleanup_errors: cleanupErrors };
-        }
+      }
+
+      if (operationError !== null) {
+        emit({
+          error: operationError,
+          ...(cleanupErrors.length > 0 ? { ref_cleanup_errors: cleanupErrors } : {}),
+        });
+        return 1;
+      }
+      if (cleanupErrors.length > 0 && document !== undefined) {
+        // Cleanup trouble rides along on the document; it never masks the
+        // operation's own result — but it does make the command fail, because
+        // refs this command promised to release are still there.
+        document = { ...document, ref_cleanup_errors: cleanupErrors };
       }
       emit(document);
-      return failure ? 1 : 0;
+      return failure || cleanupErrors.length > 0 ? 1 : 0;
     }
 
     case "session-create": {

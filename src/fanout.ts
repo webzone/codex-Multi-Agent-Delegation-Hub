@@ -18,7 +18,7 @@ import {
   resolveRepositoryIdentity,
   type BaseWorktree,
 } from "./git.js";
-import { acquireRepositoryLock, type RepositoryLock } from "./locks.js";
+import { acquireRepositoryLock, claimUnderLock, type RepositoryLock } from "./locks.js";
 import type {
   AdapterExecutionResult,
   AgentAdapter,
@@ -191,15 +191,32 @@ export async function fanOut(
     let artifact: CandidateArtifact | null = null;
     let failure: { code: string; message: string } | null = null;
     let worktree: BaseWorktree | undefined;
+    let adminReleaseError: { code: string; message: string } | null = null;
 
     try {
       const adapter = resolveAdapterFn(spec.agent);
-      worktree = await withAdminLock(() => createWorktree(request.workspace, base.head));
+      // Claiming the worktree and releasing the admin lock are separate facts.
+      // If `git worktree add` succeeded and the release then failed, this
+      // candidate is still the only party that can tear the worktree down, so
+      // the claim hands the handle back and reports the release error with the
+      // leaked path, instead of losing both.
+      const claim = await claimUnderLock(
+        () => acquireAdminLock(base.common_dir),
+        () => createWorktree(request.workspace, base.head),
+        (worktree) => worktree.path,
+      );
+      worktree = claim.value;
+      adminReleaseError = claim.releaseError ? asDelegateError(claim.releaseError) : null;
       executionWorkspace = worktree.path;
       adapterResult = await runAdapter(delegateRequest, adapter, worktree.path);
     } catch (error) {
       failure = asDelegateError(error);
     }
+    // Cleanup trouble never masks an agent failure, but it is never dropped
+    // either. Teardown below is still attempted (the handle was retained); when
+    // the stuck lock record blocks that attempt too, the candidate reports the
+    // leak — with the worktree path — not the busy-lock symptom.
+    failure ??= adminReleaseError;
 
     // Capture before teardown even when the agent failed, so judges can still
     // inspect partial work; an artifact failure must not mask an agent failure.

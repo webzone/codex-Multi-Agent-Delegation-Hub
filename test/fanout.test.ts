@@ -1,11 +1,11 @@
-import { access, mkdtemp, realpath, writeFile } from "node:fs/promises";
+import { access, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
 import { createWorktreeAtBase, pruneWorktrees, removeWorktree, resolveRepositoryIdentity, type BaseWorktree } from "../src/git.js";
-import { lockPathFor } from "../src/locks.js";
+import { acquireRepositoryLock, lockPathFor, type RepositoryLock } from "../src/locks.js";
 import { fanOut, FANOUT_MAX_CONCURRENCY_LIMIT, WORKTREE_ADMIN_LOCK_NAME } from "../src/fanout.js";
 import { deferred } from "../src/deferred.js";
 import type { AgentAdapter, FanOutCandidateResult, FanOutCandidateSpec } from "../src/types.js";
@@ -466,6 +466,78 @@ describe("fan-out", { timeout: 30_000 }, () => {
       expect(greenButBrokenPrune.error?.message).toContain("prune exploded");
       expect(greenButBrokenPrune.candidates.every((candidate) => candidate.status === "success")).toBe(true);
     } finally {
+      await removeDirectory(repo);
+    }
+  });
+
+  it("retains the candidate worktree, attempts teardown, and reports the leak when the admin lock release fails", async () => {
+    const repo = await createGitRepository();
+    const tracker = new Tracker();
+    let attempts = 0;
+    let leaked: string | null = null;
+    let wedgedRecord: string | null = null;
+
+    // Only the setup claim's release misbehaves. The follow-up attempts are
+    // sane — they simply cannot get in while the stuck record is on disk.
+    const firstReleaseFails = async (commonDir: string): Promise<RepositoryLock> => {
+      attempts += 1;
+      const lock = await acquireRepositoryLock({ commonDir, name: WORKTREE_ADMIN_LOCK_NAME });
+      if (attempts > 1) {
+        return lock;
+      }
+      return {
+        ...lock,
+        release: async () => {
+          throw new Error("simulated admin lock release failure");
+        },
+      };
+    };
+
+    try {
+      const result = await fanOut(
+        { workspace: repo, candidates: specs(1) },
+        {
+          resolveAdapter: adapterMap(
+            specs(1).map((spec) => [
+              spec.agent,
+              writeAdapter(spec.label as string, tracker, Promise.resolve(), "ok"),
+            ] as [string, AgentAdapter]),
+          ),
+          acquireAdminLock: firstReleaseFails,
+        },
+      );
+      const candidate = result.candidates[0];
+      leaked = candidate.execution_workspace;
+      wedgedRecord = lockPathFor(result.base.common_dir, WORKTREE_ADMIN_LOCK_NAME);
+
+      // The handle survived the failed release: the artifact was captured from
+      // the worktree rather than thrown away with the release error.
+      expect(candidate.artifact?.commit).toBeTruthy();
+      expect(candidate.artifact?.changed_files).toEqual(["c0.txt"]);
+
+      // Teardown and the trailing prune were both attempted...
+      expect(attempts).toBe(3);
+      // ...and the hub never force-removes a worktree behind a lock it cannot
+      // hold, so the worktree is still there and says so in the error.
+      await expect(access(candidate.execution_workspace)).resolves.toBeUndefined();
+      expect(await worktreeCount(repo)).toBe(2);
+      expect(candidate.error?.code).toBe("LOCK_RELEASE_FAILED");
+      expect(candidate.error?.message).toContain("simulated admin lock release failure");
+      expect(candidate.error?.message).toContain(candidate.execution_workspace);
+      expect(candidate.status).toBe("failure");
+      // The blocked attempts are visible at fan-out level too.
+      expect(result.error?.code).toBe("LOCK_BUSY");
+      expect(result.status).toBe("failure");
+    } finally {
+      // Clear what the simulated failure wedged: the stuck lock record, then
+      // the leaked worktree directory, then the repository itself.
+      await rm(wedgedRecord ?? lockPathFor(join(repo, ".git"), WORKTREE_ADMIN_LOCK_NAME), {
+        recursive: true,
+        force: true,
+      });
+      if (leaked) {
+        await removeDirectory(join(leaked, ".."));
+      }
       await removeDirectory(repo);
     }
   });

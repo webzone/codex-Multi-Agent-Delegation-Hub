@@ -167,7 +167,12 @@ describe("candidate artifact ref release", () => {
       const artifact = await makeArtifact(repo, "cas.txt");
       expect(await resolveRef(repo, artifact.ref!)).toBe(artifact.commit);
 
-      await expect(releaseCandidateRef(repo, artifact.ref!, artifact.commit!)).resolves.toBe(true);
+      await expect(releaseCandidateRef(repo, artifact.ref!, artifact.commit!)).resolves.toMatchObject({
+        status: "released",
+        ref: artifact.ref,
+        found: null,
+        error: null,
+      });
       expect(await resolveRef(repo, artifact.ref!)).toBeNull();
       expect(await candidateRefNames(repo)).toEqual([]);
     } finally {
@@ -183,7 +188,11 @@ describe("candidate artifact ref release", () => {
       // Someone else re-targets our ref between capture and release.
       await runGit(repo, ["update-ref", mine.ref!, theirs.commit!]);
 
-      await expect(releaseCandidateRef(repo, mine.ref!, mine.commit!)).resolves.toBe(false);
+      await expect(releaseCandidateRef(repo, mine.ref!, mine.commit!)).resolves.toMatchObject({
+        status: "foreign-retarget",
+        found: theirs.commit,
+        error: null,
+      });
       // The foreign claim stands untouched; it is no longer ours to delete.
       expect(await resolveRef(repo, mine.ref!)).toBe(theirs.commit);
       expect(await resolveRef(repo, theirs.ref!)).toBe(theirs.commit);
@@ -200,7 +209,10 @@ describe("candidate artifact ref release", () => {
       const blob = (await runGit(repo, ["hash-object", "-w", "foreign-object.txt"])).trim();
       await runGit(repo, ["update-ref", artifact.ref!, blob]);
 
-      await expect(releaseCandidateRef(repo, artifact.ref!, artifact.commit!)).resolves.toBe(false);
+      await expect(releaseCandidateRef(repo, artifact.ref!, artifact.commit!)).resolves.toMatchObject({
+        status: "foreign-retarget",
+        found: blob,
+      });
       expect(await resolveRef(repo, artifact.ref!)).toBe(blob);
     } finally {
       await removeDirectory(repo);
@@ -213,11 +225,55 @@ describe("candidate artifact ref release", () => {
       const artifact = await makeArtifact(repo, "gone.txt");
       await runGit(repo, ["update-ref", "-d", artifact.ref!]);
 
-      await expect(releaseCandidateRef(repo, artifact.ref!, artifact.commit!)).resolves.toBe(true);
+      await expect(releaseCandidateRef(repo, artifact.ref!, artifact.commit!)).resolves.toMatchObject({
+        status: "released",
+      });
     } finally {
       await removeDirectory(repo);
     }
   });
+
+  // Unlinking a loose ref needs write permission on its directory; root ignores
+  // that, so the blocked-delete probe only means something for a normal user.
+  const blockedDelete = typeof process.getuid !== "function" || process.getuid() !== 0;
+
+  it.runIf(blockedDelete)(
+    "reports a blocked delete of our own ref as a cleanup failure, ref unchanged",
+    async () => {
+      const repo = await createGitRepository();
+      const refsDir = join(repo, ".git", "refs", "agent-hub", "candidates");
+      try {
+        const artifact = await makeArtifact(repo, "blocked.txt");
+        await chmod(refsDir, 0o555);
+        try {
+          const release = await releaseCandidateRef(repo, artifact.ref!, artifact.commit!);
+
+          expect(release.status).toBe("cleanup-failed");
+          expect(release.ref).toBe(artifact.ref);
+          expect(release.found).toBe(artifact.commit);
+          expect(release.error?.code).toBe("ARTIFACT_REF_CLEANUP_FAILED");
+          expect(release.error?.message).toContain(artifact.ref!);
+          // Still there, still ours, and never reported as released.
+          expect(await resolveRef(repo, artifact.ref!)).toBe(artifact.commit);
+
+          const errors = await releaseFanOutArtifactRefs(repo, {
+            candidates: [{ artifact }],
+          } as unknown as FanOutResult);
+          expect(errors).toEqual([release.error]);
+        } finally {
+          await chmod(refsDir, 0o755);
+        }
+
+        // The failure was the blocked write, not a misread: now it releases.
+        await expect(
+          releaseCandidateRef(repo, artifact.ref!, artifact.commit!),
+        ).resolves.toMatchObject({ status: "released" });
+        expect(await resolveRef(repo, artifact.ref!)).toBeNull();
+      } finally {
+        await removeDirectory(repo);
+      }
+    },
+  );
 
   it("refuses to release refs outside the candidate namespace", async () => {
     const repo = await createGitRepository();

@@ -113,7 +113,7 @@ export function createHubServer(): McpServer {
     "fanout_candidates",
     {
       description:
-        "Run isolated candidate agents over one shared base commit. Candidates never execute in the caller checkout and nothing is merged by this tool. Retained artifact refs are released (CAS-safe) before the tool returns, so review candidates from the returned diffs.",
+        "Run isolated candidate agents over one shared base commit. Candidates never execute in the caller checkout and nothing is merged by this tool. Retained artifact refs are released (CAS-safe) before the tool returns, so review candidates from the returned diffs; a ref that could not be released is reported in `ref_cleanup_errors` and makes the tool report `isError`.",
       inputSchema: fanoutShape,
     },
     async ({ workspace, candidates, max_concurrency, allow_dirty, max_output_bytes }) =>
@@ -132,8 +132,9 @@ export function createHubServer(): McpServer {
           cleanupErrors.length > 0
             ? { ...result, ref_cleanup_errors: cleanupErrors }
             : result;
-        // A partial or fully-failed fan-out is an operation failure.
-        return okTool(document, result.status !== "success");
+        // A partial or fully-failed fan-out is an operation failure, and so is
+        // a ref this tool promised to release but could not.
+        return okTool(document, result.status !== "success" || cleanupErrors.length > 0);
       }),
   );
 
@@ -141,7 +142,7 @@ export function createHubServer(): McpServer {
     "compete_candidates",
     {
       description:
-        "Run isolated candidates, have a judge select among retained artifacts, and optionally adopt the internal winner by verified fast-forward. Retained artifact refs are released (CAS-safe) before the tool returns.",
+        "Run isolated candidates, have a judge select among retained artifacts, and optionally adopt the internal winner by verified fast-forward. Retained artifact refs are released (CAS-safe) before the tool returns; refs this tool could not release are reported in `ref_cleanup_errors` and make the tool report `isError`.",
       inputSchema: {
         ...fanoutShape,
         judge_agent: z.enum(supportedAgents),
@@ -193,7 +194,10 @@ export function createHubServer(): McpServer {
         };
         return okTool(
           document,
-          fan.status !== "success" || competition.error !== null || mergeFailed(merge),
+          fan.status !== "success" ||
+            competition.error !== null ||
+            mergeFailed(merge) ||
+            cleanupErrors.length > 0,
         );
       }),
   );

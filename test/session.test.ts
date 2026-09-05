@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
 
@@ -8,7 +8,8 @@ import { describe, expect, it } from "vitest";
 import { resolveAdapter } from "../src/adapters/index.js";
 import type { NativeResumeCapableAdapter } from "../src/adapters/types.js";
 import { resolveRepositoryIdentity } from "../src/git.js";
-import { lockPathFor, type LockOwner } from "../src/locks.js";
+import { acquireRepositoryLock, lockPathFor, type LockOwner } from "../src/locks.js";
+import { WORKTREE_ADMIN_LOCK_NAME } from "../src/fanout.js";
 import { deferred } from "../src/deferred.js";
 import { sessionLockName, sessionPendingPath, sessionStatePath } from "../src/state.js";
 import { createSession, resumeSession } from "../src/session.js";
@@ -144,6 +145,78 @@ describe("hub sessions", { timeout: 30_000 }, () => {
     expect(result.cleanup_error).toBeNull();
 
     await removeDirectory(repo);
+  });
+
+
+  it("retains the session worktree and reports trouble when its admin lock release fails", async () => {
+    const repo = await createGitRepository();
+    const identity = await resolveRepositoryIdentity(repo);
+    const adapter: AgentAdapter = {
+      id: "writer",
+      async execute(request) {
+        await writeFile(join(request.cwd, "a.txt"), "alpha\n");
+        return okResult();
+      },
+    };
+    let attempts = 0;
+    let leaked: string | null = null;
+    let wedgedRecord: string | null = null;
+
+    // The claim that created the worktree cannot release its lock; a later
+    // claim is healthy — it just cannot get in while the record is stuck.
+    const firstReleaseFails = async (commonDir: string) => {
+      attempts += 1;
+      const lock = await acquireRepositoryLock({
+        commonDir,
+        name: WORKTREE_ADMIN_LOCK_NAME,
+      });
+      if (attempts > 1) {
+        return lock;
+      }
+      return {
+        ...lock,
+        release: async () => {
+          throw new Error("simulated admin lock release failure");
+        },
+      };
+    };
+
+    try {
+      const result = await createSession(
+        { workspace: repo, agent: "writer", task: "write a file" },
+        { resolveAdapter: () => adapter, acquireAdminLock: firstReleaseFails },
+      );
+
+      // The turn is intact and durable: the handle survived the failed
+      // release, so the artifact was captured from the worktree and the
+      // session advanced exactly one commit.
+      expect(result.run.status).toBe("success");
+      expect(result.run.changed_files).toEqual(["a.txt"]);
+      expect(await refSha(repo, result.session.ref)).toBe(result.artifact.commit);
+      expect(result.session.revision).toBe(1);
+
+      wedgedRecord = lockPathFor(identity.common_dir, WORKTREE_ADMIN_LOCK_NAME);
+      leaked = result.execution_workspace;
+
+      // Teardown was attempted and reported. The hub will not touch worktree
+      // administration while it cannot hold the admin lock, so the worktree is
+      // still there — named in the cleanup error, alongside the blocked attempt.
+      expect(attempts).toBe(2);
+      await expect(access(result.execution_workspace)).resolves.toBeUndefined();
+      expect(result.cleanup_error?.code).toBe("LOCK_RELEASE_FAILED");
+      expect(result.cleanup_error?.message).toContain("simulated admin lock release failure");
+      expect(result.cleanup_error?.message).toContain(result.execution_workspace);
+      expect(result.cleanup_error?.message).toContain("Teardown also failed");
+    } finally {
+      await rm(wedgedRecord ?? lockPathFor(join(repo, ".git"), WORKTREE_ADMIN_LOCK_NAME), {
+        recursive: true,
+        force: true,
+      });
+      if (leaked) {
+        await removeDirectory(join(leaked, ".."));
+      }
+      await removeDirectory(repo);
+    }
   });
 
   it("records an artifact commit even when the run changes nothing", async () => {

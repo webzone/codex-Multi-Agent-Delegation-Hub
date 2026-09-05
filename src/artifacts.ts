@@ -124,18 +124,43 @@ export async function captureCandidateArtifact(
 const ARTIFACT_COMMIT_PATTERN = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /**
+ * What one CAS-safe release attempt actually observed about a private ref.
+ * The three states are deliberately not collapsed into a boolean: "already
+ * gone", "someone else owns it now", and "I could not delete my own ref" mean
+ * different things to the operator and to the exit code.
+ */
+export type CandidateRefReleaseStatus = "released" | "foreign-retarget" | "cleanup-failed";
+
+export interface CandidateRefRelease {
+  status: CandidateRefReleaseStatus;
+  ref: string;
+  /** What the ref resolves to now; null when it is gone or cannot be probed. */
+  found: string | null;
+  /** Structured failure, set exactly when `status` is `"cleanup-failed"`. */
+  error: DelegateError | null;
+}
+
+/**
  * CAS-safe release of one private candidate artifact ref: the ref is deleted
- * only while it still points at exactly `expectedCommit`. `update-ref -d`
- * with an old-value performs that compare-and-delete inside Git itself, so a
- * ref that someone else re-targeted concurrently survives untouched (false),
- * while a ref that already vanished counts as released (true). Refs outside
- * the Agent Hub candidate namespace are refused outright.
+ * only while it still points at exactly `expectedCommit`. `update-ref -d` with
+ * an old-value performs that compare-and-delete inside Git itself. The
+ * outcomes:
+ *
+ * - `released`: the delete succeeded, or the ref had already vanished.
+ * - `foreign-retarget`: the ref exists and names something else. That foreign
+ *   claim is preserved — correct behaviour, not a failure.
+ * - `cleanup-failed`: the ref still names *our* commit and the delete was
+ *   refused (locked ref, unwritable refs directory, git error), or its
+ *   existence cannot be established at all. Our own ref is still occupying the
+ *   namespace and could not be removed: never reported as released.
+ *
+ * Refs outside the Agent Hub candidate namespace are refused outright.
  */
 export async function releaseCandidateRef(
   workspace: string,
   ref: string,
   expectedCommit: string,
-): Promise<boolean> {
+): Promise<CandidateRefRelease> {
   if (!SAFE_REF_PATTERN.test(ref)) {
     throw new AgentHubError(
       "ARTIFACT_REF_INVALID",
@@ -154,18 +179,64 @@ export async function releaseCandidateRef(
     maxOutputBytes: 4000,
   });
   if (!cas.error && cas.exitCode === 0) {
-    return true;
+    return { status: "released", ref, found: null, error: null };
   }
+  const gitDetail = (cas.error ?? cas.stderr).trim();
 
-  // CAS rejected: distinguish "already gone" (released by whoever removed
-  // it) from "still there, pointing elsewhere" (a foreign claim — leave it).
-  // Probe the ref itself, not `${ref}^{commit}`: a concurrent retarget to a
-  // tree/blob/tag is still a foreign claim and must be preserved.
+  // The CAS was rejected or failed. Probe the ref itself, not `${ref}^{commit}`:
+  // a concurrent retarget to a tree/blob/tag is still a foreign claim and must
+  // be preserved, and a probe we cannot trust must never read as "released".
   const probe = await runProcess("git", ["rev-parse", "--quiet", "--verify", ref], {
     cwd: workspace,
     maxOutputBytes: 256,
   });
-  return !probe.error && probe.exitCode !== 0;
+  const found = probe.stdout.trim();
+
+  if (probe.error) {
+    return cleanupFailure(ref, null, "the ref could not be probed", probe.error);
+  }
+  if (probe.exitCode === 0 && found !== "") {
+    if (found === expectedCommit) {
+      return cleanupFailure(
+        ref,
+        found,
+        "it still points at the commit this hub created, so the delete was refused rather than mis-targeted",
+        gitDetail,
+      );
+    }
+    return { status: "foreign-retarget", ref, found, error: null };
+  }
+  // Verified absence is exit 1 with no output. Anything else (a fatal git
+  // error, exit 0 printing nothing) proves nothing and is never "released".
+  if (probe.exitCode === 1 && found === "") {
+    return { status: "released", ref, found: null, error: null };
+  }
+  return cleanupFailure(
+    ref,
+    null,
+    `its existence could not be established (git rev-parse exited ${probe.exitCode ?? "null"})`,
+    probe.stderr.trim() || gitDetail,
+  );
+}
+
+function cleanupFailure(
+  ref: string,
+  found: string | null,
+  why: string,
+  gitDetail: string,
+): CandidateRefRelease {
+  return {
+    status: "cleanup-failed",
+    ref,
+    found,
+    error: {
+      code: "ARTIFACT_REF_CLEANUP_FAILED",
+      message:
+        `Private artifact ref "${ref}" could not be released: ${why}` +
+        `${gitDetail ? ` (git: ${gitDetail})` : ""}. ` +
+        "The ref is still retained; releasing was never attempted blindly and nothing was deleted.",
+    },
+  };
 }
 
 /**
@@ -173,8 +244,13 @@ export async function releaseCandidateRef(
  * terminal paths (CLI `fanout`, MCP fan-out tools) run this in a `finally`
  * once the result and any merge are no longer consumers of the refs; the
  * core library never calls it because there the caller owns cleanup.
- * Failures are returned, never thrown: cleanup trouble must not mask the
- * operation it follows.
+ *
+ * Returned errors are *real* cleanup trouble (`cleanup-failed`): a ref this
+ * hub still owns that it could not delete. Foreign-retargeted refs are not
+ * errors — preserving them is the point of the CAS. Failures are returned,
+ * never thrown: cleanup trouble must not mask the operation it follows, but
+ * the terminal paths must fail on it (exit `1` / `isError`) because refs the
+ * operator was promised are gone.
  */
 export async function releaseFanOutArtifactRefs(
   workspace: string,
@@ -187,7 +263,10 @@ export async function releaseFanOutArtifactRefs(
       continue;
     }
     try {
-      await releaseCandidateRef(workspace, artifact.ref, artifact.commit);
+      const release = await releaseCandidateRef(workspace, artifact.ref, artifact.commit);
+      if (release.error) {
+        errors.push(release.error);
+      }
     } catch (error) {
       errors.push(asDelegateError(error));
     }

@@ -1,12 +1,18 @@
+import { chmod } from "node:fs/promises";
+import { join } from "node:path";
+
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { describe, expect, it } from "vitest";
 
 import { createHubServer } from "../src/mcp.js";
 import {
+  BLOCKED_WRITE_IS_MEANINGFUL,
+  BLOCKING_JUDGE_SCRIPT,
   candidateRefNames,
   createGitRepository,
   removeDirectory,
+  resolveRef,
   runGit,
 } from "./helpers.js";
 
@@ -308,4 +314,83 @@ describe("MCP server", () => {
       await removeDirectory(repository);
     }
   }, 30_000);
+
+  it.runIf(BLOCKED_WRITE_IS_MEANINGFUL)(
+    "reports an unreleasable artifact ref as a tool failure",
+    async () => {
+      const repository = await createGitRepository();
+      const refsDir = join(repository, ".git", "refs", "agent-hub", "candidates");
+      const previous = {
+        OMP_BIN: process.env.AGENT_HUB_OMP_BIN,
+        OMP_ARGS: process.env.AGENT_HUB_OMP_ARGS,
+        GROK_BIN: process.env.AGENT_HUB_GROK_BIN,
+        GROK_ARGS: process.env.AGENT_HUB_GROK_ARGS,
+      };
+      process.env.AGENT_HUB_OMP_BIN = process.execPath;
+      process.env.AGENT_HUB_OMP_ARGS = JSON.stringify([
+        "-e",
+        BLOCKING_JUDGE_SCRIPT,
+        "{task}",
+        refsDir,
+      ]);
+      process.env.AGENT_HUB_GROK_BIN = process.execPath;
+      process.env.AGENT_HUB_GROK_ARGS = JSON.stringify([
+        "-e",
+        "require('fs').writeFileSync('mcp-grok.txt', process.argv[1]);",
+        "{task}",
+      ]);
+
+      try {
+        const client = await connectClient();
+        const result = await client.callTool({
+          name: "compete_candidates",
+          arguments: {
+            workspace: repository,
+            candidates: [
+              { agent: "omp", task: "one" },
+              { agent: "grok", task: "two" },
+            ],
+            judge_agent: "omp",
+          },
+        });
+        await chmod(refsDir, 0o755);
+
+        // Selecting a winner is not enough: refs this tool promised to release
+        // are still present, so it reports them and flags the call as failed.
+        expect(result.isError ?? false).toBe(true);
+        const document = documentFrom(result);
+        const fan = document.fan_out as {
+          status: string;
+          candidates: Array<{ artifact: { ref: string; commit: string } }>;
+        };
+        const competition = document.competition as { status: string };
+        expect(fan.status).toBe("success");
+        expect(competition.status).toBe("selected");
+        expect(document.merge).toBeNull();
+        const cleanup = document.ref_cleanup_errors as Array<{ code: string }>;
+        expect(cleanup.map((failure) => failure.code)).toEqual([
+          "ARTIFACT_REF_CLEANUP_FAILED",
+          "ARTIFACT_REF_CLEANUP_FAILED",
+        ]);
+        for (const candidate of fan.candidates) {
+          expect(await resolveRef(repository, candidate.artifact.ref)).toBe(
+            candidate.artifact.commit,
+          );
+        }
+      } finally {
+        for (const [key, value] of Object.entries({
+          AGENT_HUB_OMP_BIN: previous.OMP_BIN,
+          AGENT_HUB_OMP_ARGS: previous.OMP_ARGS,
+          AGENT_HUB_GROK_BIN: previous.GROK_BIN,
+          AGENT_HUB_GROK_ARGS: previous.GROK_ARGS,
+        })) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        await chmod(refsDir, 0o755).catch(() => {});
+        await removeDirectory(repository);
+      }
+    },
+    30_000,
+  );
 });

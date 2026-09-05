@@ -20,7 +20,7 @@ import {
   runGit,
   type BaseWorktree,
 } from "./git.js";
-import { acquireRepositoryLock, type RepositoryLock } from "./locks.js";
+import { acquireRepositoryLock, claimUnderLock, type RepositoryLock } from "./locks.js";
 import { WORKTREE_ADMIN_LOCK_NAME } from "./fanout.js";
 import {
   applySessionTransition,
@@ -287,6 +287,8 @@ async function runSessionTurn(
   let runError: DelegateError | null = null;
   let worktree: BaseWorktree | undefined;
   let result: SessionRunResult | undefined;
+  /** Session worktree that was created but whose admin lock could not be released. */
+  let adminReleaseError: DelegateError | null = null;
 
   const delegateRequest: DelegateRequest = {
     task: turn.task,
@@ -300,7 +302,17 @@ async function runSessionTurn(
   const startedAt = turn.now();
   try {
     // Fresh worktree at the session artifact commit, every single time.
-    worktree = await withAdminLock(() => createWorktree(workspace, turn.baseCommit));
+    // Claiming it and releasing the admin lock are separate facts: a release
+    // failure must not cost the session its handle, because without the handle
+    // the `finally` teardown below cannot even be attempted, and the reported
+    // cleanup error would not know which worktree it is talking about.
+    const claim = await claimUnderLock(
+      () => acquireAdminLock(commonDir),
+      () => createWorktree(workspace, turn.baseCommit),
+      (worktree) => worktree.path,
+    );
+    worktree = claim.value;
+    adminReleaseError = claim.releaseError ? asDelegateError(claim.releaseError) : null;
     try {
       adapterResult = await adapter.execute({
         task: turn.task,
@@ -359,7 +371,7 @@ async function runSessionTurn(
       },
       artifact,
       execution_workspace: worktree.path,
-      cleanup_error: null,
+      cleanup_error: adminReleaseError,
     };
   } finally {
     if (worktree) {
@@ -372,7 +384,14 @@ async function runSessionTurn(
         });
       } catch (error) {
         if (result) {
-          result.cleanup_error = asDelegateError(error);
+          const trouble = asDelegateError(error);
+          // Never displace an earlier cleanup problem; report both.
+          result.cleanup_error = result.cleanup_error
+            ? {
+                code: result.cleanup_error.code,
+                message: `${result.cleanup_error.message} Teardown also failed: ${trouble.message}`,
+              }
+            : trouble;
         }
         // Pre-transition failures must not be masked by teardown noise.
       }

@@ -1,12 +1,13 @@
-import { access, realpath, writeFile } from "node:fs/promises";
+import { access, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
 import { runCompetition, type CompetitionDependencies, type CompetitionStrategy } from "../src/competition.js";
 import { AgentHubError } from "../src/errors.js";
-import { fanOut } from "../src/fanout.js";
+import { fanOut, WORKTREE_ADMIN_LOCK_NAME } from "../src/fanout.js";
 import { resolveRepositoryIdentity } from "../src/git.js";
+import { acquireRepositoryLock, lockPathFor, type RepositoryLock } from "../src/locks.js";
 import { runProcess } from "../src/process.js";
 import { SELECTION_MARKER_PREFIX } from "../src/selection.js";
 import type {
@@ -383,6 +384,92 @@ describe("competition", { timeout: 30_000 }, () => {
       await expect(access(judge.requests[0].cwd)).rejects.toThrow();
       expect(await worktreeCount(repo)).toBe(1);
     } finally {
+      await removeDirectory(repo);
+    }
+  });
+
+  it("retains the judge worktree, attempts teardown, and reports the leak when its admin lock release fails", async () => {
+    const repo = await createGitRepository();
+    const base = await resolveRepositoryIdentity(repo);
+    const leakedWorktrees: string[] = [];
+    const wedgedRecord = lockPathFor(base.common_dir, WORKTREE_ADMIN_LOCK_NAME);
+
+    // The judge worktree is claimed under the same admin lock fan-out uses.
+    // Only the first claim's release misbehaves; every later claim is sane — it
+    // simply cannot get in while the wedged record is on disk.
+    function firstReleaseFails(): (commonDir: string) => Promise<RepositoryLock> {
+      let attempts = 0;
+      return async (commonDir: string) => {
+        attempts += 1;
+        const lock = await acquireRepositoryLock({
+          commonDir,
+          name: WORKTREE_ADMIN_LOCK_NAME,
+        });
+        if (attempts > 1) {
+          return lock;
+        }
+        return {
+          ...lock,
+          release: async () => {
+            throw new Error("simulated admin lock release failure");
+          },
+        };
+      };
+    }
+
+    try {
+      const fan = fanResult(base, [candidateFixture(base, 0), candidateFixture(base, 1)]);
+
+      const judge = fakeJudge({ stdout: markerLine("cand-1", "tighter scope") });
+      const won = await runCompetition(
+        { fan_out: fan, strategy: "judge", judge_agent: "judge-1" },
+        {
+          verifyArtifact: verifyAll,
+          resolveAdapter: judgeResolver(judge.adapter),
+          acquireAdminLock: firstReleaseFails(),
+        },
+      );
+      leakedWorktrees.push(join(judge.requests[0].cwd, ".."));
+
+      // The selection stands — cleanup trouble does not undo a real winner —
+      // and the retained handle let teardown be attempted.
+      expect(won.status).toBe("selected");
+      expect(won.winner?.candidate_id).toBe("cand-1");
+      // Without the admin lock the hub will not touch worktree administration,
+      // so the worktree survives and the error names it.
+      await expect(access(judge.requests[0].cwd)).resolves.toBeUndefined();
+      expect(await worktreeCount(repo)).toBe(2);
+      expect(won.error?.code).toBe("LOCK_RELEASE_FAILED");
+      expect(won.error?.message).toContain("simulated admin lock release failure");
+      expect(won.error?.message).toContain(judge.requests[0].cwd);
+      expect(won.judge?.error).toEqual(won.error);
+
+      // Clear the wedged record so the next competition can claim a lock again.
+      await rm(wedgedRecord, { recursive: true, force: true });
+
+      // A judge failure never hides the leak either: both troubles are reported.
+      const failing = fakeJudge({ stdout: "not a selection", exitCode: 3 });
+      const lost = await runCompetition(
+        { fan_out: fan, strategy: "judge", judge_agent: "judge-1" },
+        {
+          verifyArtifact: verifyAll,
+          resolveAdapter: judgeResolver(failing.adapter),
+          acquireAdminLock: firstReleaseFails(),
+        },
+      );
+      leakedWorktrees.push(join(failing.requests[0].cwd, ".."));
+      expect(lost.status).toBe("failure");
+      expect(lost.winner).toBeNull();
+      expect(lost.error?.code).toBe("JUDGE_FAILED");
+      expect(lost.error?.message).toContain("Additionally: simulated admin lock release failure");
+      expect(lost.error?.message).toContain(failing.requests[0].cwd);
+      await expect(access(failing.requests[0].cwd)).resolves.toBeUndefined();
+      expect(await worktreeCount(repo)).toBe(3);
+    } finally {
+      await rm(wedgedRecord, { recursive: true, force: true }).catch(() => {});
+      for (const leaked of leakedWorktrees) {
+        await removeDirectory(leaked);
+      }
       await removeDirectory(repo);
     }
   });

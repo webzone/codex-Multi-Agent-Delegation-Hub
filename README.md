@@ -76,10 +76,16 @@ each candidate keeps its own `status`/`error`.
 
 The core library hands retained artifact refs to its caller. The terminal
 paths — CLI `fanout` and the MCP fan-out tools — own the tail of that
-lifecycle: they release every ref they created before returning, CAS-safe (a
-ref someone else re-targeted is left alone), and report `ref_cleanup_errors`
-in the document if releasing itself failed. Review candidates from the
-returned diffs; after the command ends, the refs are gone.
+lifecycle: they release every ref they created before returning, CAS-safe, and
+they distinguish three outcomes instead of collapsing them into a boolean. The
+ref is gone; the ref now names something else, so a foreign claim survives
+untouched; or the ref still names this hub's own commit and the delete was
+refused (`cleanup-failed` — a locked ref, an unwritable refs directory, a git
+failure). Only that third case is an error: it is reported per ref as
+`ref_cleanup_errors`, makes the command exit `1` and the tools report
+`isError`, and leaves the ref in place for an operator, because the hub never
+claims a ref is gone when it could not delete it. Review candidates from the
+returned diffs; after a clean command ends, the refs are gone.
 
 Repeat `--task` once per `--agent` to pair distinct tasks in order, or pass a
 single `--task` to give every agent the same assignment.
@@ -109,7 +115,9 @@ mutation is a structured result, not a crash: `strategy: "none"`,
 A failure after the fast-forward already happened never claims there was no
 mutation: the outcome reports `strategy: "fast-forward"`, the observed `HEAD`
 as `applied_commit`, and `MERGE_POSTCONDITION_FAILED` or
-`LOCK_RELEASE_FAILED`. Adoption is never rolled back — inspect the checkout.
+`LOCK_RELEASE_FAILED` — including when something outside Agent Hub switched
+the checkout to another branch in the meantime. Adoption is never rolled back —
+inspect the checkout.
 Merge status/errors are distinct from the v1 `DelegateStatus` vocabulary and
 live on the `merge` object only.
 
@@ -151,8 +159,9 @@ and `session_resume`. `compete_candidates.auto_merge` defaults to `false`.
 Every tool returns structured JSON content with `isError`; a failing operation
 comes back as `{ error: { code, message } }` and never escapes as a
 transport-level exception. The fan-out tools report a `partial` or `failure`
-aggregate status as `isError` and, like the CLI, release the artifact refs
-they created before returning. MCP clients and the CLI call the same cores;
+aggregate status, and a `ref_cleanup_errors` entry (an artifact ref they could
+not release), as `isError`; like the CLI, they release the artifact refs they
+created before returning. MCP clients and the CLI call the same cores;
 transport code does not contain provider or Git logic.
 
 ## Adapter configuration
@@ -207,11 +216,23 @@ v2 fan-out:
 - The result carries an aggregate `status`; CLI and MCP treat anything but
   `success` as an operation failure. The core retains artifact refs for its
   caller; terminal paths release them CAS-safe at the end and there is no
-  ref garbage collection.
-- Repository locks recover from crashes conservatively: a lock whose same-host
-  owner is demonstrably dead, and an ownerless lock directory older than the
-  60s crash-recovery grace window, are reclaimed through an atomic rename
-  arbiter; anything else reports `LOCK_BUSY` / `LOCK_UNRECOVERABLE`.
+  ref garbage collection. A ref this hub still owns that it could not delete
+  is reported in `ref_cleanup_errors` and fails the command; a ref someone
+  else re-targeted is preserved and is not an error.
+- Repository locks recover only on proof. A lock whose same-host owner is
+  demonstrably dead is reclaimed through an atomic rename arbiter. An ownerless
+  lock directory (no `owner.json`) is never reclaimed automatically, at any
+  age: a creator that is stopped, throttled, or stuck on a hung filesystem sits
+  in exactly that state, and reclaiming on elapsed time would hand one lock to
+  two holders. It reports `LOCK_UNRECOVERABLE` and is a manual inspection item
+  — automatic recovery would need acquisition to be a single atomic claim that
+  records the owner as it creates the lock, which this lock is not.
+- When a worktree is created but its admin lock cannot be released, the handle
+  is kept, not lost: the artifact is still captured, teardown is still
+  attempted, and the leaked worktree path is named in the candidate's `error`,
+  the competition's `error`, or the session's `cleanup_error`. While that lock
+  record stays on disk the hub will not touch worktree administration, so both
+  the worktree and the lock record are the operator's to clear.
 
 v2 auto-merge (opt-in, all conditions enforced again under the
 repository-local merge lock immediately before the checkout is touched):
@@ -224,7 +245,8 @@ repository-local merge lock immediately before the checkout is touched):
   private ref, and descend from the captured base.
 - Adoption is a verified fast-forward (`git merge --ff-only`) of that one
   internally selected commit, with hooks disabled. Afterwards, `HEAD` must
-  equal the artifact commit and the checkout must still be clean.
+  equal the artifact commit, the checkout must still be attached to the branch
+  that was fast-forwarded, and the tree must still be clean.
 - Any condition that fails before adoption is a serializable refusal
   (`strategy: "none"`) with no mutation: no stash, no reset, no force, no
   rebase, no cherry-pick, no patch apply, no conflict resolution. If the base
@@ -234,6 +256,13 @@ repository-local merge lock immediately before the checkout is touched):
   `strategy: "fast-forward"` with the observed `HEAD` and
   `MERGE_POSTCONDITION_FAILED` / `LOCK_RELEASE_FAILED`; there is no rollback
   path and no pretense of a no-mutation refusal.
+- Residual race, stated plainly: the merge lock serialises Agent Hub against
+  itself, not the repository. A concurrent `git switch`, `git checkout`, or
+  `git reset` from outside can still move the checkout between the pre-check
+  and the post-adoption probe. Verifying the attached branch turns that into a
+  reported applied-but-failed outcome instead of a false "adopted and
+  verified", but it narrows the window; it does not close it, and nothing is
+  ever rolled back.
 
 Sessions/continuation:
 
@@ -244,6 +273,11 @@ Sessions/continuation:
   failed session turn persists its filesystem state and remains resumable;
   the session ref and state advance together through a sidecar-guarded
   compare-and-set protocol.
+- Commit ids in session state are full object names — exactly 40 or exactly 64
+  hex characters — and the "this ref must not exist yet" compare-and-set uses an
+  all-zero OID at the repository's own hash width, derived from the commit being
+  written rather than hard-coded, so sessions work on SHA-1 and SHA-256
+  repositories alike.
 
 Not in scope for v2: queued workflows, remote providers, or cross-repository
 merges.

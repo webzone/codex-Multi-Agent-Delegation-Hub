@@ -33,6 +33,18 @@ import type {
  * as a no-mutation refusal, because there is no rollback on this path. There
  * is no stash, reset, force, rebase, cherry-pick, or conflict resolution
  * anywhere here.
+ *
+ * Residual race, stated honestly: the merge lock serialises Agent Hub against
+ * itself. It cannot fence a concurrent `git switch`, `git checkout`, `git
+ * reset`, or any other external writer — Git's own index/HEAD locking is not
+ * something this module can hold on the caller's behalf. Checks are therefore
+ * snapshots: the pre-check can pass, the fast-forward can land correctly, and
+ * an external process can still move HEAD or re-attach the checkout before
+ * this function returns. Verification after adoption narrows that window to
+ * the probe itself and turns the outcome into a truthful
+ * `MERGE_POSTCONDITION_FAILED` rather than a false "adopted and verified"; it
+ * does not eliminate the race, and nothing here rolls anything back. Treat an
+ * applied-but-failed outcome as "adopted, unverified" and inspect the checkout.
  */
 
 export const MERGE_LOCK_NAME = "merge";
@@ -54,11 +66,14 @@ export interface MergeDependencies {
   acquireMergeLock?: (commonDir: string) => Promise<RepositoryLock>;
   /**
    * Post-adoption probe, run immediately after `git merge --ff-only`
-   * succeeds; reports the checkout's observed HEAD and clean status. The
-   * default reads HEAD and `git status`; tests inject this seam to exercise
-   * the applied-but-failed path deterministically.
+   * succeeds; reports the checkout's observed HEAD, clean status, and the
+   * branch it is actually attached to (`null` when detached). The default
+   * reads HEAD, `git status`, and `git symbolic-ref`; tests inject this seam to
+   * exercise the applied-but-failed path deterministically.
    */
-  verifyPostAdoption?: (workspace: string) => Promise<{ head: string; clean: boolean }>;
+  verifyPostAdoption?: (
+    workspace: string,
+  ) => Promise<{ head: string; clean: boolean; branch: string | null }>;
 }
 
 export interface AutoMergeInput {
@@ -254,19 +269,29 @@ async function adoptUnderLock(
   }
   notes.push("fast-forward-applied");
 
-  // 8. Post-conditions: HEAD is exactly the adopted commit and the checkout
-  //    is still clean. The fast-forward is applied at this point: anything
-  //    that fails here is reported truthfully — strategy "fast-forward", the
+  // 8. Post-conditions: HEAD is exactly the adopted commit, the checkout is
+  //    still attached to the branch that was fast-forwarded, and the tree is
+  //    still clean. The fast-forward is applied at this point: anything that
+  //    fails here is reported truthfully — strategy "fast-forward", the
   //    observed HEAD, `clean: false`, a structured error — and never rolled
   //    back or disguised as a no-mutation refusal.
+  //
+  //    The attached branch is verified, not assumed. Every check above is a
+  //    snapshot, and a merge lock only serialises Agent Hub: an external `git
+  //    switch`, `git checkout`, or `git reset` can still move HEAD between the
+  //    pre-check and this probe. Catching that here is the difference between
+  //    reporting "adopted and verified" and reporting it truthfully.
   const verifyPostAdoption =
     dependencies.verifyPostAdoption ??
     (async (target: string) => ({
       head: await currentRevision(target),
       clean: !(await isDirty(target)),
+      branch: (await runGit(target, ["symbolic-ref", "--quiet", "--short", "HEAD"], 1000).catch(
+        () => null,
+      ))?.stdout.trim() ?? null,
     }));
 
-  let observed: { head: string; clean: boolean } | null = null;
+  let observed: { head: string; clean: boolean; branch: string | null } | null = null;
   let postError: DelegateError | null = hooksCleanupError
     ? {
         code: "MERGE_POSTCONDITION_FAILED",
@@ -289,6 +314,17 @@ async function adoptUnderLock(
       code: "MERGE_POSTCONDITION_FAILED",
       message: `HEAD is ${observed!.head} after adoption, expected ${artifact.commit}. The fast-forward was applied and is never rolled back; inspect the checkout`,
     };
+  }
+  if (postError === null && observed!.branch !== base.branch) {
+    postError = {
+      code: "MERGE_POSTCONDITION_FAILED",
+      message:
+        `The checkout is attached to ${
+          observed!.branch === null ? "a detached HEAD" : `"${observed!.branch}"`
+        } after adoption, expected the captured branch "${base.branch}". ` +
+        "Something outside Agent Hub changed the attachment after the pre-check passed. The fast-forward was applied and is never rolled back; inspect the checkout",
+    };
+    notes.push(`attached-branch-diverged: ${observed!.branch ?? "(detached)"}`);
   }
   if (postError === null && !observed!.clean) {
     postError = {
@@ -330,8 +366,10 @@ async function adoptUnderLock(
  * touched. Returns a serializable `MergeOutcome` on every path: refusals use
  * `strategy: "none"` with no mutation, and once a fast-forward has been
  * applied the outcome reports it truthfully — even when post-adoption
- * verification or the lock release afterwards fails. It does not throw for
- * normal outcomes.
+ * verification (HEAD, the attached branch, cleanliness) or the lock release
+ * afterwards fails. It does not throw for normal outcomes, and it cannot make
+ * an external process's later checkout change unobserved; see the residual
+ * race in the module comment.
  */
 export async function mergeCandidate(
   request: MergeCandidateRequest,

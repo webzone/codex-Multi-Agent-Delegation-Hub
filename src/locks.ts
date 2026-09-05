@@ -1,17 +1,18 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
 
 import { deferred } from "./deferred.js";
-import { AgentHubError } from "./errors.js";
+import { asDelegateError, AgentHubError } from "./errors.js";
 
 /**
  * Repository-local advisory lock stored under `<git-common-dir>/agent-hub/locks`.
  * Because it lives in the common dir it is shared by every linked worktree of
  * the same repository, which is exactly the scope Git worktree administration
  * needs. It is intentionally tiny: exclusive directory creation, an owner
- * metadata file, owner-only release, and conservative stale recovery.
+ * metadata file, owner-only release, and recovery that is only ever triggered
+ * by proof.
  *
  * Crash recovery, in order of what is provable about a lock we failed to
  * create:
@@ -20,25 +21,26 @@ import { AgentHubError } from "./errors.js";
  *   reclaimed via an atomic rename arbiter that re-checks the token.
  * - Live, unverifiable-PID, or foreign-host ownership: LOCK_BUSY /
  *   LOCK_UNRECOVERABLE; never deleted.
- * - Ownerless directory (no `owner.json` at all): the only state a crash can
- *   leave inside the window between the exclusive `mkdir` and the atomic
- *   owner write. Once the directory's own mtime is older than
- *   `ownerlessGraceMs` (default 60s, orders of magnitude wider than that
- *   window), it is reclaimed through the same rename arbiter — and if an
- *   owner file appears while the reclaim is in flight, the directory is put
- *   back untouched. A fresh ownerless directory (grace not elapsed) is left
- *   alone with LOCK_UNRECOVERABLE instead of being guessed about.
- * - A present-but-corrupt `owner.json` is never age-recovered: writes are
- *   atomic, so corrupt metadata means external tampering, not a crash
+ * - Ownerless directory (no `owner.json` at all): LOCK_UNRECOVERABLE, always.
+ *   Age is not evidence of death. A creator that is stopped (SIGSTOP),
+ *   suspended by the OS, or simply stalled on a hung filesystem sits inside
+ *   the window between the exclusive `mkdir` and the owner write indefinitely
+ *   while looking exactly like a crash remnant; reclaiming on age alone would
+ *   hand the same lock to a second holder while the first one is still about
+ *   to write its owner file and start working. Automatic recovery would need
+ *   acquisition to be a genuinely atomic claim — the owner record materialised
+ *   by the same syscall that creates the lock (a hardlink or symlink of a
+ *   pre-written content blob), not "directory first, owner second" — and this
+ *   lock does not do that. An ownerless directory is therefore a manual
+ *   inspection item: confirm no Agent Hub process owns it, then remove it.
+ * - A present-but-corrupt `owner.json` is never age-recovered either: writes
+ *   are atomic, so corrupt metadata means external tampering, not a crash
  *   remnant. LOCK_UNRECOVERABLE.
  */
 
 const LOCK_SUBDIR = join("agent-hub", "locks");
 const OWNER_FILE = "owner.json";
 const LOCK_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
-
-/** Crash-recovery grace for lock directories that never received an owner file. */
-export const OWNERLESS_GRACE_MS = 60_000;
 
 export interface LockOwner {
   token: string;
@@ -66,9 +68,6 @@ export interface LockAcquireOptions {
   retryDelayMs?: number;
   /** Seam for liveness probing in tests. Default: `process.kill(pid, 0)`. */
   probePid?: (pid: number) => "live" | "dead";
-  /** Grace before an ownerless lock directory (no owner.json at all) is reclaimed,
-   *  measured from the directory's mtime. Default 60s; 0 reclaims on sight. */
-  ownerlessGraceMs?: number;
   now?: () => Date;
   newToken?: () => string;
 }
@@ -139,33 +138,17 @@ async function sleep(ms: number): Promise<void> {
 type Staleness =
   | { state: "busy"; owner: LockOwner }
   | { state: "stale-dead"; owner: LockOwner }
-  | { state: "ownerless-expired"; ageMs: number }
   | { state: "unverifiable"; reason: string };
-
-/** Milliseconds since the lock directory was last modified; null if unreadable. */
-async function ownerlessAgeMs(lockPath: string, now: () => Date): Promise<number | null> {
-  try {
-    const info = await stat(lockPath);
-    // Filesystem timestamps may run slightly ahead of our clock: a negative
-    // age means "just created", never "already expired".
-    return Math.max(0, now().getTime() - info.mtimeMs);
-  } catch {
-    return null;
-  }
-}
 
 /**
  * Classify a lock we failed to create. Recovery is signalled only for what is
- * provable: an owner demonstrably dead on this same host, or an ownerless
- * directory whose crash-recovery grace window has elapsed. Everything else —
- * live, foreign-host, fresh-ownerless, corrupt metadata — surfaces as a
- * concrete busy/recovery error instead of being deleted.
+ * provable: an owner demonstrably dead on this same host. Everything else —
+ * live, foreign-host, ownerless, corrupt metadata — surfaces as a concrete
+ * busy/recovery error instead of being deleted.
  */
 async function classify(
   lockPath: string,
   probePid: (pid: number) => "live" | "dead",
-  ownerlessGraceMs: number,
-  now: () => Date,
 ): Promise<Staleness> {
   const stored = await readOwner(lockPath);
   if (stored.status === "corrupt") {
@@ -175,25 +158,16 @@ async function classify(
     };
   }
   if (stored.status === "absent") {
-    // Ownerless directory: the only crash trace possible between the
-    // exclusive mkdir and the atomic owner write. Reclaim only once the
-    // grace window has elapsed on the directory's own mtime.
-    const ageMs = await ownerlessAgeMs(lockPath, now);
-    if (ageMs === null) {
-      return {
-        state: "unverifiable",
-        reason: "lock directory vanished while its ownership was being probed",
-      };
-    }
-    if (ageMs >= ownerlessGraceMs) {
-      return { state: "ownerless-expired", ageMs };
-    }
+    // Ownerless directory. A creator that is stopped (SIGSTOP), throttled, or
+    // stuck on a hung filesystem sits in this state just as a crash does, and
+    // its directory mtime says nothing about which it is — stealing it would
+    // give a second holder the same lock. Automatic recovery needs a genuinely
+    // atomic claim (owner recorded by the syscall that creates the lock);
+    // acquisition here is "directory, then owner", so this stays manual.
     return {
       state: "unverifiable",
-      reason: `lock exists without owner metadata and has been ownerless for only ${Math.max(
-        0,
-        Math.round(ageMs),
-      )}ms of the ${ownerlessGraceMs}ms crash-recovery grace window; refusing to reclaim a lock that may still be mid-claim`,
+      reason:
+        "lock directory exists without owner metadata, which a live-but-stalled creator leaves behind exactly as a crash does; it is never reclaimed automatically",
     };
   }
   const owner = stored.owner;
@@ -247,47 +221,7 @@ async function tryRecover(
   return false;
 }
 
-/**
- * Reclaim an ownerless directory whose grace window expired. Same rename
- * arbiter: whoever moves it away re-checks it. If owner metadata appeared (or
- * the directory turned out corrupt) while it was moved aside, it is a live or
- * unexplainable claim — renamed straight back, untouched.
- */
-async function tryRecoverOwnerless(
-  lockPath: string,
-  ourToken: string,
-  attempt: number,
-): Promise<boolean> {
-  const reclaimPath = `${lockPath}.reclaim-${ourToken}-${attempt}`;
-  try {
-    await rename(lockPath, reclaimPath);
-  } catch {
-    return false; // Vanished or raced; caller retries.
-  }
-
-  const current = await readOwner(reclaimPath);
-  if (current.status === "absent") {
-    await rm(reclaimPath, { recursive: true, force: true });
-    return true;
-  }
-
-  try {
-    await rename(reclaimPath, lockPath);
-  } catch {
-    await rm(reclaimPath, { recursive: true, force: true }).catch(() => {});
-  }
-  return false;
-}
-
 function busyError(name: string, stale: Staleness): AgentHubError {
-  if (stale.state === "ownerless-expired") {
-    return new AgentHubError(
-      "LOCK_UNRECOVERABLE",
-      `Repository lock "${name}" is an ownerless ${Math.round(
-        stale.ageMs / 1000,
-      )}s-old remnant that could not be reclaimed concurrently. Retry, or inspect the lock directory.`,
-    );
-  }
   if (stale.state === "unverifiable") {
     return new AgentHubError(
       "LOCK_UNRECOVERABLE",
@@ -305,10 +239,10 @@ function busyError(name: string, stale: Staleness): AgentHubError {
  *
  * Ownership proof is a random token recorded in `owner.json` together with
  * pid/hostname/time. Release is owner-only. A lock left behind by a process
- * that is demonstrably dead on the same host, and an ownerless lock directory
- * whose `ownerlessGraceMs` window has elapsed (crash between mkdir and owner
- * write), are reclaimed automatically; live, foreign, fresh-ownerless, or
- * corrupt ownership produces LOCK_BUSY / LOCK_UNRECOVERABLE.
+ * that is demonstrably dead on the same host is reclaimed automatically;
+ * live, foreign, ownerless, or corrupt ownership produces LOCK_BUSY /
+ * LOCK_UNRECOVERABLE and is never deleted. An ownerless directory has no
+ * provable owner, so it is a manual inspection item — see the module comment.
  */
 export async function acquireRepositoryLock(options: LockAcquireOptions): Promise<RepositoryLock> {
   const {
@@ -317,7 +251,6 @@ export async function acquireRepositoryLock(options: LockAcquireOptions): Promis
     waitMs = 0,
     retryDelayMs = 25,
     probePid = defaultProbePid,
-    ownerlessGraceMs = OWNERLESS_GRACE_MS,
     now = () => new Date(),
     newToken = () => randomUUID(),
   } = options;
@@ -347,15 +280,11 @@ export async function acquireRepositoryLock(options: LockAcquireOptions): Promis
         throw error;
       }
 
-      const stale = await classify(lockPath, probePid, ownerlessGraceMs, now);
+      const stale = await classify(lockPath, probePid);
 
-      // Dead same-host ownership and expired ownerless remnants are reclaimed
-      // immediately: waiting cannot make a dead owner release, and recovery
-      // never requires the wait window.
+      // Dead same-host ownership is reclaimed immediately: waiting cannot make
+      // a dead owner release, and recovery never requires the wait window.
       if (stale.state === "stale-dead" && (await tryRecover(lockPath, stale.owner, token, attempt))) {
-        continue;
-      }
-      if (stale.state === "ownerless-expired" && (await tryRecoverOwnerless(lockPath, token, attempt))) {
         continue;
       }
       if (now().getTime() >= deadline) {
@@ -401,4 +330,69 @@ async function writeFileAtomic(path: string, contents: string): Promise<void> {
   const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(tempPath, contents, "utf8");
   await rename(tempPath, path);
+}
+
+/** Result of {@link claimUnderLock}. */
+export interface LockedClaim<T> {
+  /** Whatever the operation produced; the caller owns it even if release failed. */
+  value: T;
+  /** Set when the lock could not be released *after* the operation succeeded. */
+  releaseError: AgentHubError | null;
+}
+
+/**
+ * Run `operation` while holding a lock, then release it — with one deliberate
+ * asymmetry over `try/finally`: when the operation *succeeded* and the release
+ * then failed, the outcome is returned together with the release error instead
+ * of being replaced by a throw. The operation normally created something only
+ * the caller can tear down (a Git worktree, an admin directory), and converting
+ * a successful claim into a throw loses the handle while leaving the resource
+ * behind. A caller that receives a non-null `releaseError` must therefore still
+ * use `value` and attempt its teardown — and tell the operator what was left
+ * behind: with `describeResource` given, the release error names the resource.
+ *
+ * An operation failure propagates as a throw: nothing was claimed, so no handle
+ * can be orphaned. A release failure on that path is appended to the thrown
+ * error rather than dropped, because an unreleased lock record is its own
+ * operational problem.
+ */
+export async function claimUnderLock<T>(
+  acquire: () => Promise<RepositoryLock>,
+  operation: () => Promise<T>,
+  describeResource?: (value: T) => string,
+): Promise<LockedClaim<T>> {
+  const lock = await acquire();
+
+  let value: T;
+  try {
+    value = await operation();
+  } catch (error) {
+    try {
+      await lock.release();
+    } catch (releaseError) {
+      const failure = asDelegateError(error);
+      throw new AgentHubError(
+        failure.code,
+        `${failure.message} (and the repository lock could not be released either: ${
+          asDelegateError(releaseError).message
+        })`,
+      );
+    }
+    throw error;
+  }
+
+  try {
+    await lock.release();
+    return { value, releaseError: null };
+  } catch (releaseError) {
+    const failure = asDelegateError(releaseError);
+    return {
+      value,
+      releaseError: new AgentHubError(
+        failure.code === "INTERNAL_ERROR" ? "LOCK_RELEASE_FAILED" : failure.code,
+        `${failure.message}; the resource that was claimed under it still exists and needs` +
+          ` teardown${describeResource ? `: ${describeResource(value)}` : ""}`,
+      ),
+    };
+  }
 }

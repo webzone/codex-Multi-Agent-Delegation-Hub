@@ -3,7 +3,7 @@ import { CANDIDATE_REF_NAMESPACE } from "./artifacts.js";
 import { asDelegateError, AgentHubError } from "./errors.js";
 import { DEFAULT_MAX_OUTPUT_BYTES } from "./execution.js";
 import { createWorktreeAtBase, removeWorktree, type BaseWorktree } from "./git.js";
-import { acquireRepositoryLock, type RepositoryLock } from "./locks.js";
+import { acquireRepositoryLock, claimUnderLock, type RepositoryLock } from "./locks.js";
 import { runProcess } from "./process.js";
 import { isSafeCandidateId, parseSelection, SELECTION_MARKER_PREFIX } from "./selection.js";
 import { WORKTREE_ADMIN_LOCK_NAME } from "./fanout.js";
@@ -384,17 +384,18 @@ export async function runCompetition(
 
   // ---- Judge path (explicit strategy, 2+ eligible) ----
 
+  const acquireAdminLock =
+    dependencies.acquireAdminLock ??
+    ((commonDir: string) =>
+      acquireRepositoryLock({
+        commonDir,
+        name: WORKTREE_ADMIN_LOCK_NAME,
+        waitMs: ADMIN_LOCK_WAIT_MS,
+        retryDelayMs: ADMIN_LOCK_RETRY_MS,
+      }));
+
   async function withAdminLock<T>(operation: () => Promise<T>): Promise<T> {
-    const acquire =
-      dependencies.acquireAdminLock ??
-      ((commonDir: string) =>
-        acquireRepositoryLock({
-          commonDir,
-          name: WORKTREE_ADMIN_LOCK_NAME,
-          waitMs: ADMIN_LOCK_WAIT_MS,
-          retryDelayMs: ADMIN_LOCK_RETRY_MS,
-        }));
-    const lock = await acquire(base.common_dir);
+    const lock = await acquireAdminLock(base.common_dir);
     try {
       return await operation();
     } finally {
@@ -414,9 +415,36 @@ export async function runCompetition(
     };
     let winner: CompetitionWinner | null = null;
 
+    /** Judge worktree that was created but whose admin lock could not be released. */
+    let claimReleaseError: DelegateError | null = null;
+    /** Worktree teardown failed (typically: locked out by the wedged record). */
+    let teardownError: DelegateError | null = null;
+
+    /**
+     * One error field, every trouble. Precedence: the judge's own failure is
+     * primary, then the leaked worktree (the root cause of any lock trouble),
+     * then the teardown symptom — and none of them is ever dropped: whatever is
+     * left over is appended to the primary message.
+     */
+    function conclude(run: JudgeRun): JudgeRun {
+      const troubles = [run.outcome.error, claimReleaseError, teardownError];
+      const reported = troubles.filter((error): error is DelegateError => error !== null);
+      const [primary, ...rest] = reported;
+      run.outcome.error = primary
+        ? {
+            code: primary.code,
+            message:
+              rest.length > 0
+                ? [primary.message, ...rest.map((error) => error.message)].join(" Additionally: ")
+                : primary.message,
+          }
+        : null;
+      return run;
+    }
+
     const failWith = (error: DelegateError): JudgeRun => {
       outcome.error = error;
-      return { outcome, winner: null };
+      return conclude({ outcome, winner: null });
     };
 
     let adapter: AgentAdapter;
@@ -428,7 +456,17 @@ export async function runCompetition(
 
     let worktree: BaseWorktree;
     try {
-      worktree = await withAdminLock(() => createWorktree(workspace, base.head));
+      // A release failure after `git worktree add` must not swallow the
+      // handle: this function is the only party that can remove the judge
+      // worktree, so the claim keeps the handle and reports the release error
+      // with its path; `conclude` then orders every trouble.
+      const claim = await claimUnderLock(
+        () => acquireAdminLock(base.common_dir),
+        () => createWorktree(workspace, base.head),
+        (worktree) => worktree.path,
+      );
+      worktree = claim.value;
+      claimReleaseError = claim.releaseError ? asDelegateError(claim.releaseError) : null;
     } catch (error) {
       return failWith(asDelegateError(error));
     }
@@ -446,17 +484,18 @@ export async function runCompetition(
         message: error instanceof Error ? error.message : String(error),
       };
     } finally {
-      // Teardown always runs under the same admin lock fan-out uses; a
-      // cleanup failure must never mask an earlier judge failure.
+      // Teardown always runs under the same admin lock fan-out uses; a cleanup
+      // failure must never mask an earlier judge failure, so it is collected
+      // and ordered by `conclude` rather than written straight onto the outcome.
       try {
         await withAdminLock(() => removeWorktreeFn(workspace, worktree));
       } catch (error) {
-        outcome.error ??= asDelegateError(error);
+        teardownError = asDelegateError(error);
       }
     }
 
     if (!adapterResult) {
-      return { outcome, winner: null };
+      return conclude({ outcome, winner: null });
     }
 
     // Preserve the bounded raw output and truncation flag on every path,
@@ -511,7 +550,7 @@ export async function runCompetition(
       reason: parsed.selection.reason,
       basis: "judge",
     };
-    return { outcome, winner };
+    return conclude({ outcome, winner });
   }
 
   const judged = await judgeCompetition();

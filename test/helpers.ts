@@ -45,3 +45,26 @@ export async function candidateRefNames(repository: string): Promise<string[]> {
   ]);
   return output.split("\n").filter(Boolean);
 }
+
+/**
+ * Judge-aware fake-agent script that additionally makes the private candidate
+ * ref directory unwritable. The judge runs after every artifact ref exists and
+ * before a terminal path releases any of them, so a blocked release becomes
+ * deterministic instead of racy. Argument 1 is the task, argument 2 the ref
+ * directory. Joined into one line (no `//` comments inside); with `-e`,
+ * `argv[1]` is the first user argument.
+ */
+export const BLOCKING_JUDGE_SCRIPT = [
+  "const fs=require('node:fs');",
+  "const task=process.argv[1]||'';",
+  "if(task.includes('Agent Hub candidate competition')){",
+  "  const m=task.match(/^- ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) \\|/m);",
+  "  if(!m){console.error('judge found no candidate');process.exit(1);}",
+  "  fs.chmodSync(process.argv[2],0o555);",
+  "  console.log('AGENT_HUB_SELECTION: '+JSON.stringify({candidate_id:m[1],reason:'first eligible in request order'}));",
+  "}else{fs.writeFileSync('omp.txt',task);}",
+].join(" ");
+
+/** True when a read-only directory would actually block a delete. */
+export const BLOCKED_WRITE_IS_MEANINGFUL =
+  typeof process.getuid !== "function" || process.getuid() !== 0;

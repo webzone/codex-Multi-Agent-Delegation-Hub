@@ -1,10 +1,18 @@
-import { readFile } from "node:fs/promises";
+import { chmod, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
 import { parseCliArgs, parseCliCommand, runCli } from "../src/cli.js";
-import { candidateRefNames, createGitRepository, removeDirectory, runGit } from "./helpers.js";
+import {
+  BLOCKED_WRITE_IS_MEANINGFUL,
+  BLOCKING_JUDGE_SCRIPT,
+  candidateRefNames,
+  createGitRepository,
+  removeDirectory,
+  resolveRef,
+  runGit,
+} from "./helpers.js";
 
 async function withFakeAgents<T>(body: () => Promise<T>): Promise<T> {
   const saved = {
@@ -471,6 +479,66 @@ describe("CLI", () => {
           // The winner — first in request order, the omp candidate — landed.
           expect(await readFile(join(repository, "omp.txt"), "utf8")).toBe("alpha");
         } finally {
+          await removeDirectory(repository);
+        }
+      },
+      30_000,
+    );
+
+    it.runIf(BLOCKED_WRITE_IS_MEANINGFUL)(
+      "exits 1 with ref_cleanup_errors when the artifact refs cannot be released",
+      async () => {
+        const repository = await createGitRepository();
+        const refsDir = join(repository, ".git", "refs", "agent-hub", "candidates");
+        const io = collectors();
+        try {
+          // The judge is the deterministic moment: it runs after every artifact
+          // ref exists and before the command releases any of them.
+          const exitCode = await withAgentEnv(
+            ["-e", BLOCKING_JUDGE_SCRIPT, "{task}", refsDir],
+            ["-e", "require('node:fs').writeFileSync('grok.txt', process.argv[1]);", "{task}"],
+            () =>
+              runCli(
+                [
+                  "fanout",
+                  "--agent",
+                  "omp",
+                  "--agent",
+                  "grok",
+                  "--task",
+                  "alpha",
+                  "--task",
+                  "beta",
+                  "--judge",
+                  "omp",
+                  "--workspace",
+                  repository,
+                ],
+                io.output,
+              ),
+          );
+
+          await chmod(refsDir, 0o755);
+
+          // The operation itself succeeded; the promised release did not, and
+          // that is an operation failure with the refs still in place.
+          expect(exitCode).toBe(1);
+          const document = JSON.parse(io.stdout.join(""));
+          expect(document.fan_out.status).toBe("success");
+          expect(document.competition.status).toBe("selected");
+          expect(document.merge).toBeUndefined();
+          expect(
+            document.ref_cleanup_errors.map((failure: { code: string }) => failure.code),
+          ).toEqual(["ARTIFACT_REF_CLEANUP_FAILED", "ARTIFACT_REF_CLEANUP_FAILED"]);
+          for (const candidate of document.fan_out.candidates as Array<{
+            artifact: { ref: string; commit: string };
+          }>) {
+            expect(await resolveRef(repository, candidate.artifact.ref)).toBe(
+              candidate.artifact.commit,
+            );
+          }
+        } finally {
+          await chmod(refsDir, 0o755).catch(() => {});
           await removeDirectory(repository);
         }
       },

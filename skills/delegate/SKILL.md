@@ -57,9 +57,22 @@ agent-hub session resume <session-id> --task "<next turn>"
   operation failure (exit `1` / `isError`), while each candidate keeps its own
   `status` and `error`.
 - The terminal command releases the private artifact refs it created before it
-  exits, CAS-safe (a ref someone else re-targeted is left alone). Review from
-  the `diff` fields in the returned document; do not plan to inspect
-  `refs/agent-hub/candidates/...` after the command has ended.
+  exits, CAS-safe: a ref someone else re-targeted is left alone and that is
+  fine, while a ref still pointing at this hub's own commit that it could not
+  delete is an error. So read `ref_cleanup_errors`: if it is present the
+  command exited `1` for that reason and some
+  `refs/agent-hub/candidates/...` refs are still in the repository. Never
+  assume they are gone, and never delete one you did not create.
+- Review from the `diff` fields in the returned document; do not plan to
+  inspect `refs/agent-hub/candidates/...` after a clean command has ended.
+- A `LOCK_BUSY` that clears on its own is another Agent Hub operation working.
+  A `LOCK_UNRECOVERABLE` is not: it means a lock record whose owner nobody can
+  prove is dead — including an ownerless lock directory, which is never
+  reclaimed automatically at any age because a paused process looks identical.
+  Inspect `<common-dir>/agent-hub/locks/`, confirm no Agent Hub process owns
+  it, and only then remove the record. If a candidate, competition, or session
+  reports `LOCK_RELEASE_FAILED` with a worktree path, that worktree is still
+  there and needs the same kind of manual cleanup.
 - A session is an agent continuation lineage. `resume` runs the next turn in a
   fresh isolated worktree at the latest artifact commit. A failed turn still
   commits its artifact and advances the session before the error is reported,
@@ -89,10 +102,11 @@ revalidates, under the repository merge lock:
   from that base.
 
 If every check passes, the branch is fast-forwarded to the artifact commit
-with hooks disabled, and `HEAD` plus a clean tree are re-verified. Otherwise
-the result is a refusal — `strategy: "none"`, `clean: false`, a `MERGE_*`
-code, and no mutation at all. Auto-merge never stashes, resets, force-updates,
-rebases, cherry-picks, applies patches, or resolves conflicts.
+with hooks disabled, and `HEAD`, the branch the checkout is attached to, and a
+clean tree are re-verified. Otherwise the result is a refusal — `strategy:
+"none"`, `clean: false`, a `MERGE_*` code, and no mutation at all. Auto-merge
+never stashes, resets, force-updates, rebases, cherry-picks, applies patches,
+or resolves conflicts.
 
 A failure *after* the fast-forward is a different animal and is reported as
 one: `strategy: "fast-forward"` with the observed `HEAD` in `applied_commit`
@@ -100,6 +114,14 @@ plus `MERGE_POSTCONDITION_FAILED` or `LOCK_RELEASE_FAILED`. There is no
 rollback — the checkout already moved. Treat such an outcome as "adopted but
 unverified": inspect the working tree and `git status`/`git log` yourself
 before doing anything else, and never retry the merge blindly.
+
+The merge lock only serialises Agent Hub against itself. A `git switch`,
+`git checkout`, or `git reset` that someone else runs after the pre-check can
+still move the checkout: re-verifying the attached branch reports that as an
+applied-but-failed outcome rather than a clean adoption, but it narrows the
+race, it does not remove it. If the reported branch is not the one you asked
+to merge into, look at the checkout before trusting anything else in the
+result.
 
 Continuation rules:
 

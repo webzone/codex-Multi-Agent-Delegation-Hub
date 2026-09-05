@@ -18,7 +18,7 @@ import type {
   CompetitionEligibleCandidate,
   CompetitionResult,
 } from "../src/competition.js";
-import { createGitRepository, removeDirectory, runGit } from "./helpers.js";
+import { createGitRepository, removeDirectory, resolveRef, runGit } from "./helpers.js";
 
 async function headOf(repository: string): Promise<string> {
   return (await runGit(repository, ["rev-parse", "HEAD"])).trim();
@@ -696,7 +696,7 @@ describe("merge", { timeout: 30_000 }, () => {
         const { base, artifact } = await makeArtifact(repository, "candidate.txt");
         const outcome = await mergeCandidate(
           { workspace: repository, base, candidateId: "c1", artifact },
-          { verifyPostAdoption: async () => ({ head: "d".repeat(40), clean: true }) },
+          { verifyPostAdoption: async () => ({ head: "d".repeat(40), clean: true, branch: base.branch }) },
         );
 
         expect(outcome.strategy).toBe("fast-forward");
@@ -742,7 +742,7 @@ describe("merge", { timeout: 30_000 }, () => {
         const { base, artifact } = await makeArtifact(repository, "candidate.txt");
         const outcome = await mergeCandidate(
           { workspace: repository, base, candidateId: "c1", artifact },
-          { verifyPostAdoption: async () => ({ head: artifact.commit as string, clean: false }) },
+          { verifyPostAdoption: async () => ({ head: artifact.commit as string, clean: false, branch: base.branch }) },
         );
 
         expect(outcome.strategy).toBe("fast-forward");
@@ -750,6 +750,50 @@ describe("merge", { timeout: 30_000 }, () => {
         expect(outcome.error?.code).toBe("MERGE_POSTCONDITION_FAILED");
         expect(outcome.applied_commit).toBe(artifact.commit);
         expect(await headOf(repository)).toBe(artifact.commit);
+      } finally {
+        await removeDirectory(repository);
+      }
+    });
+
+    it("reports an applied fast-forward when an external git switch races the post-check", async () => {
+      const repository = await createGitRepository();
+      try {
+        const { base, artifact } = await makeArtifact(repository, "candidate.txt");
+        const outcome = await mergeCandidate(
+          { workspace: repository, base, candidateId: "c1", artifact },
+          {
+            verifyPostAdoption: async (workspace) => {
+              // The race, played for real: an external `git switch -c`
+              // detaches the checkout from the captured branch only after the
+              // fast-forward has already been applied.
+              await runGit(workspace, ["switch", "-q", "-c", "other"]);
+              const branch = (
+                await runGit(workspace, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+              ).trim();
+              return {
+                head: await headOf(workspace),
+                clean: (await statusOf(workspace)) === "",
+                branch,
+              };
+            },
+          },
+        );
+
+        expect(outcome.strategy).toBe("fast-forward");
+        expect(outcome.clean).toBe(false);
+        expect(outcome.error?.code).toBe("MERGE_POSTCONDITION_FAILED");
+        // The message names both sides of the mismatch: the observed branch
+        // and the captured one.
+        expect(outcome.error?.message).toContain('"other"');
+        expect(outcome.error?.message).toContain(`"${base.branch}"`);
+        expect(outcome.notes).toContain("fast-forward-applied");
+        expect(outcome.notes).toContain("attached-branch-diverged: other");
+        // The probe reports the HEAD it actually saw: still the artifact
+        // commit — only the attached branch moved underneath the check.
+        expect(outcome.applied_commit).toBe(artifact.commit);
+        expect(await headOf(repository)).toBe(artifact.commit);
+        // No rollback: the captured branch still carries the adopted commit.
+        expect(await resolveRef(repository, `refs/heads/${base.branch}`)).toBe(artifact.commit);
       } finally {
         await removeDirectory(repository);
       }

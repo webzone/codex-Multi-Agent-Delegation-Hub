@@ -32,7 +32,8 @@ import type { RepositoryIdentity } from "./types.js";
  *
  *   1. the new artifact commit already exists as a Git object (commit-tree is durable),
  *   2. write the pending sidecar recording the full intended post-state,
- *   3. CAS `git update-ref <ref> <new> <expected-old>` (zero oid = must not exist),
+ *   3. CAS `git update-ref <ref> <new> <expected-old>` (an all-zero OID of the
+ *      repository's own hash width = "must not exist yet"),
  *   4. atomic JSON write of the state record,
  *   5. remove the sidecar.
  *
@@ -47,8 +48,10 @@ export const SESSION_REF_NAMESPACE = "refs/agent-hub/sessions";
 export const SESSION_SCHEMA_VERSION = 1;
 
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const COMMIT_PATTERN = /^[0-9a-f]{40,64}$/;
-const ZERO_OID = "0".repeat(40);
+/** A full object name: exactly one SHA-1 (40) or SHA-256 (64) hex width —
+ *  nothing in between is a commit id, and accepting it would let a truncated
+ *  or padded id through into a CAS comparison. */
+const COMMIT_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const STATE_SUFFIX = ".json";
 const PENDING_SUFFIX = ".pending.json";
 
@@ -153,6 +156,24 @@ export function sessionRefFor(sessionId: string): string {
 
 export function newSessionId(): string {
   return randomUUID();
+}
+
+/**
+ * The all-zero OID Git compares against when a ref must not exist yet. Its
+ * width is the object-name width of the repository's hash algorithm, derived
+ * from the commit being written — that commit's OID came from this very
+ * repository — rather than a hard-coded 40: in a SHA-256 repository Git rejects
+ * a 40-zero old value outright ("not a valid old SHA1"), so a fixed width
+ * breaks every session create there.
+ */
+export function zeroOidFor(oid: string): string {
+  if (!COMMIT_PATTERN.test(oid)) {
+    throw new AgentHubError(
+      "SESSION_STATE_INCONSISTENT",
+      `"${oid}" is not a full commit id, so its zero OID width cannot be derived`,
+    );
+  }
+  return "0".repeat(oid.length);
 }
 
 function sessionFileBase(commonDir: string, sessionId: string): string {
@@ -569,7 +590,8 @@ export async function applySessionTransition(
     await context.observePhase("sidecar-written");
   }
 
-  const cas = plan.expected_ref ?? ZERO_OID;
+  // "Must not exist yet" is expressed at the repository's own hash width.
+  const cas = plan.expected_ref ?? zeroOidFor(plan.new_commit);
   try {
     await runGit(repositoryCwd, ["update-ref", plan.ref, plan.new_commit, cas], 1000);
   } catch {
