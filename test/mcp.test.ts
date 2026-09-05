@@ -3,7 +3,12 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { describe, expect, it } from "vitest";
 
 import { createHubServer } from "../src/mcp.js";
-import { createGitRepository, removeDirectory } from "./helpers.js";
+import {
+  candidateRefNames,
+  createGitRepository,
+  removeDirectory,
+  runGit,
+} from "./helpers.js";
 
 async function connectClient(): Promise<Client> {
   const server = createHubServer();
@@ -180,4 +185,127 @@ describe("MCP server", () => {
       await removeDirectory(repository);
     }
   });
+
+  it("reports a partial fan-out as a tool failure and releases refs", async () => {
+    const previousBin = process.env.AGENT_HUB_OMP_BIN;
+    const previousArgs = process.env.AGENT_HUB_OMP_ARGS;
+    const previousGrokBin = process.env.AGENT_HUB_GROK_BIN;
+    const previousGrokArgs = process.env.AGENT_HUB_GROK_ARGS;
+    process.env.AGENT_HUB_OMP_BIN = process.execPath;
+    process.env.AGENT_HUB_OMP_ARGS = JSON.stringify([
+      "-e",
+      "require('fs').writeFileSync('mcp-partial.txt', process.argv[1]);",
+      "{task}",
+    ]);
+    process.env.AGENT_HUB_GROK_BIN = process.execPath;
+    process.env.AGENT_HUB_GROK_ARGS = JSON.stringify(["-e", "process.exit(3)"]);
+
+    const repository = await createGitRepository();
+    try {
+      const client = await connectClient();
+      const result = await client.callTool({
+        name: "fanout_candidates",
+        arguments: {
+          workspace: repository,
+          candidates: [
+            { agent: "omp", task: "one" },
+            { agent: "grok", task: "two" },
+          ],
+        },
+      });
+
+      // Partial is an operation failure, and the refs are gone either way.
+      expect(result.isError).toBe(true);
+      const document = documentFrom(result);
+      expect(document.status).toBe("partial");
+      expect(document.ref_cleanup_errors).toBeUndefined();
+      expect(await candidateRefNames(repository)).toEqual([]);
+    } finally {
+      for (const [key, value] of Object.entries({
+        AGENT_HUB_OMP_BIN: previousBin,
+        AGENT_HUB_OMP_ARGS: previousArgs,
+        AGENT_HUB_GROK_BIN: previousGrokBin,
+        AGENT_HUB_GROK_ARGS: previousGrokArgs,
+      })) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await removeDirectory(repository);
+    }
+  });
+
+  it("adopts the judged winner through compete_candidates and releases every ref", async () => {
+    const judgeAwareOmp = [
+      "const fs=require('node:fs');",
+      "const task=process.argv[1]||'';",
+      "if(task.includes('Agent Hub candidate competition')){",
+      "  const m=task.match(/^- ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) \\|/m);",
+      "  if(!m){console.error('judge found no candidate');process.exit(1);}",
+      "  console.log('AGENT_HUB_SELECTION: '+JSON.stringify({candidate_id:m[1],reason:'first eligible in request order'}));",
+      "}else{fs.writeFileSync('mcp-omp.txt',task);}",
+    ].join(" ");
+
+    const previous = {
+      OMP_BIN: process.env.AGENT_HUB_OMP_BIN,
+      OMP_ARGS: process.env.AGENT_HUB_OMP_ARGS,
+      GROK_BIN: process.env.AGENT_HUB_GROK_BIN,
+      GROK_ARGS: process.env.AGENT_HUB_GROK_ARGS,
+    };
+    process.env.AGENT_HUB_OMP_BIN = process.execPath;
+    process.env.AGENT_HUB_OMP_ARGS = JSON.stringify(["-e", judgeAwareOmp, "{task}"]);
+    process.env.AGENT_HUB_GROK_BIN = process.execPath;
+    process.env.AGENT_HUB_GROK_ARGS = JSON.stringify([
+      "-e",
+      "require('fs').writeFileSync('mcp-grok.txt', process.argv[1]);",
+      "{task}",
+    ]);
+
+    const repository = await createGitRepository();
+    try {
+      const client = await connectClient();
+      const result = await client.callTool({
+        name: "compete_candidates",
+        arguments: {
+          workspace: repository,
+          candidates: [
+            { agent: "omp", task: "one" },
+            { agent: "grok", task: "two" },
+          ],
+          judge_agent: "omp",
+          auto_merge: true,
+        },
+      });
+
+      expect(result.isError ?? false).toBe(false);
+      const document = documentFrom(result);
+      const fan = document.fan_out as { status: string };
+      const competition = document.competition as { status: string; mode: string };
+      const merge = document.merge as {
+        strategy: string;
+        clean: boolean;
+        error: unknown;
+        applied_commit: string;
+      };
+      expect(fan.status).toBe("success");
+      expect(competition.status).toBe("selected");
+      expect(competition.mode).toBe("judge");
+      expect(merge.strategy).toBe("fast-forward");
+      expect(merge.clean).toBe(true);
+      expect(merge.error).toBeNull();
+      expect(merge.applied_commit).toBe((await runGit(repository, ["rev-parse", "HEAD"])).trim());
+      expect(document.ref_cleanup_errors).toBeUndefined();
+      expect(await candidateRefNames(repository)).toEqual([]);
+    } finally {
+      for (const [key, value] of Object.entries({
+        AGENT_HUB_OMP_BIN: previous.OMP_BIN,
+        AGENT_HUB_OMP_ARGS: previous.OMP_ARGS,
+        AGENT_HUB_GROK_BIN: previous.GROK_BIN,
+        AGENT_HUB_GROK_ARGS: previous.GROK_ARGS,
+      })) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await removeDirectory(repository);
+    }
+  }, 30_000);
 });

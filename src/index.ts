@@ -10,13 +10,19 @@ export {
 } from "./fanout.js";
 export type { FanOutDependencies } from "./fanout.js";
 
-// v2 — Package 4: opt-in auto-merge (verified fast-forward only).
-export { autoMerge, mergeCandidate, MERGE_LOCK_NAME } from "./merge.js";
-export type { AutoMergeInput, MergeCandidateRequest, MergeDependencies } from "./merge.js";
+// v2 — artifact ref ownership: terminal callers release retained refs here.
+export { releaseCandidateRef, releaseFanOutArtifactRefs } from "./artifacts.js";
 
-// v2 — competition and durable agent sessions.
+// v2 — Package 4: opt-in auto-merge (verified fast-forward only).
+// `mergeCandidate` is internal on purpose: adoption may only follow a real
+// `runCompetition()` result through `autoMerge`, never a hand-supplied artifact.
+export { autoMerge, MERGE_LOCK_NAME } from "./merge.js";
+export type { AutoMergeInput, MergeDependencies } from "./merge.js";
+
+// v2 — competition, durable agent sessions, and the session state contracts.
 export * from "./competition.js";
 export * from "./session.js";
+export * from "./state.js";
 
 export type {
   AdapterExecutionResult,
@@ -29,12 +35,12 @@ export type {
   DelegateRequest,
   DelegateResult,
   DelegateStatus,
-  DelegationSession,
   ExecutionMode,
   FanOutCandidateResult,
   FanOutCandidateSpec,
   FanOutRequest,
   FanOutResult,
+  FanOutStatus,
   JudgementVerdict,
   MergeOutcome,
   MergeStrategy,

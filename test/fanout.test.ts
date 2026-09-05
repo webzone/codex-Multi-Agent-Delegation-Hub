@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import { createWorktreeAtBase, pruneWorktrees, removeWorktree, resolveRepositoryIdentity, type BaseWorktree } from "../src/git.js";
 import { lockPathFor } from "../src/locks.js";
 import { fanOut, FANOUT_MAX_CONCURRENCY_LIMIT, WORKTREE_ADMIN_LOCK_NAME } from "../src/fanout.js";
+import { deferred } from "../src/deferred.js";
 import type { AgentAdapter, FanOutCandidateResult, FanOutCandidateSpec } from "../src/types.js";
 import { createGitRepository, removeDirectory, runGit } from "./helpers.js";
 
@@ -16,7 +17,7 @@ class Tracker {
   maxActive = 0;
   starts: string[] = [];
   finishes: string[] = [];
-  private notified = Promise.withResolvers<void>();
+  private notified = deferred<void>();
   begin(id: string): void {
     this.active += 1;
     this.maxActive = Math.max(this.maxActive, this.active);
@@ -38,7 +39,7 @@ class Tracker {
 
   private notify(): void {
     this.notified.resolve();
-    this.notified = Promise.withResolvers<void>();
+    this.notified = deferred<void>();
   }
 }
 
@@ -101,7 +102,7 @@ describe("fan-out", { timeout: 30_000 }, () => {
   it("runs overlapping waves up to the default cap and preserves input order", async () => {
     const repo = await createGitRepository();
     const tracker = new Tracker();
-    const gates = Array.from({ length: 6 }, () => Promise.withResolvers<void>());
+    const gates = Array.from({ length: 6 }, () => deferred<void>());
     const candidates = specs(6);
     const adapters = candidates.map((spec, index) =>
       [spec.agent, writeAdapter(spec.label as string, tracker, gates[index].promise)] as [string, AgentAdapter],
@@ -131,6 +132,7 @@ describe("fan-out", { timeout: 30_000 }, () => {
 
       const result = await run;
       expect(result.max_concurrency).toBe(4);
+      expect(result.status).toBe("success");
       expect(tracker.maxActive).toBe(4);
       // Completion order (c3 finished first) differs from result order.
       expect(tracker.finishes[0]).toBe("c3");
@@ -255,6 +257,7 @@ describe("fan-out", { timeout: 30_000 }, () => {
       );
 
       expect(result.error).toBeNull();
+      expect(result.status).toBe("partial");
       expect(result.candidates.map((candidate) => candidate.index)).toEqual([0, 1, 2]);
 
       const [failed, partial, ok] = result.candidates;
@@ -278,6 +281,8 @@ describe("fan-out", { timeout: 30_000 }, () => {
         await expect(access(candidate.execution_workspace)).rejects.toThrow();
       }
       expect(await runGit(repo, ["status", "--porcelain=v1", "--untracked-files=all"])).toBe("");
+      // The core keeps artifact refs alive for its caller (a later competition,
+      // a merge, or the terminal path's cleanup); it never GCs on its own.
       expect(await refCount(repo)).toBe(2);
     } finally {
       await removeDirectory(repo);
@@ -325,7 +330,7 @@ describe("fan-out", { timeout: 30_000 }, () => {
     const identity = await resolveRepositoryIdentity(repo);
     const adminTracker = new Tracker();
     const adapterTracker = new Tracker();
-    const sharedGate = Promise.withResolvers<void>();
+    const sharedGate = deferred<void>();
 
     let holdRelease: () => void = () => {};
     const hold = new Promise<void>((resolve) => {
@@ -415,6 +420,52 @@ describe("fan-out", { timeout: 30_000 }, () => {
     } finally {
       holdRelease();
       sharedGate.resolve();
+      await removeDirectory(repo);
+    }
+  });
+
+  it("aggregates candidate outcomes into the status field", async () => {
+    const repo = await createGitRepository();
+    const tracker = new Tracker();
+    try {
+      const allFail = await fanOut(
+        { workspace: repo, candidates: specs(2) },
+        {
+          resolveAdapter: adapterMap(
+            specs(2).map((spec, index) => [
+              spec.agent,
+              writeAdapter(spec.label as string, tracker, Promise.resolve(), "exit"),
+            ] as [string, AgentAdapter]),
+          ),
+        },
+      );
+      // Zero successes is a failure even with no fan-out-level error.
+      expect(allFail.status).toBe("failure");
+      expect(allFail.error).toBeNull();
+      expect(allFail.candidates.every((candidate) => candidate.status === "failure")).toBe(true);
+
+      let pruneCalls = 0;
+      const greenButBrokenPrune = await fanOut(
+        { workspace: repo, candidates: specs(2) },
+        {
+          resolveAdapter: adapterMap(
+            specs(2).map((spec, index) => [
+              spec.agent,
+              writeAdapter(spec.label as string, tracker, Promise.resolve(), "ok"),
+            ] as [string, AgentAdapter]),
+          ),
+          pruneWorktrees: async (workspace) => {
+            pruneCalls += 1;
+            if (pruneCalls === 1) throw new Error("prune exploded");
+            await pruneWorktrees(workspace);
+          },
+        },
+      );
+      // A fan-out-level error outranks even an all-green candidate set.
+      expect(greenButBrokenPrune.status).toBe("failure");
+      expect(greenButBrokenPrune.error?.message).toContain("prune exploded");
+      expect(greenButBrokenPrune.candidates.every((candidate) => candidate.status === "success")).toBe(true);
+    } finally {
       await removeDirectory(repo);
     }
   });

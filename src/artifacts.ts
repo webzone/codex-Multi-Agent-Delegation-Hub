@@ -3,9 +3,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { AgentHubError } from "./errors.js";
+import { asDelegateError, AgentHubError } from "./errors.js";
 import { runGit } from "./git.js";
-import type { CandidateArtifact } from "./types.js";
+import { runProcess } from "./process.js";
+import type { CandidateArtifact, DelegateError, FanOutResult } from "./types.js";
 
 /**
  * Candidate artifacts are captured as plain Git objects via plumbing only
@@ -118,4 +119,78 @@ export async function captureCandidateArtifact(
   } finally {
     await rm(indexDirectory, { recursive: true, force: true });
   }
+}
+
+const ARTIFACT_COMMIT_PATTERN = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/**
+ * CAS-safe release of one private candidate artifact ref: the ref is deleted
+ * only while it still points at exactly `expectedCommit`. `update-ref -d`
+ * with an old-value performs that compare-and-delete inside Git itself, so a
+ * ref that someone else re-targeted concurrently survives untouched (false),
+ * while a ref that already vanished counts as released (true). Refs outside
+ * the Agent Hub candidate namespace are refused outright.
+ */
+export async function releaseCandidateRef(
+  workspace: string,
+  ref: string,
+  expectedCommit: string,
+): Promise<boolean> {
+  if (!SAFE_REF_PATTERN.test(ref)) {
+    throw new AgentHubError(
+      "ARTIFACT_REF_INVALID",
+      `"${ref}" is not a private Agent Hub candidate ref; release only ever touches refs this hub created`,
+    );
+  }
+  if (!ARTIFACT_COMMIT_PATTERN.test(expectedCommit)) {
+    throw new AgentHubError(
+      "ARTIFACT_COMMIT_INVALID",
+      `Expected commit "${expectedCommit}" is not a full hex commit SHA`,
+    );
+  }
+
+  const cas = await runProcess("git", ["update-ref", "-d", ref, expectedCommit], {
+    cwd: workspace,
+    maxOutputBytes: 4000,
+  });
+  if (!cas.error && cas.exitCode === 0) {
+    return true;
+  }
+
+  // CAS rejected: distinguish "already gone" (released by whoever removed
+  // it) from "still there, pointing elsewhere" (a foreign claim — leave it).
+  // Probe the ref itself, not `${ref}^{commit}`: a concurrent retarget to a
+  // tree/blob/tag is still a foreign claim and must be preserved.
+  const probe = await runProcess("git", ["rev-parse", "--quiet", "--verify", ref], {
+    cwd: workspace,
+    maxOutputBytes: 256,
+  });
+  return !probe.error && probe.exitCode !== 0;
+}
+
+/**
+ * Release every retained artifact ref of a fan-out result, CAS-safe. The
+ * terminal paths (CLI `fanout`, MCP fan-out tools) run this in a `finally`
+ * once the result and any merge are no longer consumers of the refs; the
+ * core library never calls it because there the caller owns cleanup.
+ * Failures are returned, never thrown: cleanup trouble must not mask the
+ * operation it follows.
+ */
+export async function releaseFanOutArtifactRefs(
+  workspace: string,
+  fanOut: FanOutResult,
+): Promise<DelegateError[]> {
+  const errors: DelegateError[] = [];
+  for (const candidate of fanOut?.candidates ?? []) {
+    const artifact = candidate?.artifact;
+    if (!artifact?.ref || !artifact.commit) {
+      continue;
+    }
+    try {
+      await releaseCandidateRef(workspace, artifact.ref, artifact.commit);
+    } catch (error) {
+      errors.push(asDelegateError(error));
+    }
+  }
+  return errors;
 }

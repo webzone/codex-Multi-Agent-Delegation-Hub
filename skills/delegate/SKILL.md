@@ -52,8 +52,21 @@ agent-hub session resume <session-id> --task "<next turn>"
 - Fan-out is isolated-only: candidates run in detached worktrees pinned to one
   captured base and are recorded as hook-free artifact commits on private
   refs. Fan-out never touches the primary checkout and never merges.
+- Check the document's aggregate `status` (`success` / `partial` / `failure`)
+  even when candidates look fine: a partial or all-failed fan-out is an
+  operation failure (exit `1` / `isError`), while each candidate keeps its own
+  `status` and `error`.
+- The terminal command releases the private artifact refs it created before it
+  exits, CAS-safe (a ref someone else re-targeted is left alone). Review from
+  the `diff` fields in the returned document; do not plan to inspect
+  `refs/agent-hub/candidates/...` after the command has ended.
 - A session is an agent continuation lineage. `resume` runs the next turn in a
-  fresh isolated worktree at the latest artifact commit.
+  fresh isolated worktree at the latest artifact commit. A failed turn still
+  commits its artifact and advances the session before the error is reported,
+  so a failed session's work is resumable.
+- `session create` requires a clean caller checkout unless `--allow-dirty`;
+  `session resume` deliberately ignores caller-checkout dirtiness because the
+  session ref, not the checkout, is the baseline.
 - A competition is a recommendation. Prefer reviewing the winner's diff
   yourself over automatic adoption; competition output alone is not evidence
   the code works.
@@ -61,9 +74,13 @@ agent-hub session resume <session-id> --task "<next turn>"
 ## Auto-merge: exact semantics
 
 `--auto-merge` (CLI) / `auto_merge: true` (MCP `compete_candidates`) is opt-in,
-defaults to off, and requires a judge: it can only adopt the competition's
-internal winner, never an externally supplied commit. Before adoption the
-merge revalidates, under the repository merge lock:
+defaults to off, and requires a judge: it can only adopt the internal winner of
+a real `runCompetition()` result, never an externally supplied commit. The
+winner is trusted only when the competition reports `status: "selected"` with
+no error, names a candidate that appears exactly once among the eligible
+entries, shares the fan-out's base, and the fan-out candidate matches the
+winner's artifact commit and ref verbatim. Before adoption the merge
+revalidates, under the repository merge lock:
 
 - the workspace is still the same repository checkout, on the same named
   branch as when the fan-out started, with `HEAD` still at the captured base;
@@ -77,6 +94,13 @@ the result is a refusal — `strategy: "none"`, `clean: false`, a `MERGE_*`
 code, and no mutation at all. Auto-merge never stashes, resets, force-updates,
 rebases, cherry-picks, applies patches, or resolves conflicts.
 
+A failure *after* the fast-forward is a different animal and is reported as
+one: `strategy: "fast-forward"` with the observed `HEAD` in `applied_commit`
+plus `MERGE_POSTCONDITION_FAILED` or `LOCK_RELEASE_FAILED`. There is no
+rollback — the checkout already moved. Treat such an outcome as "adopted but
+unverified": inspect the working tree and `git status`/`git log` yourself
+before doing anything else, and never retry the merge blindly.
+
 Continuation rules:
 
 - `MERGE_BASE_MOVED`, `MERGE_BRANCH_CHANGED`, or `MERGE_IDENTITY_MISMATCH`
@@ -84,7 +108,9 @@ Continuation rules:
   the review manually yourself); do not try to force the old artifact in.
 - `MERGE_DIRTY_WORKTREE` means someone is working in the checkout now. Resolve
   that first; the hub will not interleave with it.
-- A refusal is data, not a crash: handle it like any other review outcome.
+- A refusal is data, not a crash: handle it like any other review outcome. But
+  a `strategy: "fast-forward"` outcome carrying an error is not a refusal —
+  the adoption happened; inspect the checkout as above.
 
 The hub still does not merge plain `delegate` or `fanout` output on its own —
 adoption only ever happens through an explicit opt-in step you control.

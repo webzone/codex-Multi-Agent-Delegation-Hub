@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, utimes, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { acquireRepositoryLock, lockPathFor, type LockOwner } from "../src/locks.js";
+import { acquireRepositoryLock, lockPathFor, OWNERLESS_GRACE_MS, type LockOwner } from "../src/locks.js";
+import { deferred } from "../src/deferred.js";
 
 async function fakeCommonDir(): Promise<string> {
   return mkdtemp(join(tmpdir(), "agent-hub-lock-test-"));
@@ -41,7 +42,7 @@ async function readPlantedOwner(lockPath: string): Promise<LockOwner> {
 async function deadPid(): Promise<number> {
   const child = spawn(process.execPath, ["-e", "process.exit(0)"]);
   const pid = child.pid as number;
-  const { promise, resolve } = Promise.withResolvers<void>();
+  const { promise, resolve } = deferred<void>();
   child.once("exit", resolve);
   await promise;
   return pid;
@@ -138,5 +139,46 @@ describe("repository-local lock", () => {
         "LOCK_INVALID_NAME",
       );
     }
+  });
+
+  it("reclaims an ownerless lock directory once its crash-recovery grace elapsed", async () => {
+    const commonDir = await fakeCommonDir();
+    const lockPath = await plantLock(commonDir, "worktree-admin", null);
+    // Simulate the crash remnant sitting around past the grace window.
+    const stale = new Date(Date.now() - OWNERLESS_GRACE_MS - 10_000);
+    await utimes(lockPath, stale, stale);
+
+    const handle = await acquireRepositoryLock({ commonDir, name: "worktree-admin" });
+    expect(handle.token).not.toBe("planted-token");
+    const stored = await readPlantedOwner(lockPath);
+    expect(stored.token).toBe(handle.token);
+    await handle.release();
+    await expect(access(lockPath)).rejects.toThrow();
+  });
+
+  it("reclaims a fresh ownerless directory when the grace window is zero", async () => {
+    const commonDir = await fakeCommonDir();
+    const lockPath = await plantLock(commonDir, "merge", null);
+
+    const handle = await acquireRepositoryLock({
+      commonDir,
+      name: "merge",
+      ownerlessGraceMs: 0,
+    });
+    const stored = await readPlantedOwner(lockPath);
+    expect(stored.token).toBe(handle.token);
+    await handle.release();
+  });
+
+  it("keeps an ownerless directory within the grace window and refuses to guess", async () => {
+    const commonDir = await fakeCommonDir();
+    const lockPath = await plantLock(commonDir, "merge", null);
+
+    await expectErrorCode(
+      acquireRepositoryLock({ commonDir, name: "merge" }),
+      "LOCK_UNRECOVERABLE",
+    );
+    // The directory itself was left in place for manual inspection.
+    await expect(access(lockPath)).resolves.toBeUndefined();
   });
 });

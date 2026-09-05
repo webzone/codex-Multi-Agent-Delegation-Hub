@@ -94,10 +94,17 @@ function candidateFixture(
 }
 
 function fanResult(base: RepositoryIdentity, candidates: FanOutCandidateResult[]): FanOutResult {
+  const successes = candidates.filter((candidate) => candidate.status === "success").length;
   return {
     base,
     max_concurrency: candidates.length,
     candidates,
+    status:
+      successes === 0
+        ? "failure"
+        : successes === candidates.length
+          ? "success"
+          : "partial",
     started_at: "2026-01-01T00:00:00.000Z",
     finished_at: "2026-01-01T00:00:02.000Z",
     duration_ms: 2000,

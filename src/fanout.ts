@@ -28,9 +28,9 @@ import type {
   FanOutCandidateSpec,
   FanOutRequest,
   FanOutResult,
+  FanOutStatus,
   RepositoryIdentity,
 } from "./types.js";
-
 /**
  * Bounded fan-out over one shared base. Isolated-only: every candidate runs in
  * its own worktree pinned to the base captured before dispatch. Only Git
@@ -295,10 +295,21 @@ export async function fanOut(
   }
 
   const finishedAt = now();
+  // Aggregate view: a fan-out-level error or zero successes is a failure;
+  // mixed candidate outcomes are a partial. Per-candidate errors stay on the
+  // candidates themselves.
+  const successes = candidates.filter((candidate) => candidate.status === "success").length;
+  const status: FanOutStatus =
+    fanOutError !== null || successes === 0
+      ? "failure"
+      : successes === candidates.length
+        ? "success"
+        : "partial";
   return {
     base,
     max_concurrency: maxConcurrency,
     candidates,
+    status,
     started_at: startedAt.toISOString(),
     finished_at: finishedAt.toISOString(),
     duration_ms: finishedAt.getTime() - startedAt.getTime(),
@@ -306,4 +317,9 @@ export async function fanOut(
   };
 }
 
-export type { FanOutCandidateSpec, FanOutRequest, FanOutResult } from "./types.js";
+export type {
+  FanOutCandidateSpec,
+  FanOutRequest,
+  FanOutResult,
+  FanOutStatus,
+} from "./types.js";

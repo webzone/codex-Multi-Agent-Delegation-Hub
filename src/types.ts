@@ -115,12 +115,22 @@ export interface FanOutCandidateResult extends DelegateResult {
   artifact: CandidateArtifact | null;
 }
 
+/**
+ * Aggregate outcome of a fan-out operation. `partial` means at least one
+ * candidate succeeded and at least one did not; `failure` means every
+ * candidate failed or the fan-out itself errored. Per-candidate errors stay
+ * on the individual candidate results.
+ */
+export type FanOutStatus = "success" | "partial" | "failure";
+
 export interface FanOutResult {
   /** Identity captured once before fan-out; the shared base for all candidates. */
   base: RepositoryIdentity;
   max_concurrency: number;
   /** Same order as the input specs, independent of completion order. */
   candidates: FanOutCandidateResult[];
+  /** Aggregate view; a partial fan-out is an operation failure for CLI/MCP. */
+  status: FanOutStatus;
   started_at: string;
   finished_at: string;
   duration_ms: number;
@@ -130,7 +140,7 @@ export interface FanOutResult {
 
 export type JudgementVerdict = "accepted" | "rejected" | "inconclusive";
 
-/** Contract consumed by the later competition/judge package. */
+/** A judge's verdict on one candidate. */
 export interface CandidateJudgement {
   candidate_id: string;
   index: number;
@@ -150,9 +160,15 @@ export interface CompetitionOutcome {
   error: DelegateError | null;
 }
 
-export type MergeStrategy = "none" | "fast-forward" | "cherry-pick" | "patch";
+/**
+ * Only two strategies exist. `"none"` is a refusal that mutated nothing;
+ * `"fast-forward"` means `git merge --ff-only` ran and the branch pointer
+ * moved — including the applied-but-post-verification-failed case, which is
+ * reported truthfully with `clean: false` and an error.
+ */
+export type MergeStrategy = "none" | "fast-forward";
 
-/** Contract consumed by the later auto-merge package. */
+/** Result of one auto-merge attempt, serializable on every path. */
 export interface MergeOutcome {
   strategy: MergeStrategy;
   candidate_id: string | null;
@@ -162,18 +178,6 @@ export interface MergeOutcome {
   applied_commit: string | null;
   notes: string[];
   error: DelegateError | null;
-}
-
-/** Contract consumed by the later session/state package. */
-export interface DelegationSession {
-  session_id: string;
-  created_at: string;
-  updated_at: string;
-  workspace: string;
-  base: RepositoryIdentity;
-  fan_out: FanOutResult;
-  competition: CompetitionOutcome | null;
-  merge: MergeOutcome | null;
 }
 
 export interface DelegateError {

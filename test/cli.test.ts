@@ -1,7 +1,10 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { parseCliArgs, parseCliCommand, runCli } from "../src/cli.js";
-import { createGitRepository, removeDirectory, runGit } from "./helpers.js";
+import { candidateRefNames, createGitRepository, removeDirectory, runGit } from "./helpers.js";
 
 async function withFakeAgents<T>(body: () => Promise<T>): Promise<T> {
   const saved = {
@@ -44,6 +47,47 @@ function collectors() {
       stderr: (value: string) => stderr.push(value),
     },
   };
+}
+
+/**
+ * A judge-aware fake agent: when fed the competition prompt it emits a valid
+ * selection marker line picking the first candidate enumerated in the prompt
+ * (request order); otherwise it behaves like the working `omp` agent.
+ */
+const JUDGE_AWARE_OMP = [
+  "const fs=require('node:fs');",
+  "const task=process.argv[1]||'';",
+  "if(task.includes('Agent Hub candidate competition')){",
+  "  const m=task.match(/^- ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) \\|/m);",
+  "  if(!m){console.error('judge found no candidate');process.exit(1);}",
+  "  console.log('AGENT_HUB_SELECTION: '+JSON.stringify({candidate_id:m[1],reason:'first eligible in request order'}));",
+  "}else{fs.writeFileSync('omp.txt',task);}",
+].join(" ");
+
+async function withAgentEnv<T>(
+  ompArgs: string[],
+  grokArgs: string[],
+  body: () => Promise<T>,
+): Promise<T> {
+  const saved = {
+    OMP_BIN: process.env.AGENT_HUB_OMP_BIN,
+    OMP_ARGS: process.env.AGENT_HUB_OMP_ARGS,
+    GROK_BIN: process.env.AGENT_HUB_GROK_BIN,
+    GROK_ARGS: process.env.AGENT_HUB_GROK_ARGS,
+  };
+  process.env.AGENT_HUB_OMP_BIN = process.execPath;
+  process.env.AGENT_HUB_GROK_BIN = process.execPath;
+  process.env.AGENT_HUB_OMP_ARGS = JSON.stringify(ompArgs);
+  process.env.AGENT_HUB_GROK_ARGS = JSON.stringify(grokArgs);
+  try {
+    return await body();
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      const name = `AGENT_HUB_${key}`;
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 }
 
 describe("CLI", () => {
@@ -297,10 +341,141 @@ describe("CLI", () => {
           "success",
           "success",
         ]);
+        expect(document.status).toBe("success");
+        expect(document.ref_cleanup_errors).toBeUndefined();
+        // The terminal CLI released the private artifact refs it created.
+        expect(await candidateRefNames(repository)).toEqual([]);
       } finally {
         await removeDirectory(repository);
       }
     });
+
+    it("reports a partial fan-out as an operation failure and releases refs", async () => {
+      const repository = await createGitRepository();
+      const io = collectors();
+      try {
+        const exitCode = await withAgentEnv(
+          ["-e", "require('node:fs').writeFileSync('omp.txt', process.argv[1]);", "{task}"],
+          ["-e", "process.exit(3)"],
+          () =>
+            runCli(
+              [
+                "fanout",
+                "--agent",
+                "omp",
+                "--agent",
+                "grok",
+                "--task",
+                "alpha",
+                "--task",
+                "beta",
+                "--workspace",
+                repository,
+              ],
+              io.output,
+            ),
+        );
+
+        expect(exitCode).toBe(1);
+        const document = JSON.parse(io.stdout.join(""));
+        expect(document.status).toBe("partial");
+        expect(document.error).toBeNull();
+        expect(document.candidates.map((c: { status: string }) => c.status)).toEqual([
+          "success",
+          "failure",
+        ]);
+        expect(document.ref_cleanup_errors).toBeUndefined();
+        expect(await candidateRefNames(repository)).toEqual([]);
+      } finally {
+        await removeDirectory(repository);
+      }
+    });
+
+    it("reports an all-failed fan-out as an operation failure", async () => {
+      const repository = await createGitRepository();
+      const io = collectors();
+      try {
+        const exitCode = await withAgentEnv(
+          ["-e", "process.exit(3)"],
+          ["-e", "process.exit(4)"],
+          () =>
+            runCli(
+              [
+                "fanout",
+                "--agent",
+                "omp",
+                "--agent",
+                "grok",
+                "--task",
+                "alpha",
+                "--workspace",
+                repository,
+              ],
+              io.output,
+            ),
+        );
+
+        expect(exitCode).toBe(1);
+        const document = JSON.parse(io.stdout.join(""));
+        expect(document.status).toBe("failure");
+      } finally {
+        await removeDirectory(repository);
+      }
+    });
+
+    it(
+      "adopts the judged winner by fast-forward and releases every artifact ref",
+      async () => {
+        const repository = await createGitRepository();
+        const io = collectors();
+        try {
+          const exitCode = await withAgentEnv(
+            ["-e", JUDGE_AWARE_OMP, "{task}"],
+            ["-e", "require('node:fs').writeFileSync('grok.txt', process.argv[1]);", "{task}"],
+            () =>
+              runCli(
+                [
+                  "fanout",
+                  "--agent",
+                  "omp",
+                  "--agent",
+                  "grok",
+                  "--task",
+                  "alpha",
+                  "--task",
+                  "beta",
+                  "--judge",
+                  "omp",
+                  "--auto-merge",
+                  "--workspace",
+                  repository,
+                ],
+                io.output,
+              ),
+          );
+
+          expect(exitCode).toBe(0);
+          const document = JSON.parse(io.stdout.join(""));
+          expect(document.fan_out.status).toBe("success");
+          expect(document.competition.status).toBe("selected");
+          expect(document.competition.mode).toBe("judge");
+          expect(document.merge.strategy).toBe("fast-forward");
+          expect(document.merge.clean).toBe(true);
+          expect(document.merge.error).toBeNull();
+          expect(document.merge.applied_commit).toBe(
+            (await runGit(repository, ["rev-parse", "HEAD"])).trim(),
+          );
+          expect(document.ref_cleanup_errors).toBeUndefined();
+          expect(await candidateRefNames(repository)).toEqual([]);
+          expect(await runGit(repository, ["status", "--porcelain=v1", "--untracked-files=all"])).toBe("");
+          // The winner — first in request order, the omp candidate — landed.
+          expect(await readFile(join(repository, "omp.txt"), "utf8")).toBe("alpha");
+        } finally {
+          await removeDirectory(repository);
+        }
+      },
+      30_000,
+    );
 
     it("creates and resumes a durable filesystem session", async () => {
       const repository = await createGitRepository();

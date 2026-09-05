@@ -25,3 +25,23 @@ export async function createGitRepository(): Promise<string> {
 export async function removeDirectory(path: string): Promise<void> {
   await rm(path, { recursive: true, force: true });
 }
+
+/** Full commit the ref resolves to, or null when it does not resolve. */
+export async function resolveRef(repository: string, ref: string): Promise<string | null> {
+  try {
+    const out = await runGit(repository, ["rev-parse", "--quiet", "--verify", ref]);
+    return out.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Names of every still-present private candidate artifact ref. */
+export async function candidateRefNames(repository: string): Promise<string[]> {
+  const output = await runGit(repository, [
+    "for-each-ref",
+    "--format=%(refname)",
+    "refs/agent-hub/candidates",
+  ]);
+  return output.split("\n").filter(Boolean);
+}

@@ -9,7 +9,6 @@ import { currentRevision, isDirty, resolveRepositoryIdentity, runGit } from "./g
 import { acquireRepositoryLock, type RepositoryLock } from "./locks.js";
 import type {
   CandidateArtifact,
-  CompetitionOutcome,
   DelegateError,
   FanOutResult,
   MergeOutcome,
@@ -20,15 +19,20 @@ import type {
  * Auto-merge adopts exactly one internally selected candidate artifact into
  * the primary checkout by fast-forward. It is strictly opt-in: callers reach
  * it only through an explicit `--auto-merge` / `auto_merge` decision, and the
- * selection it follows is the competition's internal winner, never an
- * externally supplied ref, path, or branch name.
+ * selection it follows is a real `runCompetition()` result's internal winner,
+ * never an externally supplied ref, path, or branch name.
  *
- * Every normal outcome is serializable: refusals come back as a `MergeOutcome`
- * with `strategy: "none"`, `clean: false`, and a `MERGE_*` (or lock/git) error
- * code. This module never throws for a refusal, and it never mutates the
- * primary checkout unless every revalidation below passes under the merge
- * lock. There is no stash, reset, force, rebase, cherry-pick, or conflict
- * resolution anywhere on this path.
+ * Every normal outcome is serializable. A refusal before any mutation comes
+ * back as a `MergeOutcome` with `strategy: "none"`, `clean: false`, and a
+ * `MERGE_*` (or lock/git) error code, and this module never throws for a
+ * refusal. It never mutates the primary checkout unless every revalidation
+ * below passes under the merge lock. Once `git merge --ff-only` has run,
+ * though, the outcome truthfully reports `strategy: "fast-forward"` with the
+ * observed HEAD: a failed post-adoption verification or lock release carries
+ * `MERGE_POSTCONDITION_FAILED` / `LOCK_RELEASE_FAILED` and is never reported
+ * as a no-mutation refusal, because there is no rollback on this path. There
+ * is no stash, reset, force, rebase, cherry-pick, or conflict resolution
+ * anywhere here.
  */
 
 export const MERGE_LOCK_NAME = "merge";
@@ -48,26 +52,33 @@ export interface MergeCandidateRequest {
 
 export interface MergeDependencies {
   acquireMergeLock?: (commonDir: string) => Promise<RepositoryLock>;
+  /**
+   * Post-adoption probe, run immediately after `git merge --ff-only`
+   * succeeds; reports the checkout's observed HEAD and clean status. The
+   * default reads HEAD and `git status`; tests inject this seam to exercise
+   * the applied-but-failed path deterministically.
+   */
+  verifyPostAdoption?: (workspace: string) => Promise<{ head: string; clean: boolean }>;
 }
 
 export interface AutoMergeInput {
   workspace: string;
   /** Fan-out the candidates came from. */
   fan_out: FanOutResult;
-  /** Competition result; auto-merge only ever follows its internal winner. */
-  competition: CompetitionOutcome | CompetitionResult | null;
+  /**
+   * Only a real `CompetitionResult` is ever followed — its internal winner,
+   * validated against this very fan-out. Anything else is a refusal.
+   */
+  competition: CompetitionResult | null;
 }
 
-type MergeCompetition = CompetitionOutcome | CompetitionResult;
-
-function competitionWinnerId(competition: MergeCompetition): string | null {
-  return "winner" in competition
-    ? competition.winner?.candidate_id ?? null
-    : competition.winner_id;
-}
-
-function competitionFailure(competition: MergeCompetition): DelegateError | null {
-  return competition.error;
+function sameIdentity(left: RepositoryIdentity, right: RepositoryIdentity): boolean {
+  return (
+    left.common_dir === right.common_dir &&
+    left.worktree_root === right.worktree_root &&
+    left.branch === right.branch &&
+    left.head === right.head
+  );
 }
 
 function refusal(
@@ -104,14 +115,17 @@ async function defaultAcquireMergeLock(commonDir: string): Promise<RepositoryLoc
 }
 
 /**
- * Revalidate everything and adopt, or throw an AgentHubError whose code is the
- * refusal code. `mergeCandidate` is the boundary that converts throws into the
- * serializable outcome, so nothing outside this function can observe a throw
- * from a normal refusal.
+ * Revalidate everything and adopt, or throw an AgentHubError whose code is
+ * the refusal code. `mergeCandidate` is the boundary that converts throws
+ * into the serializable outcome, so nothing outside can observe a throw from
+ * a normal refusal. Everything that can fail *after* the fast-forward is
+ * returned as an applied outcome instead: throwing there would let the
+ * catch-all misreport a real mutation as a strategy-"none" refusal.
  */
 async function adoptUnderLock(
   request: MergeCandidateRequest,
   notes: string[],
+  dependencies: MergeDependencies,
 ): Promise<MergeOutcome> {
   const { workspace, base, candidateId, artifact } = request;
 
@@ -216,6 +230,7 @@ async function adoptUnderLock(
   //    disabled by pointing core.hooksPath at an empty private directory and
   //    --no-verify covers commit-side hooks of the merge command itself.
   const hooksDirectory = await mkdtemp(join(tmpdir(), "agent-hub-hooks-"));
+  let hooksCleanupError: string | null = null;
   try {
     await runGit(workspace, [
       "-c",
@@ -231,24 +246,67 @@ async function adoptUnderLock(
       `Fast-forward adoption failed: ${error instanceof Error ? error.message : String(error)}`,
     );
   } finally {
-    await rm(hooksDirectory, { recursive: true, force: true });
+    try {
+      await rm(hooksDirectory, { recursive: true, force: true });
+    } catch (error) {
+      hooksCleanupError = error instanceof Error ? error.message : String(error);
+    }
   }
   notes.push("fast-forward-applied");
 
   // 8. Post-conditions: HEAD is exactly the adopted commit and the checkout
-  //    is still clean.
-  const headAfter = await currentRevision(workspace);
-  if (headAfter !== artifact.commit) {
-    throw new AgentHubError(
-      "MERGE_POSTCONDITION_FAILED",
-      `HEAD is ${headAfter} after adoption, expected ${artifact.commit}`,
-    );
+  //    is still clean. The fast-forward is applied at this point: anything
+  //    that fails here is reported truthfully — strategy "fast-forward", the
+  //    observed HEAD, `clean: false`, a structured error — and never rolled
+  //    back or disguised as a no-mutation refusal.
+  const verifyPostAdoption =
+    dependencies.verifyPostAdoption ??
+    (async (target: string) => ({
+      head: await currentRevision(target),
+      clean: !(await isDirty(target)),
+    }));
+
+  let observed: { head: string; clean: boolean } | null = null;
+  let postError: DelegateError | null = hooksCleanupError
+    ? {
+        code: "MERGE_POSTCONDITION_FAILED",
+        message: `The fast-forward was applied, but the temporary hooks directory could not be removed: ${hooksCleanupError}. Inspect the checkout; nothing is rolled back`,
+      }
+    : null;
+  if (hooksCleanupError !== null) {
+    notes.push(`hooks-directory-cleanup-failed: ${hooksCleanupError}`);
   }
-  if (await isDirty(workspace)) {
-    throw new AgentHubError(
-      "MERGE_POSTCONDITION_FAILED",
-      "Working tree is dirty after adoption; inspect the checkout",
-    );
+  try {
+    observed = await verifyPostAdoption(workspace);
+  } catch (error) {
+    postError = {
+      code: "MERGE_POSTCONDITION_FAILED",
+      message: `Adoption verification could not read checkout state: ${error instanceof Error ? error.message : String(error)}. The fast-forward was applied and is never rolled back; inspect the checkout`,
+    };
+  }
+  if (postError === null && observed!.head !== artifact.commit) {
+    postError = {
+      code: "MERGE_POSTCONDITION_FAILED",
+      message: `HEAD is ${observed!.head} after adoption, expected ${artifact.commit}. The fast-forward was applied and is never rolled back; inspect the checkout`,
+    };
+  }
+  if (postError === null && !observed!.clean) {
+    postError = {
+      code: "MERGE_POSTCONDITION_FAILED",
+      message: "Working tree is dirty after adoption. The fast-forward was applied and is never rolled back; inspect the checkout",
+    };
+  }
+  if (postError !== null) {
+    return {
+      strategy: "fast-forward",
+      candidate_id: candidateId || null,
+      artifact_commit: artifact.commit,
+      target_ref: `refs/heads/${base.branch}`,
+      clean: false,
+      applied_commit: observed?.head ?? null,
+      notes,
+      error: postError,
+    };
   }
   notes.push("post-conditions-verified");
 
@@ -258,7 +316,7 @@ async function adoptUnderLock(
     artifact_commit: artifact.commit,
     target_ref: `refs/heads/${base.branch}`,
     clean: true,
-    applied_commit: headAfter,
+    applied_commit: observed!.head,
     notes,
     error: null,
   };
@@ -269,8 +327,11 @@ async function adoptUnderLock(
  * full revalidation (identity, named branch, base HEAD, clean status including
  * untracked files, artifact existence, and descendant ancestry) runs again
  * inside the repository-local merge lock, immediately before the checkout is
- * touched. Returns a serializable `MergeOutcome` for every refusal; it does
- * not throw for normal refusal conditions.
+ * touched. Returns a serializable `MergeOutcome` on every path: refusals use
+ * `strategy: "none"` with no mutation, and once a fast-forward has been
+ * applied the outcome reports it truthfully — even when post-adoption
+ * verification or the lock release afterwards fails. It does not throw for
+ * normal outcomes.
  */
 export async function mergeCandidate(
   request: MergeCandidateRequest,
@@ -304,17 +365,27 @@ export async function mergeCandidate(
     const acquireMergeLock = dependencies.acquireMergeLock ?? defaultAcquireMergeLock;
     const lock = await acquireMergeLock(base.common_dir);
     notes.push("merge-lock-acquired");
+    let adopted: MergeOutcome | null = null;
     try {
-      return await adoptUnderLock(request, notes);
+      adopted = await adoptUnderLock(request, notes, dependencies);
     } finally {
       try {
         await lock.release();
       } catch (error) {
-        notes.push(
-          `merge-lock-release-failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
+        const detail = error instanceof Error ? error.message : String(error);
+        notes.push(`merge-lock-release-failed: ${detail}`);
+        // A fast-forward that already happened stays applied even when the
+        // lock cannot be released: attach a structured error to the truthful
+        // outcome instead of pretending nothing mutated.
+        if (adopted !== null && adopted.strategy === "fast-forward" && adopted.error === null) {
+          adopted.error = {
+            code: "LOCK_RELEASE_FAILED",
+            message: `Adoption finished but the repository merge lock could not be released: ${detail}. The checkout change stands; nothing was rolled back`,
+          };
+        }
       }
     }
+    return adopted;
   } catch (error) {
     const { code, message } = asDelegateError(error);
     return refusal(candidateId || null, artifact, base ?? null, code, message, notes);
@@ -322,9 +393,14 @@ export async function mergeCandidate(
 }
 
 /**
- * Session-level auto-merge. Follows only the competition's internal winner;
- * every input gap (no competition, judge failure, no winner, unknown candidate,
- * empty artifact) is a serializable refusal. On success delegates to
+ * Session-level auto-merge. Follows only a genuine `CompetitionResult` from
+ * `runCompetition()`: status must be `"selected"` with a null error, its
+ * winner must appear exactly once in its own eligible list, its base must be
+ * the same identity as the fan-out base, and the fan-out candidate behind the
+ * winner must be a successful candidate whose recorded artifact commit/ref
+ * match the eligible entry verbatim. A workflow-shaped look-alike (an old
+ * `CompetitionOutcome`, a hand-forged object) is refused, never followed.
+ * Every gap is a serializable refusal. On success this delegates to
  * `mergeCandidate`, which performs the locked revalidation and fast-forward.
  */
 export async function autoMerge(
@@ -348,25 +424,72 @@ export async function autoMerge(
         notes,
       );
     }
-    const competitionError = competitionFailure(competition);
-    if (competitionError !== null) {
+    if (
+      typeof competition !== "object" ||
+      typeof competition.status !== "string" ||
+      !Array.isArray(competition.eligible) ||
+      !competition.base
+    ) {
+      return refusal(
+        null,
+        null,
+        fanOut.base,
+        "MERGE_INVALID_INPUT",
+        "competition must be a CompetitionResult exactly as produced by runCompetition(); forged or workflow-shaped objects are never followed",
+        notes,
+      );
+    }
+    if (competition.error !== null) {
       return refusal(
         null,
         null,
         fanOut.base,
         "MERGE_COMPETITION_FAILED",
-        `Competition did not complete cleanly (${competitionError.code}): ${competitionError.message}`,
+        `Competition did not complete cleanly (${competition.error.code}): ${competition.error.message}`,
         notes,
       );
     }
-    const winnerId = competitionWinnerId(competition);
-    if (winnerId === null) {
+    if (competition.status !== "selected") {
+      return refusal(
+        null,
+        null,
+        fanOut.base,
+        "MERGE_NOT_SELECTED",
+        `Competition status is "${competition.status}", not "selected"; nothing is adopted without a completed selection`,
+        notes,
+      );
+    }
+    if (competition.winner === null) {
       return refusal(
         null,
         null,
         fanOut.base,
         "MERGE_NO_WINNER",
         "Judge produced no winner; nothing is adopted without an internal selection",
+        notes,
+      );
+    }
+    const winnerId = competition.winner.candidate_id;
+    const eligibleMatches = competition.eligible.filter(
+      (entry) => entry !== null && typeof entry === "object" && entry.candidate_id === winnerId,
+    );
+    if (eligibleMatches.length !== 1) {
+      return refusal(
+        winnerId,
+        null,
+        fanOut.base,
+        "MERGE_WINNER_NOT_ELIGIBLE",
+        `Winner "${winnerId}" matches ${eligibleMatches.length} entries in the competition's eligible list; exactly one is required`,
+        notes,
+      );
+    }
+    if (!sameIdentity(competition.base, fanOut.base)) {
+      return refusal(
+        winnerId,
+        null,
+        fanOut.base,
+        "MERGE_BASE_MISMATCH",
+        `Competition base ${competition.base.head} in ${competition.base.worktree_root} is not the fan-out base ${fanOut.base.head} in ${fanOut.base.worktree_root}`,
         notes,
       );
     }
@@ -382,6 +505,16 @@ export async function autoMerge(
         notes,
       );
     }
+    if (winner.status !== "success") {
+      return refusal(
+        winner.candidate_id,
+        winner.artifact,
+        fanOut.base,
+        "MERGE_CANDIDATE_NOT_SUCCESS",
+        `Winner "${winnerId}" has status "${winner.status}", not "success"`,
+        notes,
+      );
+    }
     if (!winner.artifact || winner.artifact.empty || winner.artifact.commit === null) {
       return refusal(
         winner.candidate_id,
@@ -389,6 +522,19 @@ export async function autoMerge(
         fanOut.base,
         "MERGE_NO_ARTIFACT",
         "Winning candidate produced no artifact commit to adopt",
+        notes,
+      );
+    }
+    if (
+      winner.artifact.commit !== eligibleMatches[0].artifact_commit ||
+      winner.artifact.ref !== eligibleMatches[0].artifact_ref
+    ) {
+      return refusal(
+        winner.candidate_id,
+        winner.artifact,
+        fanOut.base,
+        "MERGE_CANDIDATE_ARTIFACT_MISMATCH",
+        `Winner artifact (${winner.artifact.commit}, ${winner.artifact.ref}) does not match the eligible entry (${eligibleMatches[0].artifact_commit}, ${eligibleMatches[0].artifact_ref})`,
         notes,
       );
     }

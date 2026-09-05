@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import { AgentHubError } from "../src/errors.js";
 import { resolveRepositoryIdentity } from "../src/git.js";
 import { lockPathFor, type LockOwner } from "../src/locks.js";
+import { deferred } from "../src/deferred.js";
 import {
   applySessionTransition,
   loadSessionState,
@@ -103,7 +104,7 @@ async function plantSessionLock(commonDir: string, record: LockOwner): Promise<s
 async function deadPid(): Promise<number> {
   const child = spawn(process.execPath, ["-e", "process.exit(0)"]);
   const pid = child.pid as number;
-  const { promise, resolve } = Promise.withResolvers<void>();
+  const { promise, resolve } = deferred<void>();
   child.once("exit", resolve);
   await promise;
   return pid;
@@ -113,7 +114,7 @@ async function deadPid(): Promise<number> {
 async function livePid(): Promise<{ pid: number; stop: () => void }> {
   const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"]);
   const pid = child.pid as number;
-  const { promise, resolve } = Promise.withResolvers<void>();
+  const { promise, resolve } = deferred<void>();
   child.once("spawn", resolve);
   await promise;
   return { pid, stop: () => child.kill("SIGKILL") };

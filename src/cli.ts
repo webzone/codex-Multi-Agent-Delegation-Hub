@@ -1,17 +1,21 @@
 #!/usr/bin/env node
 
 import { delegate } from "./delegate.js";
-import { runCompetition } from "./competition.js";
+import { runCompetition, type CompetitionResult } from "./competition.js";
 import { fanOut } from "./fanout.js";
 import { autoMerge } from "./merge.js";
+import { releaseFanOutArtifactRefs } from "./artifacts.js";
 import { createSession, resumeSession } from "./session.js";
 import { asDelegateError } from "./errors.js";
 import { supportedAgents } from "./adapters/index.js";
 import type {
+  DelegateError,
   DelegateRequest,
   ExecutionMode,
   FanOutCandidateSpec,
   FanOutRequest,
+  FanOutResult,
+  MergeOutcome,
 } from "./types.js";
 import type { CreateSessionRequest, ResumeSessionRequest } from "./session.js";
 import { realpathSync } from "node:fs";
@@ -491,33 +495,62 @@ async function execute(
 
     case "fanout": {
       const fan = await fanOut(invocation.request);
-      if (invocation.judge === null) {
-        emit(fan);
-        return fan.error !== null ? 1 : 0;
+      let document:
+        | (FanOutResult & { ref_cleanup_errors?: DelegateError[] })
+        | {
+            fan_out: FanOutResult;
+            competition: CompetitionResult;
+            merge?: MergeOutcome;
+            ref_cleanup_errors?: DelegateError[];
+          }
+        | undefined = undefined;
+      let failure: boolean;
+      try {
+        if (invocation.judge === null) {
+          document = fan;
+          // A partial or fully-failed fan-out is an operation failure.
+          failure = fan.status !== "success";
+        } else {
+          const competition = await runCompetition({
+            fan_out: fan,
+            strategy: "judge",
+            judge_agent: invocation.judge,
+            workspace: invocation.request.workspace,
+            maxOutputBytes: invocation.request.maxOutputBytes,
+          });
+          if (!invocation.autoMerge) {
+            document = { fan_out: fan, competition };
+            failure = fan.status !== "success" || competition.error !== null;
+          } else {
+            const merge = await autoMerge({
+              workspace: invocation.request.workspace,
+              fan_out: fan,
+              competition,
+            });
+            document = { fan_out: fan, competition, merge };
+            failure =
+              fan.status !== "success" ||
+              competition.error !== null ||
+              merge.error !== null ||
+              !merge.clean;
+          }
+        }
+      } finally {
+        // Terminal path: once this command's document exists, nothing else
+        // can consume the candidate artifact refs, so release them CAS-safe
+        // (refs already re-targeted by someone else are left untouched).
+        const cleanupErrors = await releaseFanOutArtifactRefs(
+          invocation.request.workspace,
+          fan,
+        );
+        if (cleanupErrors.length > 0 && document !== undefined) {
+          // Cleanup trouble rides along on the document; it never masks the
+          // operation's own result.
+          document = { ...document, ref_cleanup_errors: cleanupErrors };
+        }
       }
-
-      const competition = await runCompetition({
-        fan_out: fan,
-        strategy: "judge",
-        judge_agent: invocation.judge,
-        workspace: invocation.request.workspace,
-        maxOutputBytes: invocation.request.maxOutputBytes,
-      });
-
-      if (!invocation.autoMerge) {
-        emit({ fan_out: fan, competition });
-        return fan.error !== null || competition.error !== null ? 1 : 0;
-      }
-
-      const merge = await autoMerge({
-        workspace: invocation.request.workspace,
-        fan_out: fan,
-        competition,
-      });
-      emit({ fan_out: fan, competition, merge });
-      return fan.error !== null || competition.error !== null || merge.error !== null || !merge.clean
-        ? 1
-        : 0;
+      emit(document);
+      return failure ? 1 : 0;
     }
 
     case "session-create": {

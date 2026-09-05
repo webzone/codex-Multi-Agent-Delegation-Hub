@@ -9,6 +9,7 @@ import { resolveAdapter } from "../src/adapters/index.js";
 import type { NativeResumeCapableAdapter } from "../src/adapters/types.js";
 import { resolveRepositoryIdentity } from "../src/git.js";
 import { lockPathFor, type LockOwner } from "../src/locks.js";
+import { deferred } from "../src/deferred.js";
 import { sessionLockName, sessionPendingPath, sessionStatePath } from "../src/state.js";
 import { createSession, resumeSession } from "../src/session.js";
 import type {
@@ -60,7 +61,7 @@ async function statusPorcelain(repo: string): Promise<string> {
 async function deadPid(): Promise<number> {
   const child = spawn(process.execPath, ["-e", "process.exit(0)"]);
   const pid = child.pid as number;
-  const { promise, resolve } = Promise.withResolvers<void>();
+  const { promise, resolve } = deferred<void>();
   child.once("exit", resolve);
   await promise;
   return pid;
@@ -70,7 +71,7 @@ async function livePid(): Promise<{ pid: number; stop: () => void }> {
   // The child's own timer keeps it alive; the test awaits only child events.
   const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"]);
   const pid = child.pid as number;
-  const { promise, resolve } = Promise.withResolvers<void>();
+  const { promise, resolve } = deferred<void>();
   child.once("spawn", resolve);
   await promise;
   return { pid, stop: () => child.kill("SIGKILL") };

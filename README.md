@@ -9,7 +9,8 @@ auto-merge.
 
 ## Requirements
 
-- Node.js 20 or newer
+- Node.js 20 or newer (the code base stays on plain ES2022 — no
+  `Promise.withResolvers` or other ES2024-only APIs)
 - Git
 - At least one local agent executable (`omp`, `agy`, or `grok`)
 
@@ -64,8 +65,21 @@ flag that would enable one. All candidates pin to one base commit captured
 before dispatch and work in their own detached worktrees; each produces a
 hook-free artifact commit stored under a private
 `refs/agent-hub/candidates/...` ref. The command prints the fan-out document
-(`base`, per-candidate results with `candidate_id` and `artifact`); it never
-touches the primary checkout.
+(`base`, aggregate `status`, per-candidate results with `candidate_id` and
+`artifact`); it never touches the primary checkout.
+
+`status` summarizes the operation: `success` when every candidate succeeded,
+`partial` when some succeeded and some did not, `failure` when no candidate
+succeeded or the fan-out itself errored. A partial or failed fan-out is an
+operation failure: the CLI exits `1` and the MCP tools set `isError`, while
+each candidate keeps its own `status`/`error`.
+
+The core library hands retained artifact refs to its caller. The terminal
+paths — CLI `fanout` and the MCP fan-out tools — own the tail of that
+lifecycle: they release every ref they created before returning, CAS-safe (a
+ref someone else re-targeted is left alone), and report `ref_cleanup_errors`
+in the document if releasing itself failed. Review candidates from the
+returned diffs; after the command ends, the refs are gone.
 
 Repeat `--task` once per `--agent` to pair distinct tasks in order, or pass a
 single `--task` to give every agent the same assignment.
@@ -81,12 +95,23 @@ npx agent-hub fanout --agent omp --agent grok --task "Fix it" \
 ```
 
 With `--judge` alone the command prints `{ fan_out, competition }`. With
-`--auto-merge` it prints `{ fan_out, competition, merge }` and the merge
-outcome is decided by `mergeCandidate` (see Safety below). A merge refusal is
-a structured result, not a crash: `strategy: "none"`, `clean: false`, and a
-`MERGE_*` code such as `MERGE_BASE_MOVED`, `MERGE_DIRTY_WORKTREE`, or
-`MERGE_NOT_DESCENDANT`. Merge status/errors are distinct from the v1
-`DelegateStatus` vocabulary and live on the `merge` object only.
+`--auto-merge` it prints `{ fan_out, competition, merge }`, and adoption runs
+through `autoMerge`, which follows only a real `runCompetition()` result:
+status `selected` with a null error, a winner appearing exactly once in that
+competition's own eligible list, a base identical to the fan-out base, and a
+fan-out candidate whose status is `success` and whose recorded artifact
+commit and ref match the eligible entry verbatim. Forged or workflow-shaped
+competition objects are refused, never followed. A refusal before any
+mutation is a structured result, not a crash: `strategy: "none"`,
+`clean: false`, and a `MERGE_*` code such as `MERGE_BASE_MOVED`,
+`MERGE_DIRTY_WORKTREE`, or `MERGE_NOT_DESCENDANT`.
+
+A failure after the fast-forward already happened never claims there was no
+mutation: the outcome reports `strategy: "fast-forward"`, the observed `HEAD`
+as `applied_commit`, and `MERGE_POSTCONDITION_FAILED` or
+`LOCK_RELEASE_FAILED`. Adoption is never rolled back — inspect the checkout.
+Merge status/errors are distinct from the v1 `DelegateStatus` vocabulary and
+live on the `merge` object only.
 
 ### session continuation
 
@@ -101,7 +126,13 @@ npx agent-hub session resume <session-id> --task "Continue and run the tests"
 ```
 
 The session record contains only repository and provider metadata; task text,
-stdout, and diffs are not persisted. Native provider continuation is used only
+stdout, and diffs are not persisted. The artifact commit is captured and the
+session ref advanced *before* a failing run's error is surfaced: a crashed or
+failing turn still persists its filesystem state, and a resume continues from
+that artifact. `session create` rejects a dirty caller checkout unless
+`--allow-dirty` is passed; `session resume` deliberately ignores caller
+checkout dirtiness because the session ref — not the checkout — is the
+baseline. Native provider continuation is used only
 when an adapter explicitly verifies its command syntax. Competition is a
 separate fan-out operation, available through `fanout --judge` or the MCP
 `compete_candidates` tool.
@@ -119,7 +150,9 @@ additive v2 tools `fanout_candidates`, `compete_candidates`, `session_create`,
 and `session_resume`. `compete_candidates.auto_merge` defaults to `false`.
 Every tool returns structured JSON content with `isError`; a failing operation
 comes back as `{ error: { code, message } }` and never escapes as a
-transport-level exception. MCP clients and the CLI call the same cores;
+transport-level exception. The fan-out tools report a `partial` or `failure`
+aggregate status as `isError` and, like the CLI, release the artifact refs
+they created before returning. MCP clients and the CLI call the same cores;
 transport code does not contain provider or Git logic.
 
 ## Adapter configuration
@@ -171,6 +204,14 @@ v2 fan-out:
 - Artifacts are created with Git plumbing through a private temporary index
   and fixed identity; user hooks never run during capture, and the caller's
   index/checkout are untouched. Artifact commits live only on private refs.
+- The result carries an aggregate `status`; CLI and MCP treat anything but
+  `success` as an operation failure. The core retains artifact refs for its
+  caller; terminal paths release them CAS-safe at the end and there is no
+  ref garbage collection.
+- Repository locks recover from crashes conservatively: a lock whose same-host
+  owner is demonstrably dead, and an ownerless lock directory older than the
+  60s crash-recovery grace window, are reclaimed through an atomic rename
+  arbiter; anything else reports `LOCK_BUSY` / `LOCK_UNRECOVERABLE`.
 
 v2 auto-merge (opt-in, all conditions enforced again under the
 repository-local merge lock immediately before the checkout is touched):
@@ -184,16 +225,25 @@ repository-local merge lock immediately before the checkout is touched):
 - Adoption is a verified fast-forward (`git merge --ff-only`) of that one
   internally selected commit, with hooks disabled. Afterwards, `HEAD` must
   equal the artifact commit and the checkout must still be clean.
-- Any failed condition is a serializable refusal (`strategy: "none"`) with no
-  mutation: no stash, no reset, no force, no rebase, no cherry-pick, no patch
-  apply, no conflict resolution. If the base moved, the correct continuation
-  is a fresh fan-out from the new state — never a forced adoption.
+- Any condition that fails before adoption is a serializable refusal
+  (`strategy: "none"`) with no mutation: no stash, no reset, no force, no
+  rebase, no cherry-pick, no patch apply, no conflict resolution. If the base
+  moved, the correct continuation is a fresh fan-out from the new state —
+  never a forced adoption.
+- A failure after `git merge --ff-only` ran is reported truthfully as
+  `strategy: "fast-forward"` with the observed `HEAD` and
+  `MERGE_POSTCONDITION_FAILED` / `LOCK_RELEASE_FAILED`; there is no rollback
+  path and no pretense of a no-mutation refusal.
 
 Sessions/continuation:
 
 - A session is a private ref plus an atomic state record under the Git common
   directory. Each create/resume advances one linear artifact commit and never
   modifies the primary checkout. Nothing merges on create or resume.
+- The artifact commit is durable before a run's failure is reported, so a
+  failed session turn persists its filesystem state and remains resumable;
+  the session ref and state advance together through a sidecar-guarded
+  compare-and-set protocol.
 
 Not in scope for v2: queued workflows, remote providers, or cross-repository
 merges.

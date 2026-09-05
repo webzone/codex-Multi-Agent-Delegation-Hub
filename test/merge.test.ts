@@ -9,12 +9,15 @@ import { acquireRepositoryLock } from "../src/locks.js";
 import { autoMerge, mergeCandidate, MERGE_LOCK_NAME } from "../src/merge.js";
 import type {
   CandidateArtifact,
-  CompetitionOutcome,
   FanOutCandidateResult,
   FanOutResult,
   MergeOutcome,
   RepositoryIdentity,
 } from "../src/types.js";
+import type {
+  CompetitionEligibleCandidate,
+  CompetitionResult,
+} from "../src/competition.js";
 import { createGitRepository, removeDirectory, runGit } from "./helpers.js";
 
 async function headOf(repository: string): Promise<string> {
@@ -48,34 +51,69 @@ function refused(outcome: MergeOutcome, code: string) {
   expect(typeof outcome.error?.message).toBe("string");
 }
 
-function fakeCompetition(
-  winnerId: string | null,
-  error: CompetitionOutcome["error"] = null,
-): CompetitionOutcome {
+function fakeEligible(
+  candidateId: string,
+  artifact: CandidateArtifact,
+): CompetitionEligibleCandidate {
   return {
-    judge_agent: "omp",
-    ranking: winnerId === null ? [] : [winnerId],
-    winner_id: winnerId,
-    judgements: [],
-    raw_output: "",
-    truncated: false,
-    error,
+    candidate_id: candidateId,
+    index: 0,
+    agent: "omp",
+    artifact_commit: artifact.commit as string,
+    artifact_ref: artifact.ref as string,
+    changed_file_count: artifact.changed_files.length,
   };
 }
 
-function fakeFanOutResult(base: RepositoryIdentity, artifact: CandidateArtifact | null): FanOutResult {
+/** A real CompetitionResult shape; per-test overrides simulate forged or failed inputs. */
+function fakeCompetitionResult(
+  base: RepositoryIdentity,
+  winnerId: string,
+  artifact: CandidateArtifact | null,
+  overrides: Partial<CompetitionResult> = {},
+): CompetitionResult {
+  const eligible =
+    artifact?.commit && artifact.ref
+      ? [fakeEligible(winnerId, artifact)]
+      : [];
+  return {
+    status: "selected",
+    strategy: "judge",
+    mode: "judge",
+    workspace: base.worktree_root,
+    base,
+    eligible,
+    rejected: [],
+    winner: { candidate_id: winnerId, reason: "fake judge", basis: "judge" },
+    judge: null,
+    retained_artifact_refs: eligible.map((entry) => entry.artifact_ref),
+    started_at: "2026-01-01T00:00:00.000Z",
+    finished_at: "2026-01-01T00:00:01.000Z",
+    duration_ms: 1000,
+    error: null,
+    ...overrides,
+  };
+}
+
+function fakeFanOutResult(
+  base: RepositoryIdentity,
+  artifact: CandidateArtifact | null,
+  options: { status?: "success" | "failure" } = {},
+): FanOutResult {
+  const status = options.status ?? "success";
   const candidate = {
     candidate_id: "winner",
     artifact,
     index: 0,
     label: "",
     task: "candidate task",
-    status: "success",
+    status,
   } as unknown as FanOutCandidateResult;
   return {
     base,
     max_concurrency: 1,
     candidates: [candidate],
+    status,
     started_at: "2026-01-01T00:00:00.000Z",
     finished_at: "2026-01-01T00:00:01.000Z",
     duration_ms: 1000,
@@ -412,12 +450,13 @@ describe("merge", { timeout: 30_000 }, () => {
         const outcome = await autoMerge({
           workspace: repository,
           fan_out: fakeFanOutResult(base, artifact),
-          competition: fakeCompetition("winner"),
+          competition: fakeCompetitionResult(base, "winner", artifact),
         });
 
         expect(outcome.strategy).toBe("fast-forward");
         expect(outcome.candidate_id).toBe("winner");
         expect(outcome.applied_commit).toBe(artifact.commit);
+        expect(outcome.error).toBeNull();
         expect(await headOf(repository)).toBe(artifact.commit);
       } finally {
         await removeDirectory(repository);
@@ -441,31 +480,165 @@ describe("merge", { timeout: 30_000 }, () => {
       }
     });
 
-    it("refuses when the competition errored", async () => {
+    it("refuses a failed competition (status + error)", async () => {
       const repository = await createGitRepository();
       try {
+        const before = await headOf(repository);
         const { base, artifact } = await makeArtifact(repository, "winner.txt");
         const outcome = await autoMerge({
           workspace: repository,
           fan_out: fakeFanOutResult(base, artifact),
-          competition: fakeCompetition("winner", { code: "JUDGE_TIMEOUT", message: "judge died" }),
+          competition: fakeCompetitionResult(base, "winner", artifact, {
+            status: "failure",
+            winner: null,
+            error: { code: "JUDGE_TIMEOUT", message: "judge died" },
+          }),
         });
         refused(outcome, "MERGE_COMPETITION_FAILED");
+        expect(await headOf(repository)).toBe(before);
       } finally {
         await removeDirectory(repository);
       }
     });
 
-    it("refuses when the judge produced no winner", async () => {
+    it("refuses a competition that never reached status selected", async () => {
       const repository = await createGitRepository();
       try {
         const { base, artifact } = await makeArtifact(repository, "winner.txt");
         const outcome = await autoMerge({
           workspace: repository,
           fan_out: fakeFanOutResult(base, artifact),
-          competition: fakeCompetition(null),
+          competition: fakeCompetitionResult(base, "winner", artifact, {
+            status: "failure",
+            winner: null,
+          }),
         });
-        refused(outcome, "MERGE_NO_WINNER");
+        refused(outcome, "MERGE_NOT_SELECTED");
+        expect(await headOf(repository)).not.toBe(artifact.commit);
+      } finally {
+        await removeDirectory(repository);
+      }
+    });
+
+    it("refuses a forged workflow-shaped competition object", async () => {
+      const repository = await createGitRepository();
+      try {
+        const before = await headOf(repository);
+        const { base, artifact } = await makeArtifact(repository, "winner.txt");
+        // The retired workflow-shaped look-alike (winner_id/ranking, no
+        // status/eligible/base) must be refused, never followed.
+        const forged = {
+          judge_agent: "omp",
+          ranking: ["winner"],
+          winner_id: "winner",
+          judgements: [],
+          raw_output: "",
+          truncated: false,
+          error: null,
+        } as unknown as CompetitionResult;
+        const outcome = await autoMerge({
+          workspace: repository,
+          fan_out: fakeFanOutResult(base, artifact),
+          competition: forged,
+        });
+        refused(outcome, "MERGE_INVALID_INPUT");
+        expect(await headOf(repository)).toBe(before);
+      } finally {
+        await removeDirectory(repository);
+      }
+    });
+
+    it("refuses a winner that is not exactly one eligible entry", async () => {
+      const repository = await createGitRepository();
+      try {
+        const before = await headOf(repository);
+        const { base, artifact } = await makeArtifact(repository, "winner.txt");
+
+        const ineligible = await autoMerge({
+          workspace: repository,
+          fan_out: fakeFanOutResult(base, artifact),
+          competition: fakeCompetitionResult(base, "winner", artifact, {
+            eligible: [],
+            retained_artifact_refs: [],
+          }),
+        });
+        refused(ineligible, "MERGE_WINNER_NOT_ELIGIBLE");
+
+        const entry = fakeEligible("winner", artifact);
+        const duplicated = await autoMerge({
+          workspace: repository,
+          fan_out: fakeFanOutResult(base, artifact),
+          competition: fakeCompetitionResult(base, "winner", artifact, {
+            eligible: [entry, { ...entry }],
+          }),
+        });
+        refused(duplicated, "MERGE_WINNER_NOT_ELIGIBLE");
+        expect(await headOf(repository)).toBe(before);
+      } finally {
+        await removeDirectory(repository);
+      }
+    });
+
+    it("refuses when the competition base is not the fan-out base", async () => {
+      const repository = await createGitRepository();
+      try {
+        const before = await headOf(repository);
+        const { base, artifact } = await makeArtifact(repository, "winner.txt");
+        const outcome = await autoMerge({
+          workspace: repository,
+          fan_out: fakeFanOutResult(base, artifact),
+          competition: fakeCompetitionResult(base, "winner", artifact, {
+            base: { ...base, head: "f".repeat(40) },
+          }),
+        });
+        refused(outcome, "MERGE_BASE_MISMATCH");
+        expect(await headOf(repository)).toBe(before);
+      } finally {
+        await removeDirectory(repository);
+      }
+    });
+
+    it("refuses a winner candidate whose fan-out status is not success", async () => {
+      const repository = await createGitRepository();
+      try {
+        const before = await headOf(repository);
+        const { base, artifact } = await makeArtifact(repository, "winner.txt");
+        const outcome = await autoMerge({
+          workspace: repository,
+          fan_out: fakeFanOutResult(base, artifact, { status: "failure" }),
+          competition: fakeCompetitionResult(base, "winner", artifact),
+        });
+        refused(outcome, "MERGE_CANDIDATE_NOT_SUCCESS");
+        expect(await headOf(repository)).toBe(before);
+      } finally {
+        await removeDirectory(repository);
+      }
+    });
+
+    it("refuses artifacts whose commit or ref disagree with the eligible entry", async () => {
+      const repository = await createGitRepository();
+      try {
+        const before = await headOf(repository);
+        const { base, artifact } = await makeArtifact(repository, "winner.txt");
+
+        const wrongCommit = await autoMerge({
+          workspace: repository,
+          fan_out: fakeFanOutResult(base, artifact),
+          competition: fakeCompetitionResult(base, "winner", artifact, {
+            eligible: [{ ...fakeEligible("winner", artifact), artifact_commit: "a".repeat(40) }],
+          }),
+        });
+        refused(wrongCommit, "MERGE_CANDIDATE_ARTIFACT_MISMATCH");
+
+        const wrongRef = await autoMerge({
+          workspace: repository,
+          fan_out: fakeFanOutResult(base, artifact),
+          competition: fakeCompetitionResult(base, "winner", artifact, {
+            eligible: [{ ...fakeEligible("winner", artifact), artifact_ref: "refs/heads/evil" }],
+          }),
+        });
+        refused(wrongRef, "MERGE_CANDIDATE_ARTIFACT_MISMATCH");
+        expect(await headOf(repository)).toBe(before);
       } finally {
         await removeDirectory(repository);
       }
@@ -475,10 +648,15 @@ describe("merge", { timeout: 30_000 }, () => {
       const repository = await createGitRepository();
       try {
         const { base, artifact } = await makeArtifact(repository, "winner.txt");
+        const entry = fakeEligible("ghost", artifact);
         const outcome = await autoMerge({
           workspace: repository,
           fan_out: fakeFanOutResult(base, artifact),
-          competition: fakeCompetition("ghost"),
+          competition: fakeCompetitionResult(base, "winner", artifact, {
+            winner: { candidate_id: "ghost", reason: "forged selection", basis: "judge" },
+            eligible: [entry],
+            retained_artifact_refs: [entry.artifact_ref],
+          }),
         });
         refused(outcome, "MERGE_CANDIDATE_NOT_FOUND");
       } finally {
@@ -486,14 +664,14 @@ describe("merge", { timeout: 30_000 }, () => {
       }
     });
 
-    it("refuses a winner with an empty artifact", async () => {
+    it("refuses a winner with no artifact on the candidate", async () => {
       const repository = await createGitRepository();
       try {
-        const base = await resolveRepositoryIdentity(repository);
+        const { base, artifact } = await makeArtifact(repository, "winner.txt");
         const outcome = await autoMerge({
           workspace: repository,
           fan_out: fakeFanOutResult(base, null),
-          competition: fakeCompetition("winner"),
+          competition: fakeCompetitionResult(base, "winner", artifact),
         });
         refused(outcome, "MERGE_NO_ARTIFACT");
       } finally {
@@ -505,9 +683,108 @@ describe("merge", { timeout: 30_000 }, () => {
       const outcome = await autoMerge({
         workspace: "/does-not-matter",
         fan_out: null as unknown as FanOutResult,
-        competition: fakeCompetition("winner"),
+        competition: {} as unknown as CompetitionResult,
       });
       refused(outcome, "MERGE_INVALID_INPUT");
+    });
+  });
+
+  describe("post-adoption failure reporting", () => {
+    it("reports an applied fast-forward when verification sees a different HEAD", async () => {
+      const repository = await createGitRepository();
+      try {
+        const { base, artifact } = await makeArtifact(repository, "candidate.txt");
+        const outcome = await mergeCandidate(
+          { workspace: repository, base, candidateId: "c1", artifact },
+          { verifyPostAdoption: async () => ({ head: "d".repeat(40), clean: true }) },
+        );
+
+        expect(outcome.strategy).toBe("fast-forward");
+        expect(outcome.clean).toBe(false);
+        expect(outcome.error?.code).toBe("MERGE_POSTCONDITION_FAILED");
+        // The observed HEAD, reported truthfully — not a no-mutation fiction.
+        expect(outcome.applied_commit).toBe("d".repeat(40));
+        expect(outcome.notes).toContain("fast-forward-applied");
+        // The fast-forward really happened and was never rolled back.
+        expect(await headOf(repository)).toBe(artifact.commit);
+      } finally {
+        await removeDirectory(repository);
+      }
+    });
+
+    it("reports an applied fast-forward with a null commit when the probe cannot read the checkout", async () => {
+      const repository = await createGitRepository();
+      try {
+        const { base, artifact } = await makeArtifact(repository, "candidate.txt");
+        const outcome = await mergeCandidate(
+          { workspace: repository, base, candidateId: "c1", artifact },
+          {
+            verifyPostAdoption: async () => {
+              throw new Error("probe exploded");
+            },
+          },
+        );
+
+        expect(outcome.strategy).toBe("fast-forward");
+        expect(outcome.clean).toBe(false);
+        expect(outcome.error?.code).toBe("MERGE_POSTCONDITION_FAILED");
+        expect(outcome.error?.message).toContain("probe exploded");
+        expect(outcome.applied_commit).toBeNull();
+        expect(await headOf(repository)).toBe(artifact.commit);
+      } finally {
+        await removeDirectory(repository);
+      }
+    });
+
+    it("reports an applied fast-forward when the tree is dirty afterwards", async () => {
+      const repository = await createGitRepository();
+      try {
+        const { base, artifact } = await makeArtifact(repository, "candidate.txt");
+        const outcome = await mergeCandidate(
+          { workspace: repository, base, candidateId: "c1", artifact },
+          { verifyPostAdoption: async () => ({ head: artifact.commit as string, clean: false }) },
+        );
+
+        expect(outcome.strategy).toBe("fast-forward");
+        expect(outcome.clean).toBe(false);
+        expect(outcome.error?.code).toBe("MERGE_POSTCONDITION_FAILED");
+        expect(outcome.applied_commit).toBe(artifact.commit);
+        expect(await headOf(repository)).toBe(artifact.commit);
+      } finally {
+        await removeDirectory(repository);
+      }
+    });
+
+    it("surfaces lock-release failure as an applied fast-forward with a structured error", async () => {
+      const repository = await createGitRepository();
+      try {
+        const { base, artifact } = await makeArtifact(repository, "candidate.txt");
+        const outcome = await mergeCandidate(
+          { workspace: repository, base, candidateId: "c1", artifact },
+          {
+            acquireMergeLock: async (commonDir) => {
+              const lock = await acquireRepositoryLock({ commonDir, name: MERGE_LOCK_NAME });
+              return {
+                ...lock,
+                release: async () => {
+                  throw new Error("simulated release failure");
+                },
+              };
+            },
+          },
+        );
+
+        expect(outcome.strategy).toBe("fast-forward");
+        expect(outcome.clean).toBe(true); // the checkout itself was verified
+        expect(outcome.error?.code).toBe("LOCK_RELEASE_FAILED");
+        expect(outcome.error?.message).toContain("simulated release failure");
+        expect(outcome.applied_commit).toBe(artifact.commit);
+        expect(outcome.notes.some((note) => note.startsWith("merge-lock-release-failed"))).toBe(true);
+        // No rollback: the adoption stands.
+        expect(await headOf(repository)).toBe(artifact.commit);
+      } finally {
+        await removeDirectory(repository);
+      }
     });
   });
 });

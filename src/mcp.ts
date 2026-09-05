@@ -4,14 +4,15 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import { runCompetition } from "./competition.js";
+import { runCompetition, type CompetitionResult } from "./competition.js";
 import { delegate } from "./delegate.js";
 import { fanOut, FANOUT_MAX_CONCURRENCY_LIMIT } from "./fanout.js";
 import { autoMerge } from "./merge.js";
+import { releaseFanOutArtifactRefs } from "./artifacts.js";
 import { createSession, resumeSession } from "./session.js";
 import { asDelegateError } from "./errors.js";
 import { supportedAgents } from "./adapters/index.js";
-import type { MergeOutcome } from "./types.js";
+import type { DelegateError, MergeOutcome } from "./types.js";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -112,7 +113,7 @@ export function createHubServer(): McpServer {
     "fanout_candidates",
     {
       description:
-        "Run isolated candidate agents over one shared base commit. Candidates never execute in the caller checkout and nothing is merged by this tool.",
+        "Run isolated candidate agents over one shared base commit. Candidates never execute in the caller checkout and nothing is merged by this tool. Retained artifact refs are released (CAS-safe) before the tool returns, so review candidates from the returned diffs.",
       inputSchema: fanoutShape,
     },
     async ({ workspace, candidates, max_concurrency, allow_dirty, max_output_bytes }) =>
@@ -124,7 +125,15 @@ export function createHubServer(): McpServer {
           allowDirty: allow_dirty,
           maxOutputBytes: max_output_bytes,
         });
-        return okTool(result, result.error !== null);
+        // This tool result is the last consumer of the candidate artifact
+        // refs: release them CAS-safe (externally retargeted refs survive).
+        const cleanupErrors = await releaseFanOutArtifactRefs(workspace, result);
+        const document =
+          cleanupErrors.length > 0
+            ? { ...result, ref_cleanup_errors: cleanupErrors }
+            : result;
+        // A partial or fully-failed fan-out is an operation failure.
+        return okTool(document, result.status !== "success");
       }),
   );
 
@@ -132,7 +141,7 @@ export function createHubServer(): McpServer {
     "compete_candidates",
     {
       description:
-        "Run isolated candidates, have a judge select among retained artifacts, and optionally adopt the internal winner by verified fast-forward.",
+        "Run isolated candidates, have a judge select among retained artifacts, and optionally adopt the internal winner by verified fast-forward. Retained artifact refs are released (CAS-safe) before the tool returns.",
       inputSchema: {
         ...fanoutShape,
         judge_agent: z.enum(supportedAgents),
@@ -156,19 +165,35 @@ export function createHubServer(): McpServer {
           allowDirty: allow_dirty,
           maxOutputBytes: max_output_bytes,
         });
-        const competition = await runCompetition({
+        let competition: CompetitionResult;
+        let merge: MergeOutcome | null = null;
+        let cleanupErrors: DelegateError[] = [];
+        try {
+          competition = await runCompetition({
+            fan_out: fan,
+            strategy: "judge",
+            judge_agent,
+            workspace,
+            maxOutputBytes: max_output_bytes,
+          });
+          merge = auto_merge
+            ? await autoMerge({ workspace, fan_out: fan, competition })
+            : null;
+        } finally {
+          // Competition eligibility and merge ref verification have consumed
+          // the retained artifact refs by now; release them CAS-safe in all
+          // cases, including a judge or merge throw.
+          cleanupErrors = await releaseFanOutArtifactRefs(workspace, fan);
+        }
+        const document = {
           fan_out: fan,
-          strategy: "judge",
-          judge_agent,
-          workspace,
-          maxOutputBytes: max_output_bytes,
-        });
-        const merge = auto_merge
-          ? await autoMerge({ workspace, fan_out: fan, competition })
-          : null;
+          competition,
+          merge,
+          ...(cleanupErrors.length > 0 ? { ref_cleanup_errors: cleanupErrors } : {}),
+        };
         return okTool(
-          { fan_out: fan, competition, merge },
-          fan.error !== null || competition.error !== null || mergeFailed(merge),
+          document,
+          fan.status !== "success" || competition.error !== null || mergeFailed(merge),
         );
       }),
   );
