@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 
 import { AgentHubError } from "../src/errors.js";
 import { resolveRepositoryIdentity } from "../src/git.js";
-import { lockPathFor, type LockOwner } from "../src/locks.js";
+import { acquireRepositoryLock, lockPathFor, type LockOwner } from "../src/locks.js";
 import { deferred } from "../src/deferred.js";
 import {
   applySessionTransition,
@@ -230,10 +230,48 @@ describe("session state layer", { timeout: 20_000 }, () => {
     // A demonstrably dead same-host owner is reclaimed (Package 1 semantics).
     const dead = await deadPid();
     await plantSessionLock(commonDir, owner(dead));
-    const ran = await withSessionLock({ commonDir, sessionId: SESSION_ID }, async () => "ran");
-    expect(ran).toBe("ran");
+    const reclaimed = await withSessionLock({ commonDir, sessionId: SESSION_ID }, async () => "ran");
+    expect(reclaimed.value).toBe("ran");
+    expect(reclaimed.releaseError).toBeNull();
 
     await removeDirectory(repo);
+  });
+
+  it("keeps the completed operation when only the session lock release fails", async () => {
+    // No record is ever planted: the injected release failure is the whole
+    // subject, and a fake release cannot wedge anything real.
+    const brokenRelease: typeof acquireRepositoryLock = async (options) => ({
+      name: options.name,
+      path: lockPathFor(options.commonDir, options.name),
+      release: async () => {
+        throw new Error("simulated session lock release failure");
+      },
+    });
+
+    const ran = await withSessionLock(
+      { commonDir: "/abs/common", sessionId: SESSION_ID, acquireLock: brokenRelease },
+      async () => "ran",
+    );
+    // The completed outcome survives the failed release; only evidence rides in.
+    expect(ran.value).toBe("ran");
+    expect(ran.releaseError).toMatchObject({
+      code: "LOCK_RELEASE_FAILED",
+      message: expect.stringContaining("simulated session lock release failure"),
+    });
+
+    // Operation failures still propagate — with the release failure appended,
+    // never replacing it and never dropping it.
+    await expect(
+      withSessionLock(
+        { commonDir: "/abs/common", sessionId: SESSION_ID, acquireLock: brokenRelease },
+        async () => {
+          throw new AgentHubError("SESSION_STATE_INCONSISTENT", "operation failed");
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "SESSION_STATE_INCONSISTENT",
+      message: expect.stringContaining("session lock could not be released"),
+    });
   });
 
   it("creates ref + state together and rejects an id whose ref already exists", async () => {

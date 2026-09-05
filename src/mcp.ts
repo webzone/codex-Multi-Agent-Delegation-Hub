@@ -6,7 +6,7 @@ import { z } from "zod";
 
 import { runCompetition, type CompetitionResult } from "./competition.js";
 import { delegate } from "./delegate.js";
-import { fanOut, FANOUT_MAX_CONCURRENCY_LIMIT } from "./fanout.js";
+import { fanOut, FANOUT_MAX_CANDIDATES, FANOUT_MAX_CONCURRENCY_LIMIT } from "./fanout.js";
 import { autoMerge } from "./merge.js";
 import { releaseFanOutArtifactRefs } from "./artifacts.js";
 import { createSession, resumeSession } from "./session.js";
@@ -56,7 +56,23 @@ function mergeFailed(merge: MergeOutcome | null): boolean {
   return merge !== null && (merge.error !== null || !merge.clean);
 }
 
-export function createHubServer(): McpServer {
+/**
+ * Tool-level seams mirroring the core dependency pattern (`FanOutDependencies`,
+ * `MergeDependencies` …): production defaults are the real pipeline; focused
+ * tests inject a throwing operation to pin the error-evidence contract.
+ */
+export interface HubToolDependencies {
+  fanOut?: typeof fanOut;
+  runCompetition?: typeof runCompetition;
+  autoMerge?: typeof autoMerge;
+  releaseRefs?: typeof releaseFanOutArtifactRefs;
+}
+
+export function createHubServer(dependencies: HubToolDependencies = {}): McpServer {
+  const fanOutFn = dependencies.fanOut ?? fanOut;
+  const runCompetitionFn = dependencies.runCompetition ?? runCompetition;
+  const autoMergeFn = dependencies.autoMerge ?? autoMerge;
+  const releaseRefsFn = dependencies.releaseRefs ?? releaseFanOutArtifactRefs;
   const server = new McpServer({
     name: "codex-multi-agent-delegation-hub",
     version: "0.1.0",
@@ -103,7 +119,7 @@ export function createHubServer(): McpServer {
           agent: z.enum(supportedAgents),
         }),
       )
-      .min(1),
+      .max(FANOUT_MAX_CANDIDATES),
     max_concurrency: z.number().int().min(1).max(FANOUT_MAX_CONCURRENCY_LIMIT).optional(),
     allow_dirty: z.boolean().default(false),
     max_output_bytes: z.number().int().positive().optional(),
@@ -118,7 +134,7 @@ export function createHubServer(): McpServer {
     },
     async ({ workspace, candidates, max_concurrency, allow_dirty, max_output_bytes }) =>
       guardTool(async () => {
-        const result = await fanOut({
+        const result = await fanOutFn({
           workspace,
           candidates,
           maxConcurrency: max_concurrency,
@@ -127,7 +143,7 @@ export function createHubServer(): McpServer {
         });
         // This tool result is the last consumer of the candidate artifact
         // refs: release them CAS-safe (externally retargeted refs survive).
-        const cleanupErrors = await releaseFanOutArtifactRefs(workspace, result);
+        const cleanupErrors = await releaseRefsFn(workspace, result);
         const document =
           cleanupErrors.length > 0
             ? { ...result, ref_cleanup_errors: cleanupErrors }
@@ -159,18 +175,19 @@ export function createHubServer(): McpServer {
       auto_merge,
     }) =>
       guardTool(async () => {
-        const fan = await fanOut({
+        const fan = await fanOutFn({
           workspace,
           candidates,
           maxConcurrency: max_concurrency,
           allowDirty: allow_dirty,
           maxOutputBytes: max_output_bytes,
         });
-        let competition: CompetitionResult;
+        let competition: CompetitionResult | null = null;
         let merge: MergeOutcome | null = null;
+        let operationError: DelegateError | null = null;
         let cleanupErrors: DelegateError[] = [];
         try {
-          competition = await runCompetition({
+          competition = await runCompetitionFn({
             fan_out: fan,
             strategy: "judge",
             judge_agent,
@@ -178,13 +195,30 @@ export function createHubServer(): McpServer {
             maxOutputBytes: max_output_bytes,
           });
           merge = auto_merge
-            ? await autoMerge({ workspace, fan_out: fan, competition })
+            ? await autoMergeFn({ workspace, fan_out: fan, competition })
             : null;
+        } catch (error) {
+          // Caught *inside* the handler: like the CLI terminal path, the
+          // operation's error becomes the tool's error document, and the
+          // ref-release evidence below still rides along with it. A throw
+          // out of here would discard every cleanup fact collected after it.
+          operationError = asDelegateError(error);
         } finally {
           // Competition eligibility and merge ref verification have consumed
           // the retained artifact refs by now; release them CAS-safe in all
           // cases, including a judge or merge throw.
-          cleanupErrors = await releaseFanOutArtifactRefs(workspace, fan);
+          cleanupErrors = await releaseRefsFn(workspace, fan);
+        }
+        if (operationError !== null) {
+          return okTool(
+            {
+              error: operationError,
+              ...(cleanupErrors.length > 0
+                ? { ref_cleanup_errors: cleanupErrors }
+                : {}),
+            },
+            true,
+          );
         }
         const document = {
           fan_out: fan,
@@ -195,7 +229,7 @@ export function createHubServer(): McpServer {
         return okTool(
           document,
           fan.status !== "success" ||
-            competition.error !== null ||
+            competition?.error !== null ||
             mergeFailed(merge) ||
             cleanupErrors.length > 0,
         );

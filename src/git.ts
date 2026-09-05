@@ -69,9 +69,12 @@ export async function resolveRepositoryIdentity(cwd: string): Promise<Repository
     const absolute = await runGit(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"], 4000);
     commonDir = absolute.stdout.trim();
   } catch {
-    // Older Git without --path-format: resolve relative output against cwd.
+    // Older Git without --path-format prints the common dir *relative to the
+    // queried cwd* (a linked worktree reports e.g. `../.git`). It must be
+    // resolved against that target cwd — resolving it against process.cwd()
+    // silently points every workspace's state at some unrelated directory.
     const relative = await runGit(cwd, ["rev-parse", "--git-common-dir"], 4000);
-    commonDir = relative.stdout.trim();
+    commonDir = resolvePath(cwd, relative.stdout.trim());
   }
 
   const toplevel = await runGit(cwd, ["rev-parse", "--show-toplevel"], 4000);

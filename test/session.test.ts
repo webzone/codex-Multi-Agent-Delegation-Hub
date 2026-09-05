@@ -219,6 +219,106 @@ describe("hub sessions", { timeout: 30_000 }, () => {
     }
   });
 
+  it("returns the committed create with cleanup_error when only the session lock release fails", async () => {
+    const repo = await createGitRepository();
+    const adapter: AgentAdapter = {
+      id: "writer",
+      async execute(request) {
+        await writeFile(join(request.cwd, "a.txt"), "alpha\n");
+        return okResult();
+      },
+    };
+    // Only the per-session lock's release is broken; worktree administration
+    // and the durable transition itself run untouched.
+    const brokenSessionRelease: typeof acquireRepositoryLock = async (options) => {
+      const lock = await acquireRepositoryLock(options);
+      return {
+        ...lock,
+        release: async () => {
+          throw new Error("simulated session lock release failure");
+        },
+      };
+    };
+
+    let sessionId: string | null = null;
+    try {
+      const result = await createSession(
+        { workspace: repo, agent: "writer", task: "write a file" },
+        { resolveAdapter: () => adapter, acquireSessionLock: brokenSessionRelease },
+      );
+      sessionId = result.session.session_id;
+
+      // The transition was durably committed and the completed result — id
+      // and revision included — is returned instead of being thrown away.
+      expect(result.run.status).toBe("success");
+      expect(result.session.revision).toBe(1);
+      expect(result.session.session_id).toMatch(/^[0-9a-f-]{36}$/);
+      expect(await refSha(repo, result.session.ref)).toBe(result.artifact.commit);
+
+      // The release trouble is reported, not thrown; ordinary teardown still ran.
+      expect(result.cleanup_error?.code).toBe("LOCK_RELEASE_FAILED");
+      expect(result.cleanup_error?.message).toContain("simulated session lock release failure");
+      expect(result.cleanup_error?.message).toContain("session lock record");
+      expect(await missing(result.execution_workspace)).toBe(true);
+    } finally {
+      if (sessionId) {
+        await rm(lockPathFor(join(repo, ".git"), sessionLockName(sessionId)), {
+          recursive: true,
+          force: true,
+        });
+      }
+      await removeDirectory(repo);
+    }
+  });
+
+  it("returns the committed resume with cleanup_error when only the session lock release fails", async () => {
+    const repo = await createGitRepository();
+    const adapter: AgentAdapter = {
+      id: "writer",
+      async execute(request) {
+        await writeFile(join(request.cwd, "a.txt"), "beta\n");
+        return okResult();
+      },
+    };
+    const created = await createSession(
+      { workspace: repo, agent: "writer", task: "first turn" },
+      { resolveAdapter: () => adapter },
+    );
+
+    const brokenSessionRelease: typeof acquireRepositoryLock = async (options) => {
+      const lock = await acquireRepositoryLock(options);
+      return {
+        ...lock,
+        release: async () => {
+          throw new Error("simulated resume lock release failure");
+        },
+      };
+    };
+
+    try {
+      const resumed = await resumeSession(
+        { workspace: repo, session_id: created.session.session_id, task: "second turn" },
+        { resolveAdapter: () => adapter, acquireSessionLock: brokenSessionRelease },
+      );
+
+      // The advance landed (ref + revision 2); the wedged release only adds
+      // evidence to the returned result.
+      expect(resumed.run.status).toBe("success");
+      expect(resumed.session.session_id).toBe(created.session.session_id);
+      expect(resumed.session.revision).toBe(2);
+      expect(await refSha(repo, resumed.session.ref)).toBe(resumed.artifact.commit);
+      expect(resumed.cleanup_error?.code).toBe("LOCK_RELEASE_FAILED");
+      expect(resumed.cleanup_error?.message).toContain("simulated resume lock release failure");
+      expect(await missing(resumed.execution_workspace)).toBe(true);
+    } finally {
+      await rm(lockPathFor(join(repo, ".git"), sessionLockName(created.session.session_id)), {
+        recursive: true,
+        force: true,
+      });
+      await removeDirectory(repo);
+    }
+  });
+
   it("records an artifact commit even when the run changes nothing", async () => {
     const repo = await createGitRepository();
     const adapter: AgentAdapter = { id: "noop", async execute() { return okResult(); } };

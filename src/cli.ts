@@ -2,7 +2,7 @@
 
 import { delegate } from "./delegate.js";
 import { runCompetition, type CompetitionResult } from "./competition.js";
-import { fanOut } from "./fanout.js";
+import { fanOut, FANOUT_MAX_CANDIDATES } from "./fanout.js";
 import { autoMerge } from "./merge.js";
 import { releaseFanOutArtifactRefs } from "./artifacts.js";
 import { createSession, resumeSession } from "./session.js";
@@ -36,6 +36,7 @@ Options:
 
 Fan-out options (fanout):
   --agent <a>          Candidate agent; repeat for one candidate per agent
+                       (at most ${FANOUT_MAX_CANDIDATES} candidates total)
   --task "<text>"      Candidate task; repeat to pair 1:1 with --agent in order,
                        or pass once to give every agent the same task
   --concurrency <n>    Maximum candidates in flight (1..8)
@@ -278,6 +279,12 @@ function parseFanoutArgs(args: string[], judgeAllowed: boolean): FanoutParse {
     candidates = agents.map((agent) => ({ agent, task: tasks[0] }));
   } else {
     throw new Error(`--task must be given once (shared task) or exactly once per --agent`);
+  }
+
+  if (candidates.length > FANOUT_MAX_CANDIDATES) {
+    throw new Error(
+      `at most ${FANOUT_MAX_CANDIDATES} candidates are supported per fan-out (got ${candidates.length})`,
+    );
   }
 
   if (judge !== null) {

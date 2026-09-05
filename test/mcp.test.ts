@@ -2,10 +2,14 @@ import { chmod } from "node:fs/promises";
 import { join } from "node:path";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { describe, expect, it } from "vitest";
 
+import { AgentHubError } from "../src/errors.js";
 import { createHubServer } from "../src/mcp.js";
+import { FANOUT_MAX_CANDIDATES } from "../src/fanout.js";
+import type { DelegateError, FanOutResult } from "../src/types.js";
 import {
   BLOCKED_WRITE_IS_MEANINGFUL,
   BLOCKING_JUDGE_SCRIPT,
@@ -16,8 +20,7 @@ import {
   runGit,
 } from "./helpers.js";
 
-async function connectClient(): Promise<Client> {
-  const server = createHubServer();
+async function connectClient(server: McpServer = createHubServer()): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
   const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
@@ -81,6 +84,25 @@ describe("MCP server", () => {
       "workspace",
     ]);
     expect(schema.required).toEqual(expect.arrayContaining(["task", "agent"]));
+  });
+
+  it("caps the total candidate count in both fan-out tool schemas", async () => {
+    const client = await connectClient();
+    const { tools } = await client.listTools();
+    for (const name of ["fanout_candidates", "compete_candidates"]) {
+      const tool = tools.find((entry) => entry.name === name);
+      const schema: unknown = tool?.inputSchema;
+      if (!schema || typeof schema !== "object" || !("properties" in schema)) {
+        throw new Error(`${name}: expected an object input schema with properties`);
+      }
+      const properties: unknown = schema.properties;
+      if (!properties || typeof properties !== "object" || !("candidates" in properties)) {
+        throw new Error(`${name}: expected a candidates property in the input schema`);
+      }
+      // (The SDK's JSON Schema conversion surfaces `maxItems`; the existing
+      // `.min(1)` does not survive the conversion and stays core-enforced.)
+      expect(properties.candidates).toMatchObject({ maxItems: FANOUT_MAX_CANDIDATES });
+    }
   });
 
   it("answers fan-out failures with structured content and isError, never a transport throw", async () => {
@@ -393,4 +415,56 @@ describe("MCP server", () => {
     },
     30_000,
   );
+
+  it("keeps ref-cleanup evidence when the competition throws inside the tool", async () => {
+    const fan: FanOutResult = {
+      base: {
+        common_dir: "/fake/repo/.git",
+        worktree_root: "/fake/repo",
+        branch: "main",
+        head: "f".repeat(40),
+      },
+      max_concurrency: 1,
+      candidates: [],
+      status: "success",
+      started_at: "2026-01-01T00:00:00.000Z",
+      finished_at: "2026-01-01T00:00:01.000Z",
+      duration_ms: 1_000,
+      error: null,
+    };
+    const cleanupErrors: DelegateError[] = [
+      { code: "ARTIFACT_REF_CLEANUP_FAILED", message: "ref A could not be released" },
+      { code: "ARTIFACT_REF_CLEANUP_FAILED", message: "ref B could not be released" },
+    ];
+
+    // The seams exist for exactly this contract: an operation throw must not
+    // discard the cleanup evidence collected after it.
+    const server = createHubServer({
+      fanOut: async () => fan,
+      runCompetition: async () => {
+        throw new AgentHubError("JUDGE_WORKTREE_ADD_FAILED", "judge worktree could not be created");
+      },
+      releaseRefs: async () => cleanupErrors,
+    });
+    const client = await connectClient(server);
+    const result = await client.callTool({
+      name: "compete_candidates",
+      arguments: {
+        workspace: "/fake/repo",
+        candidates: [{ agent: "omp", task: "one" }],
+        judge_agent: "omp",
+        auto_merge: true,
+      },
+    });
+
+    expect(result.isError).toBe(true);
+    const document = documentFrom(result);
+    // The operation error survives as the document's error…
+    expect(errorCode(document)).toBe("JUDGE_WORKTREE_ADD_FAILED");
+    // …and so does every ref release failure collected in `finally`.
+    expect(document.ref_cleanup_errors).toEqual(cleanupErrors);
+    // The error document is the CLI's terminal shape: no half-built outcome fields.
+    expect(document.merge).toBeUndefined();
+    expect(document.competition).toBeUndefined();
+  });
 });

@@ -2,11 +2,11 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 
-import { AgentHubError } from "./errors.js";
+import { AgentHubError, asDelegateError } from "./errors.js";
 import { runGit } from "./git.js";
 import { acquireRepositoryLock, type RepositoryLock } from "./locks.js";
 import { runProcess } from "./process.js";
-import type { RepositoryIdentity } from "./types.js";
+import type { DelegateError, RepositoryIdentity } from "./types.js";
 
 /**
  * Durable Hub-session state (Package 3).
@@ -198,16 +198,33 @@ export function sessionLockName(sessionId: string): string {
 // Per-session exclusive lock
 // ---------------------------------------------------------------------------
 
+/** Outcome of {@link withSessionLock}. */
+export interface SessionLockOutcome<T> {
+  /** Whatever the operation produced; the caller owns it even if release failed. */
+  value: T;
+  /** Set when the operation succeeded but the per-session lock could not be released. */
+  releaseError: DelegateError | null;
+}
+
 /**
  * Run `operation` while holding the per-session lock (Package 1 lock record:
  * random token, pid, hostname, timestamp, dead-same-host-owner recovery — all
  * unchanged). Contention surfaces as SESSION_BUSY; nothing about the
  * underlying lock semantics is relaxed here.
+ *
+ * Same deliberate asymmetry as `claimUnderLock`: when the operation has
+ * already durably committed (the session ref/state transition landed) and the
+ * release then fails, the completed value is returned together with the
+ * release error — converting that into a throw would orphan a committed
+ * transition from its result while leaving the lock record wedged. An
+ * operation failure still propagates, and a release failure on that path is
+ * appended to the thrown error rather than dropped, because an unreleased
+ * lock record is its own operational problem.
  */
 export async function withSessionLock<T>(
   context: SessionLockContext,
   operation: () => Promise<T>,
-): Promise<T> {
+): Promise<SessionLockOutcome<T>> {
   const acquire = context.acquireLock ?? acquireRepositoryLock;
   const name = sessionLockName(context.sessionId);
 
@@ -223,10 +240,36 @@ export async function withSessionLock<T>(
     );
   }
 
+  let value: T;
   try {
-    return await operation();
-  } finally {
+    value = await operation();
+  } catch (error) {
+    try {
+      await lock.release();
+    } catch (releaseError) {
+      const failure = asDelegateError(error);
+      throw new AgentHubError(
+        failure.code,
+        `${failure.message} (and the session lock could not be released either: ${
+          asDelegateError(releaseError).message
+        })`,
+      );
+    }
+    throw error;
+  }
+
+  try {
     await lock.release();
+    return { value, releaseError: null };
+  } catch (releaseError) {
+    const failure = asDelegateError(releaseError);
+    return {
+      value,
+      releaseError: new AgentHubError(
+        failure.code === "INTERNAL_ERROR" ? "LOCK_RELEASE_FAILED" : failure.code,
+        `${failure.message}; the session lock record still exists and needs recovery`,
+      ),
+    };
   }
 }
 

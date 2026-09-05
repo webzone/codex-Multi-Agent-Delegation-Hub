@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { parseCliArgs, parseCliCommand, runCli } from "../src/cli.js";
+import { FANOUT_MAX_CANDIDATES } from "../src/fanout.js";
 import {
   BLOCKED_WRITE_IS_MEANINGFUL,
   BLOCKING_JUDGE_SCRIPT,
@@ -207,6 +208,30 @@ describe("CLI", () => {
       if (invocation.kind !== "fanout") throw new Error("expected fanout");
       expect(invocation.request.candidates).toHaveLength(3);
       expect(invocation.request.candidates.every((candidate) => candidate.task === "same for all")).toBe(true);
+    });
+
+    it("refuses more candidates than the fixed fan-out maximum", () => {
+      const over = ["fanout"];
+      for (let index = 0; index <= FANOUT_MAX_CANDIDATES; index += 1) {
+        over.push("--agent", "omp", "--task", `task-${index}`);
+      }
+      expect(() => parseCliCommand(over)).toThrow(/at most \d+ candidates/);
+
+      // One shared task replicated over too many agents is refused too.
+      const shared = ["fanout", "--task", "same for all"];
+      for (let index = 0; index <= FANOUT_MAX_CANDIDATES; index += 1) {
+        shared.push("--agent", "omp");
+      }
+      expect(() => parseCliCommand(shared)).toThrow(/at most \d+ candidates/);
+
+      // The boundary itself parses.
+      const boundary = ["fanout"];
+      for (let index = 0; index < FANOUT_MAX_CANDIDATES; index += 1) {
+        boundary.push("--agent", "omp", "--task", `task-${index}`);
+      }
+      const invocation = parseCliCommand(boundary);
+      if (invocation.kind !== "fanout") throw new Error("expected fanout");
+      expect(invocation.request.candidates).toHaveLength(FANOUT_MAX_CANDIDATES);
     });
 
     it("rejects a task count that matches neither one nor all agents", () => {

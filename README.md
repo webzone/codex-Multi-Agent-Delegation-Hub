@@ -158,7 +158,10 @@ additive v2 tools `fanout_candidates`, `compete_candidates`, `session_create`,
 and `session_resume`. `compete_candidates.auto_merge` defaults to `false`.
 Every tool returns structured JSON content with `isError`; a failing operation
 comes back as `{ error: { code, message } }` and never escapes as a
-transport-level exception. The fan-out tools report a `partial` or `failure`
+transport-level exception — and when the failing `compete_candidates` operation
+also could not release artifact refs, those `ref_cleanup_errors` entries ride
+in the same error document (the CLI's terminal shape), so cleanup evidence is
+never lost behind the throw. The fan-out tools report a `partial` or `failure`
 aggregate status, and a `ref_cleanup_errors` entry (an artifact ref they could
 not release), as `isError`; like the CLI, they release the artifact refs they
 created before returning. MCP clients and the CLI call the same cores;
@@ -207,6 +210,9 @@ v1 guarantees (unchanged):
 v2 fan-out:
 
 - Fan-out is isolated-only; candidates never execute in the caller checkout.
+- A request is bounded on both axes: at most 16 candidates in total
+  (`FANOUT_MAX_CANDIDATES`, enforced by the core, the CLI parse/usage, and
+  both MCP tool schemas) and at most 8 in flight at once.
 - The repository identity and base `HEAD` are captured exactly once before
   dispatch; worktree administration is serialized under a repository-local
   lock, with exactly one trailing prune.
@@ -233,6 +239,11 @@ v2 fan-out:
   the competition's `error`, or the session's `cleanup_error`. While that lock
   record stays on disk the hub will not touch worktree administration, so both
   the worktree and the lock record are the operator's to clear.
+- A committed transition survives a wedged release: when the per-session lock
+  cannot be released *after* the ref/state transition landed, `session create`
+  and `session resume` still return the completed session (id, revision,
+  artifact) with the release trouble reported in `cleanup_error`; the lock
+  record itself stays for operator recovery.
 
 v2 auto-merge (opt-in, all conditions enforced again under the
 repository-local merge lock immediately before the checkout is touched):

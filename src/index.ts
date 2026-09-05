@@ -5,6 +5,7 @@ export { resolveAdapter, supportedAgents } from "./adapters/index.js";
 export {
   fanOut,
   FANOUT_DEFAULT_CONCURRENCY_CAP,
+  FANOUT_MAX_CANDIDATES,
   FANOUT_MAX_CONCURRENCY_LIMIT,
   WORKTREE_ADMIN_LOCK_NAME,
 } from "./fanout.js";

@@ -135,6 +135,8 @@ export interface SessionDependencies {
   removeWorktree?: (workspace: string, worktree: BaseWorktree) => Promise<void>;
   pruneWorktrees?: (workspace: string) => Promise<void>;
   acquireAdminLock?: (commonDir: string) => Promise<RepositoryLock>;
+  /** Test seam for the per-session lock (e.g. an injected release failure). */
+  acquireSessionLock?: typeof acquireRepositoryLock;
   newSessionId?: () => string;
   now?: () => Date;
 }
@@ -173,6 +175,28 @@ function validateShared(workspace: string, task: string, maxOutputBytes?: number
 }
 
 /**
+ * A per-session lock that could not be released *after* the transition was
+ * already committed never destroys the completed run: the result (session id,
+ * revision, artifact) is returned with the release trouble recorded in
+ * `cleanup_error`, alongside — never displacing — any earlier teardown
+ * trouble, exactly like the admin-worktree handling inside a turn.
+ */
+function reportSessionLockRelease(
+  result: SessionRunResult,
+  releaseError: DelegateError | null,
+): SessionRunResult {
+  if (releaseError !== null) {
+    result.cleanup_error = result.cleanup_error
+      ? {
+          code: result.cleanup_error.code,
+          message: `${result.cleanup_error.message} Session lock release also failed: ${releaseError.message}`,
+        }
+      : releaseError;
+  }
+  return result;
+}
+
+/**
  * Create a durable session: identity capture, first agent run at HEAD, first
  * artifact commit, ref + state record creation under the session lock.
  */
@@ -192,22 +216,30 @@ export async function createSession(
   const sessionId = newId();
   const ref = sessionRefFor(sessionId); // rejects any id that is not generated-shape
 
-  return withSessionLock({ commonDir: identity.common_dir, sessionId }, async () => {
-    return runSessionTurn({
-      kind: "create",
-      workspace: request.workspace,
+  const claim = await withSessionLock(
+    {
       commonDir: identity.common_dir,
       sessionId,
-      agent: request.agent,
-      task: request.task,
-      baseCommit: identity.head,
-      maxOutputBytes: request.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
-      identity,
-      prior: null,
-      now: dependencies.now ?? (() => new Date()),
-      deps: dependencies,
-    }, ref);
-  });
+      acquireLock: dependencies.acquireSessionLock,
+    },
+    async () => {
+      return runSessionTurn({
+        kind: "create",
+        workspace: request.workspace,
+        commonDir: identity.common_dir,
+        sessionId,
+        agent: request.agent,
+        task: request.task,
+        baseCommit: identity.head,
+        maxOutputBytes: request.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
+        identity,
+        prior: null,
+        now: dependencies.now ?? (() => new Date()),
+        deps: dependencies,
+      }, ref);
+    },
+  );
+  return reportSessionLockRelease(claim.value, claim.releaseError);
 }
 
 /**
@@ -226,30 +258,38 @@ export async function resumeSession(
   // the checkout, defines what the run starts from.
   const identity = await resolveRepositoryIdentity(request.workspace);
 
-  return withSessionLock({ commonDir: identity.common_dir, sessionId: request.session_id }, async () => {
-    const prior = await loadSessionState({
+  const claim = await withSessionLock(
+    {
       commonDir: identity.common_dir,
-      repositoryCwd: request.workspace,
       sessionId: request.session_id,
-    });
+      acquireLock: dependencies.acquireSessionLock,
+    },
+    async () => {
+      const prior = await loadSessionState({
+        commonDir: identity.common_dir,
+        repositoryCwd: request.workspace,
+        sessionId: request.session_id,
+      });
 
-    return runSessionTurn({
-      kind: "advance",
-      workspace: request.workspace,
-      commonDir: identity.common_dir,
-      sessionId: request.session_id,
-      agent: prior.agent,
-      task: request.task,
-      baseCommit: prior.current_commit,
-      maxOutputBytes: request.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
-      // Identity is refreshed per operation (paths may move); the lineage
-      // keeps the creation-time identity stored in the state record.
-      identity: prior.identity,
-      prior,
-      now: dependencies.now ?? (() => new Date()),
-      deps: dependencies,
-    }, ref);
-  });
+      return runSessionTurn({
+        kind: "advance",
+        workspace: request.workspace,
+        commonDir: identity.common_dir,
+        sessionId: request.session_id,
+        agent: prior.agent,
+        task: request.task,
+        baseCommit: prior.current_commit,
+        maxOutputBytes: request.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
+        // Identity is refreshed per operation (paths may move); the lineage
+        // keeps the creation-time identity stored in the state record.
+        identity: prior.identity,
+        prior,
+        now: dependencies.now ?? (() => new Date()),
+        deps: dependencies,
+      }, ref);
+    },
+  );
+  return reportSessionLockRelease(claim.value, claim.releaseError);
 }
 
 async function runSessionTurn(

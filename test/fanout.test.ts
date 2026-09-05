@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import { createWorktreeAtBase, pruneWorktrees, removeWorktree, resolveRepositoryIdentity, type BaseWorktree } from "../src/git.js";
 import { acquireRepositoryLock, lockPathFor, type RepositoryLock } from "../src/locks.js";
-import { fanOut, FANOUT_MAX_CONCURRENCY_LIMIT, WORKTREE_ADMIN_LOCK_NAME } from "../src/fanout.js";
+import { fanOut, FANOUT_MAX_CANDIDATES, FANOUT_MAX_CONCURRENCY_LIMIT, WORKTREE_ADMIN_LOCK_NAME } from "../src/fanout.js";
 import { deferred } from "../src/deferred.js";
 import type { AgentAdapter, FanOutCandidateResult, FanOutCandidateSpec } from "../src/types.js";
 import { createGitRepository, removeDirectory, runGit } from "./helpers.js";
@@ -162,6 +162,26 @@ describe("fan-out", { timeout: 30_000 }, () => {
       await expect(fanOut({ workspace: repo, candidates: [] })).rejects.toMatchObject({
         code: "INVALID_CANDIDATES",
       });
+      // The total candidate count is capped independently of the in-flight
+      // cap: exceeding it fails validation even with no concurrency claim.
+      await expect(
+        fanOut({ workspace: repo, candidates: specs(FANOUT_MAX_CANDIDATES + 1) }),
+      ).rejects.toMatchObject({ code: "INVALID_CANDIDATES" });
+      await expect(
+        fanOut({
+          workspace: repo,
+          candidates: specs(FANOUT_MAX_CANDIDATES + 1),
+          maxConcurrency: FANOUT_MAX_CANDIDATES + 1,
+        }),
+      ).rejects.toMatchObject({ code: "INVALID_CANDIDATES" });
+      // The boundary itself is valid: reaching the workspace probe proves the
+      // candidate check passed exactly at the cap.
+      await expect(
+        fanOut({
+          workspace: "/definitely/not/a/repository",
+          candidates: specs(FANOUT_MAX_CANDIDATES),
+        }),
+      ).rejects.toMatchObject({ code: "NOT_GIT_REPOSITORY" });
 
       const busyTracker = new Tracker();
       const busy = await fanOut(

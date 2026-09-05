@@ -41,6 +41,16 @@ import type {
 
 export const FANOUT_MAX_CONCURRENCY_LIMIT = 8;
 export const FANOUT_DEFAULT_CONCURRENCY_CAP = 4;
+/**
+ * Fixed v2 maximum *total* candidates per fan-out request — separate from the
+ * in-flight cap above, which bounds concurrency but never request size.
+ * Everything that grows with the whole request stays bounded by this number:
+ * worktree records, artifact refs, per-candidate results, and — the reason it
+ * must be fixed, not merely "large" — the judge's line-oriented input, which
+ * is one `- <uuid> | <agent> | <sha>` line per eligible candidate (well under
+ * 4 KB at this cap). 16 = two full waves at the maximum in-flight cap of 8.
+ */
+export const FANOUT_MAX_CANDIDATES = 16;
 export const WORKTREE_ADMIN_LOCK_NAME = "worktree-admin";
 
 const ADMIN_LOCK_WAIT_MS = 30_000;
@@ -68,6 +78,12 @@ function validateFanOutRequest(request: FanOutRequest): void {
   }
   if (!Array.isArray(request.candidates) || request.candidates.length === 0) {
     throw new AgentHubError("INVALID_CANDIDATES", "at least one candidate is required");
+  }
+  if (request.candidates.length > FANOUT_MAX_CANDIDATES) {
+    throw new AgentHubError(
+      "INVALID_CANDIDATES",
+      `at most ${FANOUT_MAX_CANDIDATES} candidates are allowed per fan-out, got ${request.candidates.length}`,
+    );
   }
   request.candidates.forEach((candidate, index) => {
     if (!candidate.task?.trim()) {
