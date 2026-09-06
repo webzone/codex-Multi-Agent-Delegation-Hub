@@ -106,11 +106,26 @@ class FakeTransport implements LiveTransport {
       onSend?: (command: LiveCommand, transport: FakeTransport) => void;
       /** Gates every stop() until resolved; proves pipelines never overlap. */
       stopHold?: Promise<void>;
+      /**
+       * Mirror hermes-acp: `describe()` reports the permission_response
+       * claim honest to the CURRENT launch's policy — deny auto-denies and
+       * advertises no usable answer path, interactive answers natively.
+       */
+      permissionResponseFollowsPolicy?: boolean;
     } = {},
   ) {}
 
   async describe(): Promise<{ transport: "omp-rpc"; provider: "omp"; capabilities: LiveCapabilities }> {
-    return { transport: this.id, provider: this.provider, capabilities: this.caps };
+    const capabilities = this.opts.permissionResponseFollowsPolicy
+      ? {
+          ...this.caps,
+          permission_response:
+            this.launch?.permission_policy === "interactive"
+              ? { support: "native" as const, evidence: "fake policy-scoped answer path" }
+              : { support: "unsupported" as const, evidence: null },
+        }
+      : this.caps;
+    return { transport: this.id, provider: this.provider, capabilities };
   }
 
   async open(request: LiveLaunchRequest): Promise<LiveLaunchReport> {
@@ -2042,6 +2057,83 @@ describe("permission policy contract", () => {
     expect(factory.created[1].launch?.permission_policy).toBe("deny");
 
     await resumable.closeAll();
+    await settle(scope);
+  });
+
+  it("resume refreshes the capability snapshot: deny launch, interactive resume answers natively", async () => {
+    const scope = await harness({
+      transportOptions: { resumeState: "echo", permissionResponseFollowsPolicy: true },
+    });
+    // Deny launch: like hermes-acp under deny, the fake withholds an answer
+    // path it would only auto-deny — the recorded claim is unsupported.
+    const started = await scope.manager.start({ provider: "omp" });
+    expect(started.capabilities.permission_response).toEqual({ support: "unsupported", evidence: null });
+    await scope.manager.close(started.live_session_id);
+
+    const resumed = await scope.manager.resumeFromState({
+      live_session_id: started.live_session_id,
+      permission_policy: "interactive",
+    });
+    // The resumed session describes what THIS launch actually does.
+    expect(resumed.capabilities.permission_response).toEqual({
+      support: "native",
+      evidence: "fake policy-scoped answer path",
+    });
+    expect(resumed.state.capabilities.permission_response.support).toBe("native");
+    const durable = await durableState(scope.commonDir, started.live_session_id);
+    expect(durable.capabilities.permission_response.support).toBe("native");
+
+    // The consequence the stale snapshot would have buried: the hub now
+    // accepts and forwards answers instead of refusing a live path.
+    const t = scope.factory.created[1];
+    t.push({
+      kind: "permission_request",
+      request_id: "req-r1",
+      tool: "write",
+      summary: { text: "overwrite README", truncated: false },
+    });
+    await tick();
+    const answered = await scope.manager.respondPermission(
+      started.live_session_id,
+      "req-r1",
+      "allow_once",
+      null,
+    );
+    expect(answered.outcome).toBe("succeeded");
+    expect(
+      t.commands.some((c) => c.kind === "permission_response" && c.decision === "allow_once"),
+    ).toBe(true);
+    await settle(scope);
+  });
+
+  it("resume refreshes the capability snapshot: interactive launch, deny resume refuses the dead path", async () => {
+    const scope = await harness({
+      transportOptions: { resumeState: "echo", permissionResponseFollowsPolicy: true },
+    });
+    const started = await scope.manager.start({ provider: "omp", permission_policy: "interactive" });
+    expect(started.capabilities.permission_response.support).toBe("native");
+    await scope.manager.close(started.live_session_id);
+
+    // Resume with no policy: the default deny means no answer path exists.
+    const resumed = await scope.manager.resumeFromState({
+      live_session_id: started.live_session_id,
+    });
+    expect(resumed.capabilities.permission_response).toEqual({ support: "unsupported", evidence: null });
+    expect(resumed.state.capabilities.permission_response.support).toBe("unsupported");
+    const durable = await durableState(scope.commonDir, started.live_session_id);
+    expect(durable.capabilities.permission_response.support).toBe("unsupported");
+
+    // A hub still believing the native claim would answer into a session
+    // that auto-denies; the refreshed snapshot refuses pre-dispatch.
+    const refused = await scope.manager.respondPermission(
+      started.live_session_id,
+      "req-r2",
+      "allow_once",
+      null,
+    );
+    expect(refused.outcome).toBe("unsupported");
+    expect(refused.error?.code).toBe("LIVE_CAPABILITY_UNSUPPORTED");
+    expect(scope.factory.created[1].commands).toHaveLength(0);
     await settle(scope);
   });
 

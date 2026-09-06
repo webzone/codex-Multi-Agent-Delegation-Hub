@@ -25,6 +25,7 @@ import {
   liveRefFor,
   LIVE_ADMIN_LOCK_NAME,
   LIVE_SCHEMA_VERSION,
+  TERMINAL_STATUSES,
   loadLiveState,
   newLiveSessionId,
   withLiveLock,
@@ -121,8 +122,6 @@ export const LIVE_FOLLOW_UP_QUEUE_MAX_MESSAGES = 32;
 export const LIVE_FOLLOW_UP_QUEUE_MAX_BYTES = 1024 * 1024;
 export const LIVE_FOLLOW_UP_MAX_MESSAGE_BYTES = 128 * 1024;
 export const LIVE_DEFAULT_MAX_TEXT_BYTES = 64 * 1024;
-
-const TERMINAL_STATUSES: readonly LiveStatus[] = ["closed", "error", "orphaned"];
 
 /** Durable ordering seam: tests observe these exactly, in order. */
 export type LiveManagerPhase =
@@ -363,9 +362,11 @@ export class LiveSessionManager {
    * Loads the durable record, refuses any session that is not terminal or
    * still leased, acquires a NEW lease, materializes a fresh worktree at
    * `current_commit`, launches the provider with the record's verified
-   * opaque resume state, verifies the provider identity round-tripped, and
-   * CAS-advances the EXISTING live ref/state (revision + 1) — the live ref
-   * namespace is never branched per restart.
+   * opaque resume state, verifies the provider identity round-tripped,
+   * re-reads the capability snapshot from the transport's live descriptor
+   * (claims are launch-scoped — see `launchSession`), and CAS-advances the
+   * EXISTING live ref/state (revision + 1) — the live ref namespace is
+   * never branched per restart.
    */
   async resumeFromState(request: LiveResumeFromStateRequest): Promise<LiveStartResult> {
     const { commonDir, repositoryCwd } = this.options;
@@ -461,8 +462,22 @@ export class LiveSessionManager {
         }
       }
 
+      // Capability freshness: claims are scoped to the launch that produced
+      // them — a policy-scoped transport (hermes-acp today) honestly
+      // describes different claims per launch. Re-read the descriptor from
+      // THIS launch, refuse one that no longer matches the durable session
+      // identity, and persist the refreshed snapshot with the advance.
+      const descriptor = await transport.describe();
+      if (descriptor.provider !== prior.provider || descriptor.transport !== prior.transport) {
+        throw new AgentHubError(
+          "LIVE_RESUME_VERIFICATION_FAILED",
+          `the resumed transport describes itself as "${descriptor.provider}/${descriptor.transport}", not the durable "${prior.provider}/${prior.transport}" recorded for "${liveSessionId}"`,
+        );
+      }
+
       const next: LiveSessionState = {
         ...prior,
+        capabilities: descriptor.capabilities,
         resume:
           report.resume_state ??
           this.initialResume(prior.provider, prior.resume, report.provider_session_id, prior.transport),

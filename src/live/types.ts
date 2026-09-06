@@ -474,7 +474,7 @@ export interface LiveSessionState {
   session_id: string | null;
   provider: LiveProviderId;
   transport: LiveTransportId;
-  /** Capability claims as established at launch; immutable for this record's lifetime. */
+  /** Capability claims from the CURRENT launch's transport descriptor; a successful resume refreshes this snapshot from the live transport. */
   capabilities: LiveCapabilities;
   /** Repository identity captured at launch (same rule as v2 fan-out/session). */
   identity: RepositoryIdentity;

@@ -89,6 +89,9 @@ const STATUS_VALUES: readonly LiveStatus[] = [
   "error",
   "orphaned",
 ];
+/** Terminal statuses: the only records a `resumeFromState` advance may start from. */
+export const TERMINAL_STATUSES: readonly LiveStatus[] = ["closed", "error", "orphaned"];
+
 const ERROR_STAGES: readonly LiveErrorStage[] = [
   "probe",
   "launch",
@@ -817,8 +820,12 @@ export async function applyLiveTransition(
       || current.created_at !== plan.next_state.created_at
       || current.session_id !== plan.next_state.session_id
       || JSON.stringify(current.identity) !== JSON.stringify(plan.next_state.identity)
-      // Launch-captured capabilities are immutable for the record's lifetime.
-      || JSON.stringify(current.capabilities) !== JSON.stringify(plan.next_state.capabilities)
+      // Capabilities are launch-scoped: an in-flight transition must carry
+      // the launch snapshot unchanged. Only a transition advancing a
+      // TERMINAL record — a resume, and nothing else may — refreshes the
+      // capability snapshot from the resumed transport's live descriptor.
+      || (!TERMINAL_STATUSES.includes(current.status)
+        && JSON.stringify(current.capabilities) !== JSON.stringify(plan.next_state.capabilities))
       || plan.next_state.revision !== current.revision + 1
       || plan.next_state.checkpoint_seq < current.checkpoint_seq
       || (plan.next_state.checkpoint_seq === current.checkpoint_seq
