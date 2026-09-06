@@ -140,8 +140,9 @@ adoption only ever happens through an explicit opt-in step you control.
 ## Live sessions (v3, additive)
 
 When one agent should work interactively over many turns — steering mid-run,
-answering its permission requests, or cancelling a turn — use the live
-surface instead of one-shot delegation:
+cancelling a turn, or driving a long task turn by turn — use the live surface
+instead of one-shot delegation (answering permission requests is a
+library-only interactive path; see the Hermes bullet):
 
 ```sh
 agent-hub live --agent <omp|agy|pi|hermes> --workspace "$PWD"
@@ -165,22 +166,51 @@ agent-hub live probe --agent <omp|agy|pi|hermes>
   reached the provider — do not retry it expecting a different result;
   choose a different flow (e.g. a fresh `follow_up` at the next idle
   boundary when only `steer` is unsupported).
-- Consume events by cursor (`live_session_events`) instead of assuming
-  delivery: `next_cursor` advances over per-session seqs with no gaps, and
-  `dropped: true` says the ring buffer already evicted past your cursor —
-  re-read from `earliest_seq` or take `status`.
+- Consume events by cursor (`live_session_events`): seqs are per-session,
+  start at 1, and have no gaps; `next_cursor` is your resume point. The ring
+  is bounded (4096 events / 8 MiB per session): if the ring already evicted
+  past your cursor the poll fails with `EVENT_CURSOR_EXPIRED` (its message
+  names the oldest replayable cursor) — resynchronize from the session state
+  or a `status` command. There is no `earliest_seq` to replay from.
 - A `cancelled` turn result means the hub stopped the provider before the
   turn concluded (close or cancel): partial work may exist; it is not a
   provider crash and not a success. An `orphaned` close means the hub could
   not prove the process died — inspect before starting a sibling session.
-- Resume honesty: `--resume` needs the durable live-state store; until that
-  package is wired it fails with `LIVE_STATE_UNAVAILABLE`. Likewise a
-  provider with no registered transport fails `LIVE_TRANSPORT_UNAVAILABLE`
-  — the hub never guesses a command line. `probe` answers what is actually
-  installed; a not-found probe exits `1` as honest data.
-- Live sessions are process-local and transient by contract: hub live state
-  stores only the metadata record (no task text, transcripts, or event
-  bodies), and checkpoint pinning belongs to the durable package. Do not
-  plan a continuation from hub memory — inspect the workspace itself, as
-  with every isolated run, and run the relevant tests before accepting the
-  work.
+- Resume is wired to the durable store: `--resume` / `live_session_resume`
+  reads the `agent-hub-live/v1` record under the Git common dir and its chain
+  on `refs/agent-hub/live/...`. It accepts only a terminal record (`closed`,
+  `error`, `orphaned`) with no live lease, materializes a FRESH hub worktree
+  at `current_commit`, replays the recorded opaque provider resume state and
+  verifies the identity round-trips, and CAS-advances the SAME live ref.
+  Unknown ids fail `LIVE_SESSION_NOT_FOUND`, a missing binary
+  `LIVE_TRANSPORT_UNAVAILABLE`, a wrong transport pairing
+  `LIVE_TRANSPORT_PAIRING_INVALID`, a still-leased session
+  `LIVE_LEASE_EXISTS` (recover first). AGY's resume argv is re-verified
+  against the installed binary's own `--help` on every resume. Nothing ever
+  guesses a command line or fakes a continuation.
+- Live runs are durable, not transient: turn boundaries, closes, and crash
+  recovery pin checkpoint commits on the live chain, and the record carries
+  identity and lineage only (no task text, transcripts, or event bodies by
+  construction). After a hub process died, recovery is the core manager's
+  `recover()` — no CLI command ships for it in this version: it reaps
+  provably-orphaned providers under identity proof, pins any surviving
+  worktree as a `crash_recovery` checkpoint, rewrites the record to
+  `orphaned`, and releases the lease; anything it cannot prove is reported
+  `manual` and left untouched. As with every isolated run, inspect the
+  worktree named by the session and run the relevant tests before accepting
+  the work.
+- A running live session belongs to the hub process that launched it. MCP
+  clients must keep every `live_session_command` / `_events` / `_close` call
+  for a session on the same `agent-hub-mcp` process (process pinning) — a
+  different process answers `LIVE_SESSION_NOT_FOUND`; adopt its durable
+  record with `live_session_resume`. Quotas: 8 live sessions per hub process
+  and 4 leases per Git common dir (`LIVE_QUOTA_EXCEEDED`); the per-session
+  follow-up queue holds at most 32 commands / 1 MiB total / 128 KiB per
+  message (`LIVE_QUEUE_FULL`) and is in-memory only.
+- Hermes permission policy: the CLI and MCP builds run headless, so every
+  `session/request_permission` is auto-denied — you still see the
+  `permission_request` event and a warn log, and Hermes continues within what
+  needs no approval. The interactive answer path is library-only
+  (`interactive: true`): it waits at most 60 s for a `permission_response`,
+  then denies; only `allow_once`/`deny` are honored and `allow_always` is
+  never selected.
