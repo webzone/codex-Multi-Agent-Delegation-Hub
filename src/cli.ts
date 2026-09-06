@@ -11,6 +11,7 @@ import {
   iterateLiveCommands,
   probeLiveAgent,
   registerProductionLiveTransports,
+  runLiveRecover,
   runLiveSession,
   supportedLiveAgents,
 } from "./live/index.js";
@@ -26,7 +27,7 @@ import type {
   MergeOutcome,
 } from "./types.js";
 import type { CreateSessionRequest, ResumeSessionRequest } from "./session.js";
-import type { LiveProviderId } from "./live/types.js";
+import type { LivePermissionPolicy, LiveProviderId } from "./live/types.js";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -37,6 +38,7 @@ const usage = `Usage:
   agent-hub session resume <session-id> --task "<text>" [options]
   agent-hub live --agent <omp|agy|pi|hermes> [--workspace <path>] [options]
   agent-hub live --resume <hub-live-id> [--workspace <path>] [options]
+  agent-hub live recover [--workspace <path>]
   agent-hub live probe --agent <omp|agy|pi|hermes>
 
 Options:
@@ -45,6 +47,8 @@ Options:
   --max-output-bytes   Limit captured stdout, stderr, and diff output
   --json               Emit the unified JSON result (the default)
   --help               Show this help
+  --                   End of options: everything after it is the delegate
+                       task, so a task may literally start with "--"
 
 Fan-out options (fanout):
   --agent <a>          Candidate agent; repeat for one candidate per agent
@@ -67,6 +71,11 @@ Live session (v3, live):
   --resume <id>        Continue a durable live session (hub-live-id) from its
                        chain head: fresh hub worktree at current_commit,
                        verified provider resume identity, same live ref
+  --allow-dirty      Start/resume even over a dirty caller checkout (the
+                     live worktree still branches only from committed HEAD)
+  --permission-policy <deny|interactive>
+                     Permission policy for this launch/resume; a resume
+                     must select it explicitly, no selection means deny
   stdin: one Hub NDJSON command per line:
     {"action":"prompt"|"follow_up"|"steer","text":"..."} |
     {"action":"cancel","reason":"..."} | {"action":"status"} |
@@ -74,6 +83,11 @@ Live session (v3, live):
     {"action":"close","terminate":false}
   stdout: NDJSON — {type:"session"|"event"|"result"|"error"|"close"} documents
   stderr: human-readable diagnostics
+
+live recover reconciles every durable live lease with the OS and the
+repository and prints the JSON report. Each session reports one of
+kept-live / foreign / recovered / cleaned / manual; exit 1 means at least
+one session needs a human ("manual").
 
 Exit codes: 0 success, 1 structured operation failure (JSON on stdout),
 2 parse or usage error (message plus usage on stderr).
@@ -114,12 +128,19 @@ export interface LiveSessionInvocation {
     resumeId: string | null;
     workspace: string;
     maxTextBytes: number | undefined;
+    allowDirty: boolean;
+    permissionPolicy: LivePermissionPolicy | null;
   };
 }
 
 export interface LiveProbeInvocation {
   kind: "live-probe";
   agent: LiveProviderId;
+}
+
+export interface LiveRecoverInvocation {
+  kind: "live-recover";
+  workspace: string;
 }
 
 export interface HelpInvocation {
@@ -133,6 +154,7 @@ export type CliInvocation =
   | SessionResumeInvocation
   | LiveSessionInvocation
   | LiveProbeInvocation
+  | LiveRecoverInvocation
   | HelpInvocation;
 
 function requireValue(argv: string[], index: number, option: string): string {
@@ -145,7 +167,11 @@ function requireValue(argv: string[], index: number, option: string): string {
 
 export function parseCliArgs(argv: string[]): CliOptions {
   const args = argv[0] === "delegate" ? argv.slice(1) : argv;
-  if (args.includes("--help") || args.length === 0) {
+  // `--help` counts only before the `--` terminator; after it, the text is
+  // the task, not a flag.
+  const terminator = args.indexOf("--");
+  const optionsEnd = terminator === -1 ? args.length : terminator;
+  if (args.slice(0, optionsEnd).includes("--help") || args.length === 0) {
     return {
       help: true,
       request: {
@@ -166,6 +192,12 @@ export function parseCliArgs(argv: string[]): CliOptions {
 
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
+    if (argument === "--") {
+      // Standard terminator: everything after it is task text, so a task
+      // may literally start with "--".
+      taskParts.push(...args.slice(index + 1));
+      break;
+    }
     switch (argument) {
       case "--agent":
         agent = requireValue(args, index, argument);
@@ -247,6 +279,8 @@ function parseLiveArgs(args: string[]): LiveSessionInvocation["request"] {
   let resumeId: string | null = null;
   let workspace = process.cwd();
   let maxTextBytes: number | undefined;
+  let allowDirty = false;
+  let permissionPolicy: LivePermissionPolicy | null = null;
 
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
@@ -282,6 +316,23 @@ function parseLiveArgs(args: string[]): LiveSessionInvocation["request"] {
         index += 1;
         break;
       }
+      case "--allow-dirty":
+        allowDirty = true;
+        break;
+      case "--permission-policy": {
+        if (permissionPolicy !== null) {
+          throw new Error("--permission-policy may be specified only once for a live session");
+        }
+        {
+          const value = requireValue(args, index, argument);
+          if (value !== "deny" && value !== "interactive") {
+            throw new Error("--permission-policy must be deny or interactive");
+          }
+          permissionPolicy = value;
+        }
+        index += 1;
+        break;
+      }
       case "--json":
         break;
       default:
@@ -300,7 +351,7 @@ function parseLiveArgs(args: string[]): LiveSessionInvocation["request"] {
   if (agent !== null && resumeId !== null) {
     throw new Error("live accepts either --agent or --resume, not both");
   }
-  return { agent, resumeId, workspace, maxTextBytes };
+  return { agent, resumeId, workspace, maxTextBytes, allowDirty, permissionPolicy };
 }
 
 /** Grammar for `agent-hub live probe --agent <provider>`. */
@@ -327,6 +378,25 @@ function parseLiveProbeArgs(args: string[]): LiveProviderId {
   }
   assertLiveAgent(agent, "--agent");
   return agent;
+}
+
+/** Grammar for `agent-hub live recover [--workspace <path>]`. */
+function parseLiveRecoverArgs(args: string[]): string {
+  let workspace = process.cwd();
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    switch (argument) {
+      case "--workspace":
+        workspace = requireValue(args, index, argument);
+        index += 1;
+        break;
+      case "--json":
+        break;
+      default:
+        throw new Error(`live recover accepts only --workspace, got "${argument}"`);
+    }
+  }
+  return workspace;
 }
 
 interface FanoutParse {
@@ -511,6 +581,16 @@ function parseSessionCreateArgs(args: string[]): CreateSessionRequest {
 export function parseCliCommand(argv: string[]): CliInvocation {
   const command = argv[0];
 
+  // v1 bare invocation: no subcommand, first token is an option (or absent).
+  if (command === undefined || command.startsWith("-")) {
+    return { kind: "delegate", options: parseCliArgs(argv) };
+  }
+
+  if (command === "delegate") {
+    // `parseCliArgs` strips the leading "delegate" itself.
+    return { kind: "delegate", options: parseCliArgs(argv) };
+  }
+
   if (command === "fanout") {
     if (argv.includes("--help")) {
       return { kind: "help" };
@@ -590,6 +670,9 @@ export function parseCliCommand(argv: string[]): CliInvocation {
     if (argv[1] === "probe") {
       return { kind: "live-probe", agent: parseLiveProbeArgs(argv.slice(2)) };
     }
+    if (argv[1] === "recover") {
+      return { kind: "live-recover", workspace: parseLiveRecoverArgs(argv.slice(2)) };
+    }
     return { kind: "live", request: parseLiveArgs(argv.slice(1)) };
   }
 
@@ -597,7 +680,13 @@ export function parseCliCommand(argv: string[]): CliInvocation {
     throw new Error("compete is not a persisted-session command; use fanout with --judge");
   }
 
-  return { kind: "delegate", options: parseCliArgs(argv) };
+  // Strict command vocabulary: a leading word that is not a recognized
+  // subcommand is a usage error (exit 2). It is never reinterpreted as
+  // delegate task text — an unknown command must never launch an agent.
+  // The v1 bare form survives only when the first token is an option.
+  throw new Error(
+    `unknown command "${command}"; expected delegate, fanout, session, or live`,
+  );
 }
 
 export async function runCli(
@@ -751,6 +840,8 @@ async function execute(
           resumeId: invocation.request.resumeId,
           workspace: invocation.request.workspace,
           maxTextBytes: invocation.request.maxTextBytes,
+          allowDirty: invocation.request.allowDirty,
+          permissionPolicy: invocation.request.permissionPolicy,
         },
         {
           stdin: iterateLiveCommands(process.stdin as AsyncIterable<unknown>),
@@ -758,6 +849,18 @@ async function execute(
           stderr: output.stderr,
         },
       );
+    }
+
+    case "live-recover": {
+      const outcome = await runLiveRecover(invocation.workspace);
+      emit(outcome.document);
+      const manual = outcome.document.sessions.filter(
+        (session) => session.outcome === "manual",
+      ).length;
+      output.stderr(
+        `agent-hub live recover: scanned=${outcome.document.scanned} manual=${manual}\n`,
+      );
+      return outcome.exitCode;
     }
   }
 }

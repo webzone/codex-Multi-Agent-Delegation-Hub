@@ -7,6 +7,7 @@ import type {
   LiveError,
   LiveErrorStage,
   LiveEvent,
+  LivePermissionPolicy,
   LiveProviderId,
   LiveSessionState,
   LiveStatus,
@@ -15,6 +16,7 @@ import type {
   LiveTransportId,
   LiveTurnResult,
 } from "./types.js";
+import type { LiveRecoveryReport } from "./manager.js";
 
 /**
  * v3 live Agent Hub — package façade.
@@ -242,6 +244,10 @@ export interface LiveLaunchInvocation {
   resumeId: string | null;
   workspace: string;
   maxTextBytes?: number;
+  /** Caller-worktree gate; omitted means a dirty checkout refuses the run. */
+  allowDirty?: boolean;
+  /** Permission policy for this launch/resume; omitted means the default `deny`. */
+  permissionPolicy?: LivePermissionPolicy | null;
 }
 
 export interface LiveIo {
@@ -271,6 +277,8 @@ interface LiveSessionManagerLike {
     transport?: LiveTransportId;
     session_id?: string | null;
     max_text_bytes?: number;
+    allow_dirty?: boolean;
+    permission_policy?: LivePermissionPolicy;
   }): Promise<{
     live_session_id: string;
     state: LiveSessionState;
@@ -281,6 +289,8 @@ interface LiveSessionManagerLike {
     live_session_id: string;
     transport?: LiveTransportId;
     max_text_bytes?: number;
+    allow_dirty?: boolean;
+    permission_policy?: LivePermissionPolicy;
   }): Promise<{
     live_session_id: string;
     state: LiveSessionState;
@@ -438,6 +448,10 @@ export async function runLiveSession(
       started = await manager.resumeFromState({
         live_session_id: invocation.resumeId,
         max_text_bytes: invocation.maxTextBytes,
+        allow_dirty: invocation.allowDirty ?? false,
+        // A resume must select its policy explicitly; no selection is the
+        // contract default `deny`, never an inherited `interactive`.
+        permission_policy: invocation.permissionPolicy ?? "deny",
       });
       context.provider = started.state.provider;
     } else {
@@ -447,6 +461,8 @@ export async function runLiveSession(
       started = await manager.start({
         provider: invocation.provider,
         max_text_bytes: invocation.maxTextBytes,
+        allow_dirty: invocation.allowDirty ?? false,
+        permission_policy: invocation.permissionPolicy ?? "deny",
       });
     }
   } catch (error) {
@@ -476,7 +492,6 @@ export async function runLiveSession(
 
   let cursor = 0;
   let relayStopped = false;
-  let idleSpins = 0;
   const emitEvents = (): boolean => {
     for (;;) {
       let page: { events: LiveEvent[]; next_cursor: number };
@@ -519,9 +534,13 @@ export async function runLiveSession(
     }
   };
   const relay = (async () => {
+    // The relay stays alive through arbitrary silence: an idle live session
+    // is the normal state, not a leak. It stops only on this runner's own
+    // close (`relayStopped`, including the session teardown that makes the
+    // ring unreachable), a terminal session status, or the session/manager
+    // disappearing (`view` throwing reads as `orphaned`).
     while (!relayStopped) {
       if (emitEvents()) {
-        idleSpins = 0;
         continue;
       }
       let status: LiveStatus = "orphaned";
@@ -533,14 +552,9 @@ export async function runLiveSession(
       if (isTerminalLiveStatus(status)) {
         break;
       }
-      idleSpins += 1;
       // No progress: re-check after a brief wait so a wedged pump cannot
-      // spin; after 400 quiet polls (≈10 s) stop relaying, not the session.
-      if (idleSpins > 400) {
-        break;
-      }
-      // Ref'd: the relay poll keeps a closing runner's event loop alive
-      // until the close report lands.
+      // spin the event loop. Ref'd: the relay poll keeps a closing runner's
+      // event loop alive until the close report lands.
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
     }
     // Final drain: no recorded event may fail to reach stdout before close.
@@ -692,4 +706,58 @@ export async function runLiveSession(
   return failedSeen || stopStatus === "orphaned" || finalStatus === "error" || finalStatus === "orphaned"
     ? 1
     : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Recovery surface: `agent-hub live recover`
+// ---------------------------------------------------------------------------
+
+/** The exact manager surface recovery drives (the core `recover()`). */
+interface LiveRecoveryManagerLike {
+  recover(): Promise<LiveRecoveryReport>;
+}
+
+export interface LiveRecoveryDependencies {
+  /**
+   * Injected manager (focused tests). Production omits both seams and lets
+   * the same production bootstrap the session surface uses build the
+   * manager — recovery always runs against the wired, real store.
+   */
+  manager?: LiveRecoveryManagerLike;
+  createManager?: (workspace: string) => Promise<LiveRecoveryManagerLike>;
+}
+
+/** The recovery report plus the caller-facing verdict. */
+export type LiveRecoveryDocument = LiveRecoveryReport & {
+  /** True when any session's safety could not be proven and needs a human. */
+  requires_manual: boolean;
+};
+
+export interface LiveRecoveryOutcome {
+  document: LiveRecoveryDocument;
+  /** CLI exit code: 0 when every outcome is settled, 1 when a human is needed. */
+  exitCode: number;
+}
+
+/**
+ * One-shot reconciliation of every durable live lease in the workspace's
+ * Git common dir. The report is the manager's honest per-session outcome
+ * (`kept-live` / `foreign` / `recovered` / `cleaned` / `manual`); `manual`
+ * is the only outcome a caller must act on, so it alone decides the exit
+ * code. This path launches nothing: `recover()` classifies, reaps provably
+ * orphaned provider groups, pins surviving worktrees, and refuses to guess.
+ */
+export async function runLiveRecover(
+  workspace: string,
+  dependencies: LiveRecoveryDependencies = {},
+): Promise<LiveRecoveryOutcome> {
+  const manager =
+    dependencies.manager ??
+    (await (dependencies.createManager ?? ((target) => createLiveManager(target)))(workspace));
+  const report = await manager.recover();
+  const requiresManual = report.sessions.some((session) => session.outcome === "manual");
+  return {
+    document: { ...report, requires_manual: requiresManual },
+    exitCode: requiresManual ? 1 : 0,
+  };
 }

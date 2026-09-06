@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { AgentHubError } from "../src/errors.js";
 import { resolveRepositoryIdentity } from "../src/git.js";
@@ -16,6 +16,7 @@ import {
   LiveSessionManager,
   LiveTransportRegistry,
   probeLiveAgent,
+  runLiveRecover,
   runLiveSession,
   supportedLiveAgents,
 } from "../src/live/index.js";
@@ -40,6 +41,7 @@ import type {
   ProviderResumeState,
 } from "../src/live/types.js";
 import { createGitRepository, removeDirectory } from "./helpers.js";
+import { deferred } from "../src/deferred.js";
 
 // ---------------------------------------------------------------------------
 // Scripted transport harness (mirrors the live transport contract exactly;
@@ -220,7 +222,7 @@ class ScriptedTransport implements LiveTransport {
       if (this.ended) {
         return;
       }
-      const { promise, resolve } = Promise.withResolvers<void>();
+      const { promise, resolve } = deferred<void>();
       this.wakeups.push(resolve);
       await promise;
     }
@@ -359,7 +361,7 @@ function makeIo(commands: StdinEntry[]) {
             if (Date.now() > deadline) {
               throw new Error("live stdin gate timed out waiting for a wire document");
             }
-            const { promise, resolve } = Promise.withResolvers<void>();
+            const { promise, resolve } = deferred<void>();
             setTimeout(resolve, 5);
             await promise;
           }
@@ -454,6 +456,65 @@ describe("live CLI parsing", () => {
       lines.push(line);
     }
     expect(lines).toEqual(['{"action":"status"}', '{"action":"close"}']);
+  });
+
+  it("parses the live start gates and their defaults", () => {
+    const plain = parseCliCommand(["live", "--agent", "hermes", "--workspace", "/tmp/repo"]);
+    expect(plain.kind).toBe("live");
+    if (plain.kind === "live") {
+      expect(plain.request.allowDirty).toBe(false);
+      expect(plain.request.permissionPolicy).toBeNull();
+    }
+
+    const selected = parseCliCommand([
+      "live",
+      "--agent",
+      "hermes",
+      "--allow-dirty",
+      "--permission-policy",
+      "interactive",
+      "--workspace",
+      "/tmp/repo",
+    ]);
+    expect(selected.kind).toBe("live");
+    if (selected.kind === "live") {
+      expect(selected.request.allowDirty).toBe(true);
+      expect(selected.request.permissionPolicy).toBe("interactive");
+    }
+
+    const resumed = parseCliCommand(["live", "--resume", "live-42", "--permission-policy", "deny"]);
+    expect(resumed.kind).toBe("live");
+    if (resumed.kind === "live") {
+      expect(resumed.request.permissionPolicy).toBe("deny");
+      expect(resumed.request.allowDirty).toBe(false);
+    }
+
+    expect(() =>
+      parseCliCommand(["live", "--agent", "pi", "--permission-policy", "allow_session"]),
+    ).toThrow(/--permission-policy must be deny or interactive/);
+    expect(() =>
+      parseCliCommand([
+        "live", "--agent", "pi",
+        "--permission-policy", "interactive",
+        "--permission-policy", "deny",
+      ]),
+    ).toThrow(/--permission-policy may be specified only once/);
+    expect(() => parseCliCommand(["live", "--agent", "pi", "--permission-policy"])).toThrow(
+      /requires a value/,
+    );
+  });
+
+  it("parses live recover", () => {
+    expect(parseCliCommand(["live", "recover", "--workspace", "/tmp/repo"])).toEqual({
+      kind: "live-recover",
+      workspace: "/tmp/repo",
+    });
+    expect(() => parseCliCommand(["live", "recover", "--agent", "pi"])).toThrow(
+      /live recover accepts only --workspace/,
+    );
+    expect(() => parseCliCommand(["live", "recover", "extra"])).toThrow(
+      /live recover accepts only --workspace/,
+    );
   });
 });
 
@@ -918,6 +979,76 @@ describe("live session wire", () => {
     },
     30_000,
   );
+
+  it(
+    "refuses a dirty caller checkout unless --allow-dirty, and carries the selected permission policy across resume",
+    async () => {
+      const scope = await wireScope();
+      try {
+        await writeFile(join(scope.repository, "untracked-during-live.txt"), "caller state\n");
+
+        // Default gate: a dirty caller checkout refuses the launch — no
+        // transport is created, and the refusal is an honest error document.
+        const refused = makeIo([]);
+        expect(
+          await runLiveSession(
+            { provider: "pi", resumeId: null, workspace: scope.repository },
+            refused.io,
+            { manager: scope.manager },
+          ),
+        ).toBe(1);
+        expect(refused.documents).toHaveLength(1);
+        expect(refused.documents[0]).toMatchObject({
+          type: "error",
+          error: { code: "DIRTY_WORKTREE", stage: "launch" },
+        });
+        expect(scope.factory.created).toHaveLength(0);
+
+        // --allow-dirty proceeds from committed HEAD, and the selected
+        // policy rides the launch request to the transport.
+        const started = makeIo([{ action: "close" }]);
+        expect(
+          await runLiveSession(
+            {
+              provider: "pi",
+              resumeId: null,
+              workspace: scope.repository,
+              allowDirty: true,
+              permissionPolicy: "interactive",
+            },
+            started.io,
+            { manager: scope.manager },
+          ),
+        ).toBe(0);
+        expect(scope.factory.created[0]?.launchRequests[0]?.permission_policy).toBe("interactive");
+        const liveSessionId = started.documents[0]?.session?.live_session_id as string;
+        expect(docsOfType(started.documents, "close")[0]?.close).toMatchObject({ status: "closed" });
+
+        // A fresh hub resumes the durable id. The policy was NOT selected
+        // for the resume, so the resumed launch carries the contract
+        // default `deny` — never the previous run's `interactive`.
+        const resumedHub = await secondWireHub(scope);
+        scope.manager = resumedHub;
+        const resumed = makeIo([{ action: "close" }]);
+        expect(
+          await runLiveSession(
+            {
+              provider: null,
+              resumeId: liveSessionId,
+              workspace: scope.repository,
+              allowDirty: true,
+            },
+            resumed.io,
+            { manager: resumedHub },
+          ),
+        ).toBe(0);
+        expect(scope.factory.created[1]?.launchRequests[0]?.permission_policy).toBe("deny");
+      } finally {
+        await releaseWire(scope);
+      }
+    },
+    60_000,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -1037,4 +1168,179 @@ describe("live probe and the default registry", () => {
     },
     30_000,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Relay liveness under fake timers. The injected manager is a pure relay
+// fixture driven through the runner's structural manager surface; fake
+// timers compress "arbitrary silence" without freezing real integration.
+// ---------------------------------------------------------------------------
+
+describe("live event relay across silence (fake timers)", () => {
+  it("relays an event that arrives after thirteen seconds of silence", async () => {
+    vi.useFakeTimers();
+    try {
+      const sink = { status: "idle" as LiveStatus, events: [] as LiveEvent[] };
+      const fakeState = (status: LiveStatus) =>
+        ({ live_session_id: "live-relay-fake", status }) as unknown as LiveSessionState;
+      const unused = async (): Promise<never> => {
+        throw new Error("unused by this relay test");
+      };
+      const manager = {
+        start: async () => ({
+          live_session_id: "live-relay-fake",
+          state: fakeState("idle"),
+          workspace: "/relay-fake-worktree",
+        }),
+        resumeFromState: unused,
+        prompt: unused,
+        followUp: unused,
+        steer: unused,
+        cancel: unused,
+        requestStatus: unused,
+        respondPermission: unused,
+        view: () => fakeState(sink.status),
+        eventsAfter: (_id: string, cursor: number) => ({
+          events: sink.events.slice(cursor),
+          next_cursor: sink.events.length,
+        }),
+        eventCursor: () => sink.events.length,
+        close: async () => {
+          sink.status = "closed";
+          return {
+            state: fakeState("closed"),
+            stop: {
+              status: "closed",
+              exit_code: 0,
+              exit_signal: null,
+              waited_ms: 1,
+            } as LiveStopReport,
+            checkpoint_taken: false,
+            cleanup_errors: [],
+          };
+        },
+      };
+
+      const silence = deferred<void>();
+      const documents: Array<Record<string, any>> = [];
+      const running = runLiveSession(
+        { provider: "pi", resumeId: null, workspace: "/relay-fake" },
+        {
+          stdin: (async function* () {
+            await silence.promise; // arbitrary silence: no commands, no events
+            yield JSON.stringify({ action: "close" });
+          })(),
+          stdout: (document) => documents.push(document),
+          stderr: () => {},
+        },
+        { manager },
+      );
+
+      // Thirteen seconds of total silence — well past the old ~10 s relay
+      // cutoff. Nothing has arrived, and nothing may have been dropped.
+      await vi.advanceTimersByTimeAsync(13_000);
+      expect(docsOfType(documents, "event")).toHaveLength(0);
+
+      // The provider finally says something; the relay must still be alive.
+      sink.events.push({
+        live_session_id: "live-relay-fake",
+        seq: 1,
+        transport: "pi-rpc",
+        occurred_at: new Date(0).toISOString(),
+        body: {
+          kind: "log",
+          level: "info",
+          text: { text: "output after silence", truncated: false },
+        },
+      });
+      silence.resolve();
+      await vi.runAllTimersAsync();
+      const exitCode = await running;
+
+      expect(exitCode).toBe(0);
+      const eventIndex = documents.findIndex((document) => document.type === "event");
+      const closeIndex = documents.findIndex((document) => document.type === "close");
+      expect(eventIndex).toBeGreaterThan(-1);
+      expect(closeIndex).toBeGreaterThan(eventIndex);
+      expect(documents[eventIndex]?.event?.seq).toBe(1);
+      expect(documents[eventIndex]?.event?.body?.text?.text).toBe("output after silence");
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// `agent-hub live recover`: outcome mapping and exit semantics
+// ---------------------------------------------------------------------------
+
+describe("live recover", () => {
+  it("maps kept-live / recovered / manual outcomes to the document and exit code", async () => {
+    const mixed = await runLiveRecover("/unused", {
+      manager: {
+        recover: async () => ({
+          scanned: 3,
+          sessions: [
+            { live_session_id: "s-1", outcome: "recovered" as const, detail: "provider reaped, worktree pinned" },
+            { live_session_id: "s-2", outcome: "kept-live" as const, detail: "this hub process owns the session" },
+            { live_session_id: "s-3", outcome: "manual" as const, detail: "lease corrupt; refusing to guess" },
+          ],
+        }),
+      },
+    });
+    expect(mixed.document).toMatchObject({ scanned: 3, requires_manual: true });
+    expect(mixed.exitCode).toBe(1); // a manual outcome is the caller's to act on
+
+    const settled = await runLiveRecover("/unused", {
+      manager: {
+        recover: async () => ({
+          scanned: 2,
+          sessions: [
+            { live_session_id: "s-1", outcome: "kept-live" as const, detail: "still owned" },
+            { live_session_id: "s-2", outcome: "recovered" as const, detail: "rewritten to orphaned" },
+          ],
+        }),
+      },
+    });
+    expect(settled.document.requires_manual).toBe(false);
+    expect(settled.exitCode).toBe(0); // settled outcomes — auto or humanless — exit clean
+  });
+
+  it("reports a lease-free workspace through runCli with exit 0", async () => {
+    const repository = await createGitRepository();
+    const stdout: string[] = [];
+    const exitCode = await runCli(["live", "recover", "--workspace", repository], {
+      stdout: (value) => stdout.push(value),
+      stderr: () => {},
+    });
+    await removeDirectory(repository);
+
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(stdout.join(""))).toMatchObject({
+      scanned: 0,
+      sessions: [],
+      requires_manual: false,
+    });
+  });
+
+  it("exits 1 through runCli when a corrupt lease needs a human", async () => {
+    const repository = await createGitRepository();
+    const identity = await resolveRepositoryIdentity(repository);
+    const leasesRoot = join(identity.common_dir, "agent-hub", "live", "leases");
+    await mkdir(leasesRoot, { recursive: true });
+    // Recovery must refuse to guess ownership of an unparseable lease.
+    await writeFile(join(leasesRoot, `${randomUUID()}.lease.json`), "{ not a lease");
+
+    const stdout: string[] = [];
+    const exitCode = await runCli(["live", "recover", "--workspace", repository], {
+      stdout: (value) => stdout.push(value),
+      stderr: () => {},
+    });
+    await removeDirectory(repository);
+
+    expect(exitCode).toBe(1);
+    const document = JSON.parse(stdout.join(""));
+    expect(document).toMatchObject({ scanned: 1, requires_manual: true });
+    expect(document.sessions[0]).toMatchObject({ outcome: "manual" });
+  });
 });

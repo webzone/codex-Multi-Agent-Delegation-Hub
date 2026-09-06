@@ -611,6 +611,116 @@ describe("CLI", () => {
       }
     });
   });
+
+  describe("strict command dispatch", () => {
+    it("keeps the explicit delegate subcommand on the delegate path", () => {
+      const invocation = parseCliCommand([
+        "delegate",
+        "--agent",
+        "omp",
+        "--mode",
+        "isolated",
+        "a task",
+      ]);
+      expect(invocation.kind).toBe("delegate");
+      if (invocation.kind === "delegate") {
+        expect(invocation.options.request.task).toBe("a task");
+      }
+    });
+
+    it("rejects an unknown leading word instead of treating it as task text", () => {
+      expect(() =>
+        parseCliCommand(["frobnicate", "--agent", "omp", "--mode", "direct", "t"]),
+      ).toThrow(/unknown command "frobnicate"/);
+      expect(() => parseCliCommand(["build", "the", "thing"])).toThrow(/unknown command "build"/);
+    });
+
+    it("exits 2 on an unknown command and never reaches the agent path", async () => {
+      const io = collectors();
+      expect(await runCli(["frobnicate", "--agent", "omp", "--mode", "direct", "t"], io.output)).toBe(2);
+      expect(io.stderr.join("")).toContain('unknown command "frobnicate"');
+      expect(io.stderr.join("")).toContain("Usage:");
+      // Nothing operational ran: an unknown command never launches an agent.
+      expect(io.stdout.join("")).toBe("");
+    });
+
+    it("exits 2 for --help on an unknown command and 0 on recognized ones", async () => {
+      const unknownIo = collectors();
+      expect(await runCli(["frobnicate", "--help"], unknownIo.output)).toBe(2);
+      expect(unknownIo.stdout.join("")).toBe("");
+
+      for (const argv of [
+        ["--help"],
+        ["delegate", "--help"],
+        ["fanout", "--help"],
+        ["session", "--help"],
+        ["live", "--help"],
+      ]) {
+        const io = collectors();
+        expect(await runCli(argv, io.output)).toBe(0);
+        expect(io.stdout.join("")).toContain("Usage:");
+      }
+    });
+
+    it("supports the `--` terminator so a task may literally start with --", () => {
+      const options = parseCliArgs([
+        "delegate",
+        "--agent",
+        "omp",
+        "--mode",
+        "isolated",
+        "--",
+        "--flag-like",
+        "task",
+        "text",
+      ]);
+      expect(options.request.task).toBe("--flag-like task text");
+
+      // After the terminator, `--help` is task text, not a flag.
+      const after = parseCliArgs(["--agent", "omp", "--mode", "direct", "--", "--help"]);
+      expect(after.help).toBe(false);
+      expect(after.request.task).toBe("--help");
+
+      // Before the terminator, `--help` still wins.
+      expect(parseCliArgs(["--help", "--", "text"]).help).toBe(true);
+    });
+
+    it("runs a task that starts with -- end to end", async () => {
+      const repository = await createGitRepository();
+      try {
+        const io = collectors();
+        // The fake agent reads the task from its own argv; the `--` before
+        // {task} keeps node itself from eating a `--task` as a node flag —
+        // proof the hub forwarded the terminated text verbatim.
+        await withAgentEnv(
+          ["-e", "require('node:fs').writeFileSync('omp.txt', process.argv[1]);", "--", "{task}"],
+          ["-e", "process.exit(1)"],
+          async () => {
+            expect(
+              await runCli(
+                [
+                  "delegate",
+                  "--agent",
+                  "omp",
+                  "--mode",
+                  "direct",
+                  "--workspace",
+                  repository,
+                  "--",
+                  "--carry-this-through",
+                ],
+                io.output,
+              ),
+            ).toBe(0);
+          },
+        );
+        expect(JSON.parse(io.stdout.join("")).status).toBe("success");
+        expect(await readFile(join(repository, "omp.txt"), "utf8")).toBe("--carry-this-through");
+      } finally {
+        await removeDirectory(repository);
+      }
+    });
+  });
 });
 
 describe("legacy agent vocabulary (unchanged by v3 live surfaces)", () => {
