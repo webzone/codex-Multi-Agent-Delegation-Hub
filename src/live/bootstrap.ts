@@ -36,20 +36,24 @@ import type { LiveSessionState, LiveTransportFactory } from "./types.js";
  *     hub-created OS-temp worktree the manager materializes.
  */
 
-/** The four real transport factories a production hub build must carry. */
+/**
+ * The four real transport factories a production hub build must carry.
+ * Module-level singletons: the registry's conflict rule compares factory
+ * identity, so repeated production registration must be idempotent.
+ */
+const ompFactory = ompRpcTransportFactory;
+const piFactory = piRpcTransportFactory;
+const agyFactory = createAgyStreamJsonFactory();
+const hermesFactory = createHermesAcpFactory();
+
 export function productionTransportFactories(): readonly LiveTransportFactory[] {
-  return [
-    ompRpcTransportFactory,
-    piRpcTransportFactory,
-    createAgyStreamJsonFactory(),
-    createHermesAcpFactory(),
-  ];
+  return [ompFactory, piFactory, agyFactory, hermesFactory];
 }
 
 /**
  * Register the four real transports into `registry` (default: the build-wide
  * one). Idempotent: the registry's conflict rule compares factory identity,
- * and these are the module singletons.
+ * and these are the module singletons above.
  */
 export function registerProductionLiveTransports(
   registry: LiveTransportRegistry = liveTransportRegistry,
@@ -122,6 +126,12 @@ export async function createLiveManager(
   options: CreateLiveManagerOptions = {},
 ): Promise<LiveSessionManager> {
   const identity = await resolveRepositoryIdentity(workspace);
+  // Production builds also populate the build-wide default registry, so
+  // surfaces that consult it (for example `agent-hub live probe` through
+  // `probeLiveAgent`) never see an unwired default on a real build.
+  if (!options.withoutProductionTransports) {
+    registerProductionLiveTransports();
+  }
   const registry = new LiveTransportRegistry();
   if (!options.withoutProductionTransports) {
     for (const factory of productionTransportFactories()) {

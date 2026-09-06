@@ -10,6 +10,7 @@ import {
   isLiveProvider,
   iterateLiveCommands,
   probeLiveAgent,
+  registerProductionLiveTransports,
   runLiveSession,
   supportedLiveAgents,
 } from "./live/index.js";
@@ -733,6 +734,10 @@ async function execute(
     }
 
     case "live-probe": {
+      // Production builds register the four real transports into the
+      // default registry before probing it — an empty default is a wiring
+      // bug, never a provider to guess.
+      registerProductionLiveTransports();
       const document = await probeLiveAgent(invocation.agent);
       emit(document);
       // Not-found is honest data, but operationally it is a failed probe.

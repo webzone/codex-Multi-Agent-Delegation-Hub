@@ -13,7 +13,7 @@ import type {
   LiveEvent,
   LiveEventBody,
   LiveFollowUpCommand,
-  LivePermissionResponseCommand,
+  LivePermissionDecision,
   LivePromptCommand,
   LiveSteerCommand,
   LiveStatusCommand,
@@ -203,7 +203,7 @@ function statusCommand(): LiveStatusCommand {
 function cancelCommand(reason: string | null) {
   return { ...commandBase(), kind: "cancel" as const, reason };
 }
-function permissionResponse(requestId: string, decision: "allow_once" | "allow_session" | "deny"): LivePermissionResponseCommand {
+function permissionResponse(requestId: string, decision: LivePermissionDecision): LivePermissionResponseCommand {
   return { ...commandBase(), kind: "permission_response", request_id: requestId, decision, note: null };
 }
 
@@ -450,22 +450,42 @@ describe("hermes acp transport", () => {
     }
   });
 
-  it("interactive allow_session is never auto-approved as allow_always", async () => {
+  it("interactive answers speak only allow_once/deny; a widened decision never reaches allow_always", async () => {
+    // Typed surface: LivePermissionDecision is exactly "allow_once" | "deny".
+    // This assignment fails typecheck if a wider decision ever returns to the union.
+    // @ts-expect-error allow_session was removed from LivePermissionDecision
+    const widened: LivePermissionDecision = "allow_session";
+
     const fake = await makeFakeHermes();
     const t = transport(fake, { interactive: true });
     try {
       const recorder = new EventRecorder(t.events());
       await t.open(launchRequest(fake.dir));
-      await t.send(promptCommand("PERM now"));
-      await recorder.waitUntil("permission request", (events) => events.some((e) => e.body.kind === "permission_request"));
-      const request = recorder.bodiesOf("permission_request")[0];
-      await t.send(permissionResponse(request.request_id, "allow_session"));
-      await recorder.waitUntil("turn closed", (events) => idleCount(events) >= 2);
+
+      // Typed deny: selects the agent's own reject_once, never allow_always.
+      await t.send(promptCommand("PERM first"));
+      await recorder.waitUntil("first permission", (events) => events.some((e) => e.body.kind === "permission_request"));
+      const first = recorder.bodiesOf("permission_request")[0];
+      await t.send(permissionResponse(first.request_id, "deny"));
+      await recorder.waitUntil("first turn closed", (events) => idleCount(events) >= 2);
+
+      // The widened value cannot be constructed typed; cast across the
+      // manager-free transport boundary it still cannot be honored: anything
+      // but allow_once denies.
+      await t.send(promptCommand("PERM second"));
+      await recorder.waitUntil("second permission", () => recorder.bodiesOf("permission_request").length >= 2);
+      const second = recorder.bodiesOf("permission_request")[1];
+      await t.send(permissionResponse(second.request_id, widened));
+      await recorder.waitUntil("second turn closed", (events) => idleCount(events) >= 3);
 
       const journal = await readJournal(fake);
-      const answer = journal.find((e) => e.m === "permission")?.response as { outcome: { outcome: string; optionId?: string } };
-      expect(answer.outcome.optionId).toBe("opt-reject");
-      expect(recorder.bodiesOf("log").some((l) => l.text.text.includes("allow_always is never auto-approved"))).toBe(true);
+      const answers = journal
+        .filter((e) => e.m === "permission")
+        .map((e) => e.response as { outcome: { outcome: string; optionId?: string } });
+      expect(answers).toHaveLength(2);
+      expect(answers[0].outcome).toEqual({ outcome: "selected", optionId: "opt-reject" });
+      expect(answers[1].outcome).toEqual({ outcome: "selected", optionId: "opt-reject" });
+      expect(answers.some((a) => a.outcome.optionId === "opt-always")).toBe(false);
       await t.stop("graceful");
     } finally {
       await t.stop("terminate");

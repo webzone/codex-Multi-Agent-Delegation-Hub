@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import { acquireRepositoryLock } from "../src/locks.js";
 import {
   applyLiveTransition,
+  LIVE_SCHEMA_VERSION,
   livePendingPath,
   liveRefFor,
   liveStatePath,

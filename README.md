@@ -161,7 +161,7 @@ npx agent-hub live probe --agent hermes
 `live` reads one Hub NDJSON command per line on stdin —
 `prompt`, `follow_up`, `steer`, `cancel`, `status`, `permission_response`,
 and `close` (`{"action":"prompt","text":"..."}`,
-`{"action":"permission_response","request_id":"...","decision":"allow_once|allow_session|deny"}`,
+`{"action":"permission_response","request_id":"...","decision":"allow_once|deny"}`,
 etc.) — writes normalized NDJSON documents on stdout
 (`{type:"session"|"event"|"result"|"error"|"close"}`), and keeps human
 diagnostics on stderr. Stdin EOF closes the session gracefully. Exit codes:
@@ -175,14 +175,22 @@ command is gated against the transport's launch capability snapshot: a
 command whose claim is `unsupported` comes back `outcome: "unsupported"`
 with a `stage: "capability"` error and is never delivered; claims short of
 `unsupported` must carry evidence or the transport is refused at launch.
-Turn results report `cancelled` when the hub stopped the provider mid-turn —
-an intentional exit never masquerades as `succeeded`.
+Permission verdicts are exactly `allow_once` and `deny` — any other verdict
+is a caller error, never silently converted into a deny. Turn results report
+`cancelled` when the hub stopped the provider mid-turn — an intentional exit
+never masquerades as `succeeded`.
 
-Seams, by design, until the other live packages land: transport factories
-register through `registerLiveTransport()` (an unregistered provider fails
-with `LIVE_TRANSPORT_UNAVAILABLE`, never a guessed command line), and
-`--resume` reads durable live state through `setLiveResumeSource()` (until
-wired, it fails with `LIVE_STATE_UNAVAILABLE`, never a fake continuation).
+The `live` command and the MCP tools drive the one authoritative live core
+(`src/live/manager.ts`). Production startup wires everything: all four real
+transports (OMP RPC, PI RPC, AGY stream-json, Hermes ACP) register through
+`registerProductionLiveTransports()`, and `--resume` reads durable live
+state through the wired reader in `src/live/state.ts` — an unregistered
+provider fails with `LIVE_TRANSPORT_UNAVAILABLE`, and an unknown resume id
+fails with `LIVE_SESSION_NOT_FOUND`; nothing ever guesses a command line or
+fabricates a continuation. The provider runs in a hub-owned isolated OS-temp
+worktree (the primary checkout's HEAD and index are never its working
+directory); a lifetime lease, quotas, recovery, and a bounded event ring
+belong to the core manager.
 
 ## MCP server
 
@@ -198,8 +206,9 @@ and `session_resume`. `compete_candidates.auto_merge` defaults to `false`.
 The additive v3 live tools — `live_session_start`, `live_session_resume`,
 `live_session_command` (the six hub actions), `live_session_events` (poll
 with a cursor, honest about ring-buffer eviction), and `live_session_close` —
-run on a process-local manager; `live_session_command` reports capability
-refusals as `outcome: "unsupported"` with `isError`, never as a delivery.
+run on the same core live manager (one per workspace, built by
+`createLiveManager`); `live_session_command` reports capability refusals as
+`outcome: "unsupported"` with `isError`, never as a delivery.
 Every tool returns structured JSON content with `isError`; a failing operation
 comes back as `{ error: { code, message } }` and never escapes as a
 transport-level exception — and when the failing `compete_candidates` operation
@@ -336,16 +345,27 @@ Sessions/continuation:
 
 v3 live surfaces (additive; v1/v2 guarantees above are untouched):
 
-- Live sessions are process-local: the hub keeps events only in a bounded
-  ring per session (cursor polls report evictions), and the durable
-  `LiveSessionState` record type admits no task text, transcripts, or event
-  bodies by construction.
-- Capability claims are enforced at the boundary: a launch whose transport
-  claims `native`-class support without evidence is refused, and every
-  refused command names `stage: "capability"` instead of vanishing.
-- Shutdown honesty: `closed` is reported only with proof the provider
-  process is gone; a still-unproven end is `orphaned` (CLI exit `1`, MCP
-  `isError`) and an in-flight turn reports `cancelled`, not `succeeded`.
+- One durable record per live session, schema `agent-hub-live/v1`, under
+  `<common>/agent-hub/live/sessions/` (a namespace v1/v2 never reads):
+  identity, commit lineage, `worktree_path`/`worktree_parent`,
+  `last_checkpoint_reason`, resume state, status, revision. The record type
+  admits no task text, transcripts, or event bodies by construction; events
+  live only in a bounded ring per session (cursor polls report evictions).
+- Launch integrity: the provider's process identity (pid/pgid/start token)
+  is durably recorded on the session's lease the moment the process spawns —
+  before any protocol handshake can fail. A launch that rejects afterwards
+  may only reclaim resources when shutdown PROVES the whole owned process
+  group is dead; otherwise the lease, worktree, and ownership facts are
+  retained for recovery or manual review.
+- Capability honesty: a launch whose transport claims `native`-class support
+  without evidence is refused, and every refused command names
+  `stage: "capability"` instead of vanishing. A `native` follow-up is
+  delivered to the provider immediately and tracked provider-queued; only a
+  `hub-queued` claim waits for the terminal boundary.
+- Shutdown honesty: `closed` is reported only with proof the provider group
+  is gone (leader reap plus group probe); a still-unproven end is `orphaned`
+  (CLI exit `1`, MCP `isError`) and an in-flight turn reports `cancelled`,
+  not `succeeded`.
 
 Not in scope for v2: queued workflows, remote providers, or cross-repository
 merges.
