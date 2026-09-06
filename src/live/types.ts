@@ -126,8 +126,10 @@ export type LiveStatus =
 // shared shapes — durable state never stores them)
 // ---------------------------------------------------------------------------
 
-/** Permission verdict returned for an observed `permission_request` event. */
-export type LivePermissionDecision = "allow_once" | "allow_session" | "deny";
+/** Permission verdict returned for an observed `permission_request` event. v3
+ * accepts exactly two verdicts; anything else (including any "session-wide
+ * allow" wording) is rejected at the surface boundary, never converted. */
+export type LivePermissionDecision = "allow_once" | "deny";
 
 interface LiveCommandBase {
   /** Hub-generated UUID; echoed back in the matching `LiveTurnResult`. */
@@ -460,8 +462,8 @@ export interface LiveTurnResult {
  * recovery must re-prove liveness or rewrite it to `orphaned`.
  */
 export interface LiveSessionState {
-  /** Live-record schema version. */
-  schema: 1;
+  /** Live-record schema version: the non-ambiguous frozen schema id. */
+  schema: "agent-hub-live/v1";
   /** Hub-generated UUID; never derived from raw user text. */
   live_session_id: string;
   /**
@@ -482,6 +484,12 @@ export interface LiveSessionState {
   current_commit: string;
   /** Number of checkpoints taken (0 before the first); matches `LiveCheckpoint.seq` of the head. */
   checkpoint_seq: number;
+  /** Reason recorded by the checkpoint at the chain head; null before the first checkpoint. */
+  last_checkpoint_reason: CheckpointReason | null;
+  /** Absolute path of the hub-owned live worktree backing this record. */
+  worktree_path: string;
+  /** Absolute path of that worktree's hub temp parent directory. */
+  worktree_parent: string;
   /** Resume state for the provider, or null before the provider surfaced any handle. */
   resume: ProviderResumeState | null;
   status: LiveStatus;
@@ -504,6 +512,13 @@ export interface LiveTransportDescriptor {
   capabilities: LiveCapabilities;
 }
 
+/** Process identity facts proven at spawn time. `pgid` equals `pid` for the
+ * detached group leaders the hub launches on POSIX. */
+export interface LiveProviderProcessFacts {
+  pid: number;
+  pgid: number;
+}
+
 /** Everything a transport needs to start a live session. Contains no task text — prompts arrive only via `send`. */
 export interface LiveLaunchRequest {
   live_session_id: string;
@@ -513,6 +528,15 @@ export interface LiveLaunchRequest {
   max_text_bytes: number;
   /** Durable resume hint; a transport that cannot honor it must fail launch with a `LiveError`, never silently start fresh. */
   resume: ProviderResumeState | null;
+  /**
+   * Durable ownership boundary: a transport that spawned a local provider
+   * process MUST await this callback with the spawn facts immediately after
+   * the spawn succeeds and BEFORE any protocol handshake can fail. The hub
+   * records the ownership durably at that point, so a later handshake failure
+   * can never lose the process. Absent only when the caller cannot record
+   * ownership (no lease); such callers may not spawn group-owned children.
+   */
+  report_process?: (facts: LiveProviderProcessFacts) => Promise<void>;
 }
 
 /** What a launch produced. */
@@ -522,6 +546,14 @@ export interface LiveLaunchReport {
   /** Provider session handle observed at startup (also lands in the resume state). */
   provider_session_id: string | null;
   launched_at: string;
+  /**
+   * The full post-handshake resume state, built by the transport from what it
+   * actually observed (locator echo, init-envelope identity, session/load
+   * round-trip, argv verification). `verified` here is the transport's own
+   * evidence, not a hub inference; a launch under a resume hint that produced
+   * no resume state is a contract violation the hub must reject.
+   */
+  resume_state?: ProviderResumeState | null;
 }
 
 /** How shutdown was requested. `terminate` means bounded SIGKILL escalation is authorized. */

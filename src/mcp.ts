@@ -10,14 +10,14 @@ import { fanOut, FANOUT_MAX_CANDIDATES, FANOUT_MAX_CONCURRENCY_LIMIT } from "./f
 import { autoMerge } from "./merge.js";
 import { releaseFanOutArtifactRefs } from "./artifacts.js";
 import { createSession, resumeSession } from "./session.js";
-import { asDelegateError } from "./errors.js";
+import { AgentHubError, asDelegateError } from "./errors.js";
 import { supportedAgents } from "./adapters/index.js";
 import {
-  getLiveResumeSource,
+  createLiveManager,
   LiveSessionManager,
   supportedLiveAgents,
 } from "./live/index.js";
-import type { LiveResumeSource } from "./live/index.js";
+import type { LivePermissionDecision } from "./live/types.js";
 import type { DelegateError, MergeOutcome } from "./types.js";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -73,12 +73,14 @@ export interface HubToolDependencies {
   autoMerge?: typeof autoMerge;
   releaseRefs?: typeof releaseFanOutArtifactRefs;
   /**
-   * v3 live surfaces: the process-local manager and the durable-state seam.
-   * By default each server owns its own process-local manager; focused
-   * tests inject an isolated manager wired to a scripted transport registry.
+   * v3 live surfaces: the CORE manager (the one from `live/manager.ts`).
+   * Production builds one per workspace through `liveManagerFor` (which
+   * resolves the repository from the requested workspace, registers all four
+   * real transports, and wires the durable live-state reader). Focused tests
+   * inject a manager wired to scripted transports.
    */
   live?: LiveSessionManager;
-  liveResumeSource?: LiveResumeSource;
+  liveManagerFor?: (workspace: string) => Promise<LiveSessionManager>;
 }
 
 export function createHubServer(dependencies: HubToolDependencies = {}): McpServer {
@@ -86,10 +88,24 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
   const runCompetitionFn = dependencies.runCompetition ?? runCompetition;
   const autoMergeFn = dependencies.autoMerge ?? autoMerge;
   const releaseRefsFn = dependencies.releaseRefs ?? releaseFanOutArtifactRefs;
-  // Process-local by contract: one manager per server unless a caller
-  // injects one (focused tests wire a scripted transport registry).
-  const liveManager = dependencies.live ?? new LiveSessionManager();
-  const liveResumeSource = dependencies.liveResumeSource ?? getLiveResumeSource();
+  const injectedLive = dependencies.live ?? null;
+  const liveManagerFor = dependencies.liveManagerFor ?? ((workspace: string) => createLiveManager(workspace));
+  // Which manager owns which live session (the manager holds the live
+  // transport; commands must route back to the process that started it).
+  const liveOwners = new Map<string, LiveSessionManager>();
+  async function liveManagerForWorkspace(workspace: string): Promise<LiveSessionManager> {
+    return injectedLive ?? (await liveManagerFor(workspace));
+  }
+  function liveOwner(liveSessionId: string): LiveSessionManager {
+    const owner = injectedLive ?? liveOwners.get(liveSessionId);
+    if (!owner) {
+      throw new AgentHubError(
+        "LIVE_SESSION_NOT_FOUND",
+        `no live session "${liveSessionId}" is owned by this hub process; commands must route to the process that started it`,
+      );
+    }
+    return owner;
+  }
   const server = new McpServer({
     name: "codex-multi-agent-delegation-hub",
     version: "0.1.0",
@@ -307,15 +323,16 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
 
 
   // ---------------------------------------------------------------------
-  // v3 live surfaces (additive): a process-local manager, polling plus
-  // cursor event reads, and the six hub commands behind one tool.
+  // v3 live surfaces (additive): the CORE manager behind start/resume/
+  // command/events/close, with the durable live-state reader wired by the
+  // production bootstrap.
   // ---------------------------------------------------------------------
 
   server.registerTool(
     "live_session_start",
     {
       description:
-        "Start a long-lived interactive live session (v3) for one provider (omp, agy, pi, hermes). Providers are validated against the live vocabulary; pi/hermes stay live-only and remain rejected by the legacy tools. Fails honestly when the provider's transport is not wired into this build.",
+        "Start a long-lived interactive live session (v3) for one provider (omp, agy, pi, hermes). The provider runs in a hub-owned isolated OS-temp worktree materialized from this workspace; durable state, the lifetime lease, quotas, and the bounded event ring are all owned by the core live manager. pi/hermes stay live-only and remain rejected by the legacy tools. Fails honestly when the provider probe is not found.",
       inputSchema: {
         agent: z.enum(supportedLiveAgents),
         workspace: z.string().min(1).default(process.cwd()),
@@ -325,13 +342,14 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     },
     async ({ agent, workspace, session_id, max_output_bytes }) =>
       guardTool(async () => {
-        const summary = await liveManager.start({
+        const manager = await liveManagerForWorkspace(workspace);
+        const started = await manager.start({
           provider: agent,
-          workspace,
-          sessionId: session_id ?? null,
-          maxTextBytes: max_output_bytes,
+          session_id: session_id ?? null,
+          max_text_bytes: max_output_bytes,
         });
-        return okTool(summary);
+        liveOwners.set(started.live_session_id, manager);
+        return okTool(started);
       }),
   );
 
@@ -339,7 +357,7 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     "live_session_resume",
     {
       description:
-        "Resume a durable live session (hub-live-id) by reopening its provider transport with the stored resume state. Until the durable live-state store is wired, this fails with LIVE_STATE_UNAVAILABLE — never with a fake continuation.",
+        "Resume a durable live session (hub-live-id): loads the agent-hub-live/v1 record, refuses live/leased sessions, materializes a FRESH hub worktree at current_commit, launches the provider with the recorded opaque resume state, verifies provider identity, and CAS-advances the existing live ref (never a new ref). A resume whose identity does not round-trip fails; there is no fake continuation.",
       inputSchema: {
         live_session_id: z.string().min(1),
         workspace: z.string().min(1).default(process.cwd()),
@@ -348,13 +366,13 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     },
     async ({ live_session_id, workspace, max_output_bytes }) =>
       guardTool(async () => {
-        const state = await liveResumeSource.load(workspace, live_session_id);
-        const summary = await liveManager.resume({
-          state,
-          workspace,
-          maxTextBytes: max_output_bytes,
+        const manager = await liveManagerForWorkspace(workspace);
+        const resumed = await manager.resumeFromState({
+          live_session_id,
+          max_text_bytes: max_output_bytes,
         });
-        return okTool(summary);
+        liveOwners.set(resumed.live_session_id, manager);
+        return okTool(resumed);
       }),
   );
 
@@ -362,28 +380,70 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     "live_session_command",
     {
       description:
-        "Inject one hub command into a live session: prompt (once, while idle), follow_up (native when idle or hub-queued mid-turn), steer (mid-turn, when claimed), cancel, status (answered from stream evidence), or permission_response (answering an observed permission_request). Returns the LiveTurnResult plus the session status; capability-refused commands come back outcome \"unsupported\" with a stage \"capability\" error and are never delivered.",
+        "Inject one hub command into a live session: prompt (once, while idle), follow_up (native claims are delivered immediately and tracked provider-queued; hub-queued claims wait for the terminal boundary), steer (mid-turn, when claimed), cancel, status (answered from stream evidence when derived), or permission_response (answering an observed permission_request with allow_once or deny only — any other verdict is rejected, never converted). Returns the LiveTurnResult plus the session status; capability-refused commands come back outcome \"unsupported\" with a stage \"capability\" error and are never delivered.",
       inputSchema: {
         live_session_id: z.string().min(1),
         action: z.enum(["prompt", "follow_up", "steer", "cancel", "status", "permission_response"]),
         text: z.string().optional(),
         reason: z.string().nullable().optional(),
         request_id: z.string().optional(),
-        decision: z.enum(["allow_once", "allow_session", "deny"]).optional(),
+        decision: z.enum(["allow_once", "deny"]).optional(),
         note: z.string().nullable().optional(),
       },
     },
     async ({ live_session_id, action, text, reason, request_id, decision, note }) =>
       guardTool(async () => {
-        const result = await liveManager.command(live_session_id, {
-          action,
-          text: text ?? null,
-          reason: reason ?? null,
-          request_id: request_id ?? null,
-          decision: decision ?? null,
-          note: note ?? null,
-        });
-        const status = liveManager.get(live_session_id)?.status ?? "closed";
+        const manager = liveOwner(live_session_id);
+        const invalid = (message: string) =>
+          failTool({ code: "LIVE_COMMAND_INVALID", message });
+        let result;
+        switch (action) {
+          case "prompt":
+          case "follow_up":
+          case "steer": {
+            if (typeof text !== "string") {
+              return invalid(`command "${action}" requires a "text" string`);
+            }
+            result =
+              action === "prompt"
+                ? await manager.prompt(live_session_id, text)
+                : action === "follow_up"
+                  ? await manager.followUp(live_session_id, text)
+                  : await manager.steer(live_session_id, text);
+            break;
+          }
+          case "cancel": {
+            result = await manager.cancel(live_session_id, reason ?? null);
+            break;
+          }
+          case "status": {
+            result = await manager.requestStatus(live_session_id);
+            break;
+          }
+          case "permission_response": {
+            if (typeof request_id !== "string" || request_id.length === 0) {
+              return invalid('command "permission_response" requires "request_id"');
+            }
+            const verdict: LivePermissionDecision | null =
+              decision === "allow_once" || decision === "deny" ? decision : null;
+            if (verdict === null) {
+              return invalid('command "permission_response" requires decision allow_once or deny');
+            }
+            result = await manager.respondPermission(
+              live_session_id,
+              request_id,
+              verdict,
+              note ?? null,
+            );
+            break;
+          }
+        }
+        let status: string = result.outcome;
+        try {
+          status = manager.view(live_session_id).status;
+        } catch {
+          status = "closed";
+        }
         return okTool({ result, status }, result.outcome === "failed" || result.outcome === "unsupported");
       }),
   );
@@ -392,22 +452,24 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     "live_session_events",
     {
       description:
-        "Poll normalized live events after a cursor (events are per-session, 1-based, no gaps). Returns the page, the next cursor, the oldest retained seq, and an honest `dropped` flag when the ring buffer already evicted what the cursor points before.",
+        "Poll normalized live events after a cursor (events are per-session, 1-based, no gaps). Returns the replay page and the next cursor; when the bounded ring already evicted events behind the cursor this fails with EVENT_CURSOR_EXPIRED (resynchronize from the durable record) instead of silently dropping events.",
       inputSchema: {
         live_session_id: z.string().min(1),
         cursor: z.number().int().nonnegative().default(0),
-        limit: z.number().int().min(1).max(1000).default(200),
       },
     },
-    async ({ live_session_id, cursor, limit }) =>
-      guardTool(async () => okTool(liveManager.events(live_session_id, cursor, limit))),
+    async ({ live_session_id, cursor }) =>
+      guardTool(async () => {
+        const page = liveOwner(live_session_id).eventsAfter(live_session_id, cursor);
+        return okTool(page);
+      }),
   );
 
   server.registerTool(
     "live_session_close",
     {
       description:
-        "Stop a live session's provider (graceful, or terminate with bounded SIGKILL escalation authorized) and report what shutdown proved: `closed` only with proof the process is gone, `orphaned` otherwise — an orphaned close is an isError.",
+        "Stop a live session's provider (graceful, or terminate with bounded SIGKILL escalation authorized) and report what shutdown proved: `closed` only with leader reap plus proof the owned process group is gone, `orphaned` otherwise (the lease and worktree then stay for recovery). An orphaned close is an isError.",
       inputSchema: {
         live_session_id: z.string().min(1),
         terminate: z.boolean().default(false),
@@ -415,8 +477,15 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     },
     async ({ live_session_id, terminate }) =>
       guardTool(async () => {
-        const close = await liveManager.close(live_session_id, terminate ? "terminate" : "graceful");
-        return okTool(close, close.stop.status === "orphaned");
+        const close = await liveOwner(live_session_id).close(
+          live_session_id,
+          terminate ? "terminate" : "graceful",
+        );
+        liveOwners.delete(live_session_id);
+        return okTool(
+          close,
+          close.stop === null ? close.state.status === "orphaned" : close.stop.status === "orphaned",
+        );
       }),
   );
 

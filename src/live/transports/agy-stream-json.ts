@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { launchLiveChild, SUPPORTS_GROUP_SIGNALS, type LiveChildHandle } from "../child-process.js";
 
 import { deferred, type Deferred } from "../../deferred.js";
 import type {
@@ -202,7 +202,7 @@ export class AgyStreamJsonTransport implements LiveTransport {
 
   private readonly options: AgyTransportOptions;
   private request: LiveLaunchRequest | null = null;
-  private child: ChildProcessWithoutNullStreams | null = null;
+  private child: LiveChildHandle | null = null;
   private sink: EventSink | null = null;
   private promptDelivered = false;
   private activeTurn: TurnState | null = null;
@@ -237,10 +237,19 @@ export class AgyStreamJsonTransport implements LiveTransport {
         evidence: 'follow_up accepted mid-turn is held in the transport and emitted as the next {event:"user"} stdin line only after the result envelope closes the current turn (queue is in-memory only)',
       },
       steer: { support: "unsupported", evidence: null },
-      cancel: {
-        support: "signal",
-        evidence: "cancel is SIGINT to the spawned process group (detached group, shell:false); no control frame is ever written to stdin for cancel",
-      },
+      cancel: SUPPORTS_GROUP_SIGNALS
+        ? {
+            support: "signal",
+            evidence:
+              "cancel is SIGINT to the spawned process group (detached group leader via the shared child primitive, shell:false); no control frame is ever written to stdin for cancel",
+          }
+        : {
+            // Signal-only cancel is capability-gated: on platforms without
+            // reliable process-group signals, SIGINT would hit only the
+            // leader and helpers would survive — so nothing is claimed.
+            support: "unsupported",
+            evidence: null,
+          },
       status: {
         support: "derived",
         evidence: "status is derived from init/step_update/result stream activity; the stream-json protocol exposes no status request, so status commands are never forwarded",
@@ -312,39 +321,57 @@ export class AgyStreamJsonTransport implements LiveTransport {
       args.push(AGY_RESUME_FLAG, resumeConversation);
     }
 
-    const child = spawn(resolveAgyCommand(this.options), args, {
-      cwd: request.workspace,
-      env: this.options.environment ?? process.env,
-      shell: false,
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
-    });
+    let child: LiveChildHandle;
+    try {
+      child = await launchLiveChild({
+        command: resolveAgyCommand(this.options),
+        args,
+        cwd: request.workspace,
+        env: this.options.environment,
+        maxStderrBytes: 64 * 1024,
+      });
+    } catch (error) {
+      throw new LiveTransportError(
+        liveError(
+          "launch",
+          "LIVE_AGY_SPAWN_FAILED",
+          `agy process could not run: ${error instanceof Error ? error.message : String(error)}`,
+          true,
+        ),
+      );
+    }
     this.child = child;
 
-    this.attachLineReader(child.stdout, (line, bytes) => this.handleLine(line, bytes));
-    child.stderr.on("data", (chunk: Buffer | string) => {
-      for (const line of (typeof chunk === "string" ? chunk : chunk.toString("utf8")).split("\n")) {
+    this.attachLineReader(child.stdout!, (line, bytes) => this.handleLine(line, bytes));
+    child.onStderr((chunk) => {
+      for (const line of chunk.toString("utf8").split("\n")) {
         if (line.trim()) {
           this.emit({ kind: "log", level: "info", text: this.bound(line) });
         }
       }
     });
-    child.once("error", (error: Error) => {
-      this.exitInfo = { code: null, signal: null };
-      this.emit({ kind: "exit", intentional: false, exit_code: null, exit_signal: null });
-      this.emit({
-        kind: "error",
-        error: liveError("launch", "LIVE_AGY_SPAWN_FAILED", `agy process could not run (${(error as NodeJS.ErrnoException).code ?? "unknown"})`, true),
-      });
-      this.fatal = true;
-      this.initDeferred?.reject(
-        new LiveTransportError(
-          liveError("launch", "LIVE_AGY_SPAWN_FAILED", `agy spawn failed: ${error.message}`, true),
-        ),
-      );
-      this.sink?.close();
-    });
-    child.once("exit", (code, signal) => this.handleExit(code, signal));
+    // Durable ownership boundary: record the group leader BEFORE the init
+    // envelope race can fail, so a rejected open() can never orphan a
+    // detached process whose pid was never written down.
+    if (request.report_process) {
+      try {
+        await request.report_process({ pid: child.pid, pgid: child.pgid });
+      } catch (error) {
+        const structured = liveError(
+          "launch",
+          "LIVE_OWNERSHIP_RECORDING_FAILED",
+          `the hub could not durably record ownership of the spawned provider (${error instanceof Error ? error.message : String(error)}); refusing to proceed with an unowned process`,
+          false,
+        );
+        this.emit({ kind: "error", error: structured });
+        this.fatal = true;
+        child.closeStdin();
+        void child.stop("terminate");
+        void child.exited().then((info) => this.handleExit(info.exit_code, info.exit_signal));
+        throw new LiveTransportError(structured);
+      }
+    }
+    void child.exited().then((info) => this.handleExit(info.exit_code, info.exit_signal));
 
     const launchedAt = new Date().toISOString();
     let init: InitEnvelope;
@@ -384,7 +411,12 @@ export class AgyStreamJsonTransport implements LiveTransport {
     }
 
     this.setStatus("idle");
-    return { pid: child.pid ?? null, provider_session_id: this.providerSessionId, launched_at: launchedAt };
+    return {
+      pid: child.pid,
+      provider_session_id: this.providerSessionId,
+      launched_at: launchedAt,
+      resume_state: this.resumeState(),
+    };
   }
 
   async send(command: LiveCommand): Promise<void> {
@@ -495,18 +527,19 @@ export class AgyStreamJsonTransport implements LiveTransport {
     this.emit({ kind: "status", status, note: note ? this.bound(note).text : null });
   }
 
-  private raceInit(child: ChildProcessWithoutNullStreams): Promise<InitEnvelope> {
+  private raceInit(child: LiveChildHandle): Promise<InitEnvelope> {
     const init = this.initDeferred!;
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new Error(`no init envelope within ${INIT_TIMEOUT_MS}ms`)), INIT_TIMEOUT_MS);
       timer.unref?.();
     });
-    const died = new Promise<never>((_, reject) => {
-      child.once("exit", (code, signal) =>
-        reject(new Error(`agy exited before init (code ${code ?? "null"}, signal ${signal ?? "null"})`)),
-      );
-    });
+    const died = child.exited().then(
+      (info) =>
+        Promise.reject(
+          new Error(`agy exited before init (code ${info.exit_code ?? "null"}, signal ${info.exit_signal ?? "null"})`),
+        ),
+    );
     return Promise.race([init.promise, timeout, died]).finally(() => {
       clearTimeout(timer);
     });
@@ -737,7 +770,8 @@ export class AgyStreamJsonTransport implements LiveTransport {
   }
 
   private deliverTurn(command: LivePromptOrFollowUp): void {
-    if (this.fatal || !this.child?.stdin.writable) {
+    const stdin = this.child?.stdin;
+    if (this.fatal || !stdin || !stdin.writable) {
       return;
     }
     this.activeTurn = {
@@ -747,7 +781,8 @@ export class AgyStreamJsonTransport implements LiveTransport {
       assistantText: [],
       sawAssistantText: false,
     };
-    this.child.stdin.write(`${JSON.stringify({ event: "user", message: command.text })}\n`);
+    // The only bytes ever written to agy's stdin: user envelopes.
+    void this.child!.writeStdin(`${JSON.stringify({ event: "user", message: command.text })}\n`);
     this.setStatus("running");
   }
 
@@ -768,7 +803,7 @@ export class AgyStreamJsonTransport implements LiveTransport {
     this.emit({ kind: "error", error: liveError("protocol", code, message, false) });
     this.setStatus("error");
     this.initDeferred?.reject(new LiveTransportError(liveError("protocol", code, message, false)));
-    this.child?.stdin.end();
+    this.child?.closeStdin();
     if (!this.stopMode) {
       this.stopMode = "terminate";
       this.stopCall ??= this.shutdown("terminate");
@@ -804,25 +839,16 @@ export class AgyStreamJsonTransport implements LiveTransport {
   }
 
   private signalGroup(signal: NodeJS.Signals): void {
-    const pid = this.child?.pid;
-    if (!pid || this.exitInfo) {
+    if (!this.child) {
       return;
     }
     this.hubSignalSent = true;
-    try {
-      process.kill(-pid, signal);
-    } catch {
-      try {
-        this.child?.kill(signal);
-      } catch {
-        // The group is already gone; the exit listener reports the truth.
-      }
-    }
+    this.child.signalGroup(signal);
   }
 
   private terminateAfterFailedOpen(): void {
     this.fatal = true;
-    this.child?.stdin.end();
+    this.child?.closeStdin();
     if (!this.stopMode) {
       this.stopMode = "terminate";
       this.stopCall ??= this.shutdown("terminate");
@@ -837,7 +863,8 @@ export class AgyStreamJsonTransport implements LiveTransport {
     if (!this.fatal) {
       this.setStatus("closing");
     }
-    this.child.stdin.end();
+    const child = this.child;
+    child.closeStdin();
 
     const waitForExit = async (ms: number): Promise<boolean> => {
       if (this.exitInfo) {
@@ -868,6 +895,20 @@ export class AgyStreamJsonTransport implements LiveTransport {
 
     if (!this.exitInfo) {
       return { status: "orphaned", exit_code: null, exit_signal: null, waited_ms: Date.now() - started };
+    }
+    // `closed` requires the leader exit AND proof the owned group is gone;
+    // a surviving helper gets one bounded SIGKILL sweep first.
+    if (child.groupAlive()) {
+      child.signalGroup("SIGKILL");
+      await child.proveGroupGone(GRACEFUL_EXIT_MS);
+    }
+    if (child.groupAlive()) {
+      return {
+        status: "orphaned",
+        exit_code: this.exitInfo.code,
+        exit_signal: this.exitInfo.signal,
+        waited_ms: Date.now() - started,
+      };
     }
     return {
       status: "closed",

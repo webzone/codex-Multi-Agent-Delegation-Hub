@@ -31,7 +31,9 @@ import type {
   LiveLaunchRequest,
   LiveTransportDescriptor,
   LiveTransportFactory,
+  PiResumeState,
   ProviderResumeState,
+  ResumeVerification,
 } from "../types.js";
 import { probePi } from "../probes/pi.js";
 import {
@@ -92,6 +94,26 @@ export class PiRpcTransport extends RpcSessionBase {
 
   protected resumeHandle(resume: ProviderResumeState): string | null {
     return resume.provider === "pi" ? resume.resume_token : null;
+  }
+
+  protected buildResumeState(
+    locator: string | null,
+    prior: ProviderResumeState | null,
+    verification: ResumeVerification,
+  ): PiResumeState {
+    // PI's opaque resume locator IS the observed session handle
+    // (`sessionFile` else `sessionId`) fed back to `switch_session`. It was
+    // never persisted before this launch observed it — the previous
+    // transport-side hole that made every PI restart start fresh.
+    const token =
+      locator ??
+      (prior?.provider === "pi" ? prior.resume_token : null);
+    return {
+      provider: "pi",
+      provider_session_id: locator,
+      ...verification,
+      resume_token: token,
+    };
   }
 
   protected async handshake(_request: LiveLaunchRequest): Promise<string | null> {

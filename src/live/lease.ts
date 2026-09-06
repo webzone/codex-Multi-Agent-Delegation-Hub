@@ -71,7 +71,6 @@ export interface LiveLeaseProbes {
 }
 
 export type LiveLeaseProviderStatus =
-  | { state: "none" }
   | { state: "dead" }
   | { state: "alive"; reapable: true }
   | { state: "uncertain"; reapable: false; reason: string };
@@ -393,7 +392,18 @@ export async function classifyLiveLease(
 
   let provider: LiveLeaseProviderStatus;
   if (lease.provider_pid === null) {
-    provider = { state: "none" };
+    // A null pid proves recorded ownership never landed — never provider
+    // death. A hub that died between lease creation and spawn and one that
+    // died after spawning without recording facts look identical here, so
+    // nothing may be inferred: the session goes to manual review and its
+    // worktree survives. The launch path records provider facts via
+    // `updateLiveLeaseProvider` the moment a process exists.
+    provider = {
+      state: "uncertain",
+      reapable: false,
+      reason:
+        "lease records no provider pid; provider liveness can be neither proven nor disproven, so nothing is assumed",
+    };
   } else if (probes.probePid(lease.provider_pid) === "dead") {
     provider = { state: "dead" };
   } else {

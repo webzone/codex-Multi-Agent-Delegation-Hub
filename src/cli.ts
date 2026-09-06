@@ -63,11 +63,13 @@ Session options (session create/resume):
 Live session (v3, live):
   --agent <p>          Live provider (omp, agy, pi, hermes); pi/hermes are
                        live-only and stay rejected by delegate/fanout/session
-  --resume <id>        Continue a durable live session (hub-live-id)
+  --resume <id>        Continue a durable live session (hub-live-id) from its
+                       chain head: fresh hub worktree at current_commit,
+                       verified provider resume identity, same live ref
   stdin: one Hub NDJSON command per line:
     {"action":"prompt"|"follow_up"|"steer","text":"..."} |
     {"action":"cancel","reason":"..."} | {"action":"status"} |
-    {"action":"permission_response","request_id":"...","decision":"allow_once|allow_session|deny","note":null} |
+    {"action":"permission_response","request_id":"...","decision":"allow_once|deny","note":null} |
     {"action":"close","terminate":false}
   stdout: NDJSON — {type:"session"|"event"|"result"|"error"|"close"} documents
   stderr: human-readable diagnostics

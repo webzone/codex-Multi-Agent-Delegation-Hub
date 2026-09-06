@@ -1,5 +1,5 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Readable, Writable } from "node:stream";
+
 
 import { ClientSideConnection, ndJsonStream } from "@zed-industries/agent-client-protocol";
 import type {
@@ -10,6 +10,7 @@ import type {
   SessionNotification,
 } from "@zed-industries/agent-client-protocol";
 
+import { launchLiveChild, type LiveChildHandle } from "../child-process.js";
 import { deferred, type Deferred } from "../../deferred.js";
 import type {
   HermesResumeState,
@@ -44,13 +45,14 @@ import { HERMES_ACP_ARGS, probeHermes, resolveHermesCommand } from "../probes/he
  * `session/load`, permitted only when the agent's own `initialize` response
  * advertised `loadSession` — otherwise launch fails instead of silently
  * starting fresh.
- *
  * Permission policy (binding):
  *   - headless sessions deny every `session/request_permission`;
  *   - interactive sessions wait for the hub's answer for at most
  *     `permission_timeout_ms` (default 60s), then deny;
- *   - only `allow_once` and `deny` are ever honored — an `allow_session`
- *     decision or an offered `allow_always` option is never auto-approved;
+ *   - v3 speaks exactly two verdicts: `allow_once` selects the agent's own
+ *     `allow_once` option (never another kind), `deny` selects `reject_once`
+ *     or cancels; `allow_always` is never selected, and any wider verdict is
+ *     rejected at the surface boundary before it can reach this transport;
  *   - a turn cancelled while a permission is pending answers `cancelled`.
  *
  * ACP v1 `session/prompt` responses carry no usage counters, so
@@ -187,7 +189,7 @@ export class HermesAcpTransport implements LiveTransport {
   private readonly options: HermesTransportOptions;
   private readonly permissionTimeoutMs: number;
   private request: LiveLaunchRequest | null = null;
-  private child: ChildProcessWithoutNullStreams | null = null;
+  private child: LiveChildHandle | null = null;
   private conn: ClientSideConnection | null = null;
   private sink: EventSink | null = null;
   private sessionId: string | null = null;
@@ -260,18 +262,30 @@ export class HermesAcpTransport implements LiveTransport {
       );
     }
 
-    const child = spawn(resolveHermesCommand(this.options), [...HERMES_ACP_ARGS], {
-      cwd: request.workspace,
-      env: this.options.environment ?? process.env,
-      shell: false,
-      stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
-    });
+    let child: LiveChildHandle;
+    try {
+      child = await launchLiveChild({
+        command: resolveHermesCommand(this.options),
+        args: [...HERMES_ACP_ARGS],
+        cwd: request.workspace,
+        env: this.options.environment,
+        maxStderrBytes: 64 * 1024,
+      });
+    } catch (error) {
+      throw new LiveTransportError(
+        liveError(
+          "launch",
+          "LIVE_ACP_SPAWN_FAILED",
+          `hermes process could not run: ${error instanceof Error ? error.message : String(error)}`,
+          true,
+        ),
+      );
+    }
     this.child = child;
 
     const stream = ndJsonStream(
-      Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
-      Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
+      Writable.toWeb(child.stdin as Writable) as WritableStream<Uint8Array>,
+      Readable.toWeb(child.stdout as Readable) as ReadableStream<Uint8Array>,
     );
     this.conn = new ClientSideConnection(
       (): Client => ({
@@ -283,24 +297,34 @@ export class HermesAcpTransport implements LiveTransport {
       stream,
     );
 
-    child.stderr.on("data", (chunk: Buffer | string) => {
-      for (const line of (typeof chunk === "string" ? chunk : chunk.toString("utf8")).split("\n")) {
+    child.onStderr((chunk) => {
+      for (const line of chunk.toString("utf8").split("\n")) {
         if (line.trim()) {
           this.emit({ kind: "log", level: "info", text: this.bound(line) });
         }
       }
     });
-    child.once("error", (error: Error) => {
-      this.exitInfo = { code: null, signal: null };
-      this.emit({ kind: "exit", intentional: false, exit_code: null, exit_signal: null });
-      this.emit({
-        kind: "error",
-        error: liveError("launch", "LIVE_ACP_SPAWN_FAILED", `hermes process could not run (${(error as NodeJS.ErrnoException).code ?? "unknown"})`, true),
-      });
-      this.fatal = true;
-      this.sink?.close();
-    });
-    child.once("exit", (code, signal) => this.handleExit(code, signal));
+    // Durable ownership boundary: the hub records the group leader BEFORE
+    // the ACP handshake can fail, so a rejected open() can never orphan a
+    // detached process whose pid was never written down.
+    if (request.report_process) {
+      try {
+        await request.report_process({ pid: child.pid, pgid: child.pgid });
+      } catch (error) {
+        const structured = liveError(
+          "launch",
+          "LIVE_OWNERSHIP_RECORDING_FAILED",
+          `the hub could not durably record ownership of the spawned provider (${error instanceof Error ? error.message : String(error)}); refusing to proceed with an unowned process`,
+          false,
+        );
+        this.emit({ kind: "error", error: structured });
+        this.fatal = true;
+        child.closeStdin();
+        void child.stop("terminate");
+        throw new LiveTransportError(structured);
+      }
+    }
+    void child.exited().then((info) => this.handleExit(info.exit_code, info.exit_signal));
 
     const launchedAt = new Date().toISOString();
     try {
@@ -374,7 +398,12 @@ export class HermesAcpTransport implements LiveTransport {
     }
 
     this.setStatus("idle");
-    return { pid: child.pid ?? null, provider_session_id: this.sessionId, launched_at: launchedAt };
+    return {
+      pid: child.pid,
+      provider_session_id: this.sessionId,
+      launched_at: launchedAt,
+      resume_state: this.resumeState(),
+    };
   }
 
   async send(command: LiveCommand): Promise<void> {
@@ -665,9 +694,6 @@ export class HermesAcpTransport implements LiveTransport {
       // An unoffered allow_once is never mapped onto some other option kind.
       response = allow ? { outcome: { outcome: "selected", optionId: allow.optionId } } : this.denyResponse(entry.options);
     } else {
-      if (decision === "allow_session") {
-        this.emit({ kind: "log", level: "warn", text: this.bound(`allow_session refused for ${requestId}: allow_always is never auto-approved; denying`) });
-      }
       response = this.denyResponse(entry.options);
     }
     entry.resolve(response);
@@ -691,7 +717,7 @@ export class HermesAcpTransport implements LiveTransport {
     this.answerPendingPermissions({ outcome: { outcome: "cancelled" } }, "protocol failure");
     this.emit({ kind: "error", error: liveError("protocol", code, message, false) });
     this.setStatus("error");
-    this.child?.stdin.end();
+    this.child?.closeStdin();
     if (!this.stopMode) {
       this.stopMode = "terminate";
       this.stopCall ??= this.shutdown("terminate");
@@ -727,24 +753,15 @@ export class HermesAcpTransport implements LiveTransport {
   }
 
   private signalGroup(signal: NodeJS.Signals): void {
-    const pid = this.child?.pid;
-    if (!pid || this.exitInfo) {
+    if (!this.child) {
       return;
     }
     this.hubSignalSent = true;
-    try {
-      process.kill(-pid, signal);
-    } catch {
-      try {
-        this.child?.kill(signal);
-      } catch {
-        // The group is already gone; the exit listener reports the truth.
-      }
-    }
+    this.child.signalGroup(signal);
   }
 
   private terminateAfterFailedOpen(): void {
-    this.child?.stdin.end();
+    this.child?.closeStdin();
     if (!this.stopMode) {
       this.stopMode = "terminate";
       this.stopCall ??= this.shutdown("terminate");
@@ -760,7 +777,8 @@ export class HermesAcpTransport implements LiveTransport {
     if (!this.fatal) {
       this.setStatus("closing");
     }
-    this.child.stdin.end();
+    const child = this.child;
+    child.closeStdin();
 
     const waitForExit = async (ms: number): Promise<boolean> => {
       if (this.exitInfo) {
@@ -788,6 +806,20 @@ export class HermesAcpTransport implements LiveTransport {
 
     if (!this.exitInfo) {
       return { status: "orphaned", exit_code: null, exit_signal: null, waited_ms: Date.now() - started };
+    }
+    // `closed` requires the leader exit AND proof the owned group is gone;
+    // a surviving helper gets one bounded SIGKILL sweep first.
+    if (child.groupAlive()) {
+      child.signalGroup("SIGKILL");
+      await child.proveGroupGone(GRACEFUL_EXIT_MS);
+    }
+    if (child.groupAlive()) {
+      return {
+        status: "orphaned",
+        exit_code: this.exitInfo.code,
+        exit_signal: this.exitInfo.signal,
+        waited_ms: Date.now() - started,
+      };
     }
     return {
       status: "closed",

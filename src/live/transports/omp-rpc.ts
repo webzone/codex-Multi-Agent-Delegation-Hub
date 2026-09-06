@@ -30,7 +30,9 @@ import type {
   LiveLaunchRequest,
   LiveTransportDescriptor,
   LiveTransportFactory,
+  OmpResumeState,
   ProviderResumeState,
+  ResumeVerification,
 } from "../types.js";
 import { probeOmp } from "../probes/omp.js";
 import {
@@ -100,6 +102,22 @@ export class OmpRpcTransport extends RpcSessionBase {
 
   protected resumeHandle(resume: ProviderResumeState): string | null {
     return resume.provider === "omp" ? resume.provider_session_id : null;
+  }
+
+  protected buildResumeState(
+    locator: string | null,
+    prior: ProviderResumeState | null,
+    verification: ResumeVerification,
+  ): OmpResumeState {
+    // OMP's durable locator is the `get_state` sessionFile echoed by the
+    // handshake; `switch_session` resolves that path. The replay cursor is
+    // the hub's own, carried across restarts.
+    return {
+      provider: "omp",
+      provider_session_id: locator,
+      ...verification,
+      last_event_seq: prior?.provider === "omp" ? prior.last_event_seq : 0,
+    };
   }
 
   protected async handshake(_request: LiveLaunchRequest): Promise<string | null> {

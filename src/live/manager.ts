@@ -4,13 +4,14 @@ import { dirname } from "node:path";
 import { deferred, type Deferred } from "../deferred.js";
 import { asDelegateError, AgentHubError } from "../errors.js";
 import { resolveRepositoryIdentity } from "../git.js";
-import { acquireRepositoryLock } from "../locks.js";
+import { acquireRepositoryLock, type RepositoryLock } from "../locks.js";
 import {
   classifyLiveLease,
   createLiveLease,
   defaultLiveLeaseProbes,
   hubProcessStartToken,
   listLiveLeases,
+  readLiveLease,
   reapOrphanedProvider,
   removeLiveLease,
   updateLiveLeaseProvider,
@@ -21,6 +22,8 @@ import { LiveEventRing, truncateUtf8 } from "./events.js";
 import {
   applyLiveTransition,
   liveRefFor,
+  LIVE_ADMIN_LOCK_NAME,
+  LIVE_SCHEMA_VERSION,
   loadLiveState,
   newLiveSessionId,
   withLiveLock,
@@ -33,6 +36,7 @@ import {
   removeLiveWorktree,
   type LiveWorktree,
 } from "./worktree.js";
+import type { RepositoryIdentity } from "../types.js";
 import type {
   CheckpointReason,
   LiveCancelCommand,
@@ -41,14 +45,17 @@ import type {
   LiveEvent,
   LiveFollowUpCommand,
   LiveLaunchRequest,
+  LivePermissionDecision,
   LivePermissionResponseCommand,
   LivePromptCommand,
   LiveProviderFactory,
   LiveProviderId,
+  LiveProviderProcessFacts,
   LiveSessionState,
   LiveSteerCommand,
   LiveStatus,
   LiveStatusCommand,
+  LiveStopMode,
   LiveStopReport,
   LiveTransport,
   LiveTransportFactory,
@@ -159,6 +166,20 @@ export interface LiveStartResult {
   state: LiveSessionState;
   workspace: string;
   capabilities: LiveSessionState["capabilities"];
+  /**
+   * Non-fatal integrity notes for an otherwise successful launch — today
+   * only a live-admin lock release that failed while every resource
+   * operation succeeded. Never dropped silently.
+   */
+  warnings?: { code: string; message: string }[];
+}
+
+export interface LiveResumeFromStateRequest {
+  /** Durable live session id whose terminal record is continued. */
+  live_session_id: string;
+  /** Optional transport pin; must pair with the durable record. */
+  transport?: LiveTransportId;
+  max_text_bytes?: number;
 }
 
 export interface LiveCloseResult {
@@ -189,6 +210,8 @@ interface ActiveTurn {
   error_seen: LiveTurnResult["error"];
   usage: LiveUsage | null;
   streams: Map<string, { chunks: string[]; truncated: boolean; final: boolean }>;
+  /** True when the command was already delivered to the provider (native queue hand-off). */
+  delivered: boolean;
 }
 
 interface QueuedFollowUp {
@@ -208,6 +231,13 @@ interface ManagedSession {
   prompt_accepted: boolean;
   turn: ActiveTurn | null;
   queue: QueuedFollowUp[];
+  /**
+   * Follow-ups already delivered to a `native` provider while a turn runs —
+   * the provider queued them; the hub only tracks the pending result and
+   * never re-sends. Honesty matters here: routing a native claim through the
+   * hub queue while still claiming `native` is a contract violation.
+   */
+  provider_queued: QueuedFollowUp[];
   queue_bytes: number;
   open_permissions: Set<string>;
   pump: Deferred<void>;
@@ -263,14 +293,176 @@ export class LiveSessionManager {
     const identity = await resolveRepositoryIdentity(repositoryCwd);
     const base = request.base ?? identity.head;
 
-    const adminLock = await (this.options.acquireLock ?? acquireRepositoryLock)({
-      commonDir,
-      name: "live-admin",
-      waitMs: 30_000,
+    const prepared = await this.reserveLaunchResources(liveSessionId, provider, base);
+    return this.launchSession({
+      liveSessionId,
+      provider,
+      sessionId: request.session_id ?? null,
+      identity,
+      base,
+      maxTextBytes: request.max_text_bytes ?? this.options.maxTextBytes,
+      resume: request.resume ?? null,
+      factory,
+      worktree: prepared.worktree,
+      lease: prepared.lease,
+      warnings: prepared.warnings,
     });
+  }
+
+  /**
+   * Continue the durable live record `live_session_id` from its chain head.
+   * Loads the durable record, refuses any session that is not terminal or
+   * still leased, acquires a NEW lease, materializes a fresh worktree at
+   * `current_commit`, launches the provider with the record's verified
+   * opaque resume state, verifies the provider identity round-tripped, and
+   * CAS-advances the EXISTING live ref/state (revision + 1) — the live ref
+   * namespace is never branched per restart.
+   */
+  async resumeFromState(request: LiveResumeFromStateRequest): Promise<LiveStartResult> {
+    const { commonDir, repositoryCwd } = this.options;
+    const liveSessionId = request.live_session_id;
+    if (this.sessions.has(liveSessionId)) {
+      throw new AgentHubError(
+        "LIVE_SESSION_ALREADY_LIVE",
+        `live session "${liveSessionId}" is already running in this hub process`,
+      );
+    }
+
+    const prior = await loadLiveState({ commonDir, repositoryCwd, liveSessionId });
+    if (!TERMINAL_STATUSES.includes(prior.status)) {
+      throw new AgentHubError(
+        "LIVE_SESSION_NOT_RESUMABLE",
+        `live session "${liveSessionId}" is "${prior.status}"; only terminal records (closed, error, orphaned) may be resumed`,
+      );
+    }
+    if ((await readLiveLease(commonDir, liveSessionId)) !== undefined) {
+      throw new AgentHubError(
+        "LIVE_LEASE_EXISTS",
+        `live session "${liveSessionId}" still holds a lease; run recovery (or release the lease) before resuming`,
+      );
+    }
+
+    const factory = this.selectFactory(prior.provider, request.transport ?? prior.transport);
+    if (factory.transport !== prior.transport) {
+      throw new AgentHubError(
+        "LIVE_TRANSPORT_PAIRING_INVALID",
+        `durable live session "${liveSessionId}" was launched on "${prior.transport}"; resuming on "${factory.transport}" is refused`,
+      );
+    }
+    const probe = await factory.probe();
+    if (!probe.found) {
+      throw new AgentHubError(
+        "LIVE_TRANSPORT_UNAVAILABLE",
+        `provider "${prior.provider}" was not found${probe.detail ? `: ${probe.detail}` : "; launching nothing rather than guessing"}`,
+      );
+    }
+
+    const prepared = await this.reserveLaunchResources(
+      liveSessionId,
+      prior.provider,
+      prior.current_commit,
+    );
+
+    const transport = factory.create();
+    let processFacts: LiveProviderProcessFacts | null = null;
+    let lease = prepared.lease;
+    try {
+      const report = await transport.open({
+        live_session_id: liveSessionId,
+        workspace: prepared.worktree.path,
+        max_text_bytes: request.max_text_bytes ?? this.options.maxTextBytes,
+        resume: prior.resume,
+        report_process: async (facts) => {
+          processFacts = facts;
+          lease = await this.recordProviderOwnership(lease, facts);
+        },
+      });
+
+      // Provider identity verification: a durable resume hint must come back
+      // as the same provider's session handle, verified by the transport's
+      // own evidence. A transport that cannot show the post-handshake resume
+      // state at all is refused — a silent fresh session would lie.
+      if (prior.resume !== null) {
+        const resumed = report.resume_state ?? null;
+        if (resumed === null || resumed === undefined) {
+          throw new AgentHubError(
+            "LIVE_RESUME_VERIFICATION_FAILED",
+            `the transport produced no post-handshake resume state for a durable resume of "${liveSessionId}"; continuing without verified provider identity is refused`,
+          );
+        }
+        if (resumed.provider !== prior.resume.provider) {
+          throw new AgentHubError(
+            "LIVE_RESUME_VERIFICATION_FAILED",
+            `resume state came back for provider "${resumed.provider}", not the recorded "${prior.resume.provider}"`,
+          );
+        }
+        if (
+          prior.resume.provider_session_id !== null &&
+          resumed.provider_session_id !== prior.resume.provider_session_id
+        ) {
+          throw new AgentHubError(
+            "LIVE_RESUME_VERIFICATION_FAILED",
+            `the provider resumed a different session identity than the durable handle records`,
+          );
+        }
+      }
+
+      const next: LiveSessionState = {
+        ...prior,
+        resume:
+          report.resume_state ??
+          this.initialResume(prior.provider, prior.resume, report.provider_session_id, prior.transport),
+        worktree_path: prepared.worktree.path,
+        worktree_parent: prepared.worktree.parentPath,
+        status: "idle",
+        revision: prior.revision + 1,
+        last_error: null,
+        updated_at: this.now().toISOString(),
+      };
+      await withLiveLock(
+        { commonDir, liveSessionId, acquireLock: this.options.acquireLock },
+        () =>
+          applyLiveTransition(
+            { commonDir, repositoryCwd },
+            {
+              kind: "advance",
+              live_session_id: liveSessionId,
+              ref: liveRefFor(liveSessionId),
+              expected_ref: prior.current_commit,
+              new_commit: prior.current_commit,
+              next_state: next,
+            },
+          ),
+      );
+
+      const session = this.registerSession(transport, lease, prepared.worktree, next);
+      void this.pumpLoop(session);
+      return {
+        live_session_id: liveSessionId,
+        state: session.state,
+        workspace: prepared.worktree.path,
+        capabilities: session.state.capabilities,
+        warnings: prepared.warnings.length > 0 ? prepared.warnings : undefined,
+      };
+    } catch (error) {
+      throw await this.conservativeLaunchFailure(transport, lease, prepared.worktree, processFacts, error);
+    }
+  }
+
+  /**
+   * Quotas + prune + `worktree add` + lease claim, all under the short
+   * live-admin lock — and nothing else. The lock is never held across a
+   * transport launch (handshakes are slow) nor for a session lifetime.
+   */
+  private async reserveLaunchResources(
+    liveSessionId: string,
+    provider: LiveProviderId,
+    base: string,
+  ): Promise<{ worktree: LiveWorktree; lease: LiveLeaseRecord; warnings: { code: string; message: string }[] }> {
+    const { commonDir, repositoryCwd } = this.options;
+    const adminLock = await this.acquireAdminLock();
+    const warnings: { code: string; message: string }[] = [];
     let worktree: LiveWorktree | null = null;
-    let lease: LiveLeaseRecord | null = null;
-    let registered = false;
     try {
       if (this.sessions.size >= this.options.processQuota) {
         throw new AgentHubError(
@@ -286,9 +478,8 @@ export class LiveSessionManager {
         );
       }
       await pruneLiveWorktrees(repositoryCwd);
-
       worktree = await createLiveWorktree(repositoryCwd, base, this.options.tmpRoot);
-      lease = await createLiveLease({
+      const lease = await createLiveLease({
         commonDir,
         live_session_id: liveSessionId,
         provider,
@@ -299,117 +490,261 @@ export class LiveSessionManager {
         hub_start_token: await hubProcessStartToken(this.probes),
         now: () => this.now(),
       });
-
-      const transport = factory.create();
-      let session: ManagedSession;
-      try {
-        const launchRequest: LiveLaunchRequest = {
-          live_session_id: liveSessionId,
-          workspace: worktree.path,
-          max_text_bytes: request.max_text_bytes ?? this.options.maxTextBytes,
-          resume: request.resume ?? null,
-        };
-        const report = await transport.open(launchRequest);
-        if (report.pid !== null) {
-          lease = await updateLiveLeaseProvider(
-            commonDir,
-            lease,
-            {
-              provider_pid: report.pid,
-              provider_pgid: report.pid,
-              provider_start_token: await this.probes.startToken(report.pid),
-            },
-            () => this.now(),
+      return { worktree, lease, warnings };
+    } catch (error) {
+      if (worktree !== null) {
+        const removal = await removeLiveWorktree(repositoryCwd, worktree);
+        if (removal.cleanup_error) {
+          throw new AgentHubError(
+            "LIVE_WORKTREE_RETAINED",
+            `${asDelegateError(error).message}; the fresh worktree at ${worktree.path} could not be removed (${removal.cleanup_error.message}) and its lease stays as the audit trail`,
           );
         }
-        const descriptor = await transport.describe();
-        const createdAt = this.now().toISOString();
-        const state: LiveSessionState = {
-          schema: 1,
-          live_session_id: liveSessionId,
-          session_id: request.session_id ?? null,
-          provider,
-          transport: descriptor.transport,
-          capabilities: descriptor.capabilities,
-          identity,
-          base_commit: base,
-          current_commit: base,
-          checkpoint_seq: 0,
-          resume: this.initialResume(
-            provider,
-            request.resume ?? null,
-            report.provider_session_id,
-            descriptor.transport,
-          ),
-          // `open` resolved ⇒ the transport is ready to accept commands;
-          // `starting` would describe this record only if the write itself
-          // were still in flight, which recovery re-derives from the lease.
-          status: "idle",
-          revision: 1,
-          last_error: null,
-          created_at: createdAt,
-          updated_at: createdAt,
-        };
-
-        await withLiveLock(
-          { commonDir, liveSessionId, acquireLock: this.options.acquireLock },
-          () =>
-            applyLiveTransition(
-              { commonDir, repositoryCwd },
-              {
-                kind: "create",
-                live_session_id: liveSessionId,
-                ref: liveRefFor(liveSessionId),
-                expected_ref: null,
-                new_commit: base,
-                next_state: state,
-              },
-            ),
-        );
-
-        session = {
-          id: liveSessionId,
-          transport,
-          lease,
-          worktree,
-          state,
-          ring: new LiveEventRing(),
-          status: "idle",
-          prompt_accepted: false,
-          turn: null,
-          queue: [],
-          queue_bytes: 0,
-          open_permissions: new Set(),
-          pump: deferred<void>(),
-          closing: false,
-          torn_down: false,
-          durable_tail: Promise.resolve(),
-        };
-        this.sessions.set(liveSessionId, session);
-        registered = true;
-        void this.pumpLoop(session);
-      } catch (error) {
-        // Transport-side failure after the lease exists: prove the process is
-        // gone, then undo everything the lease stands for.
-        await transport.stop("terminate").catch(() => undefined);
-        throw error;
       }
+      throw error;
+    } finally {
+      try {
+        await adminLock.release();
+      } catch (releaseError) {
+        warnings.push({
+          code: "LIVE_ADMIN_LOCK_RELEASE_FAILED",
+          message: `worktree resources were claimed but the live-admin lock was not released cleanly: ${asDelegateError(releaseError).message}`,
+        });
+      }
+    }
+  }
 
+  private async launchSession(input: {
+    liveSessionId: string;
+    provider: LiveProviderId;
+    sessionId: string | null;
+    identity: RepositoryIdentity;
+    base: string;
+    maxTextBytes: number;
+    resume: ProviderResumeState | null;
+    factory: LiveTransportFactory;
+    worktree: LiveWorktree;
+    lease: LiveLeaseRecord;
+    warnings: { code: string; message: string }[];
+  }): Promise<LiveStartResult> {
+    const { commonDir, repositoryCwd } = this.options;
+    const { liveSessionId, provider, worktree } = input;
+    const transport = input.factory.create();
+    let processFacts: LiveProviderProcessFacts | null = null;
+    let lease = input.lease;
+    try {
+      const launchRequest: LiveLaunchRequest = {
+        live_session_id: liveSessionId,
+        workspace: worktree.path,
+        max_text_bytes: input.maxTextBytes,
+        resume: input.resume,
+        report_process: async (facts) => {
+          processFacts = facts;
+          lease = await this.recordProviderOwnership(lease, facts);
+        },
+      };
+      const report = await transport.open(launchRequest);
+      const descriptor = await transport.describe();
+      const createdAt = this.now().toISOString();
+      const state: LiveSessionState = {
+        schema: LIVE_SCHEMA_VERSION,
+        live_session_id: liveSessionId,
+        session_id: input.sessionId,
+        provider,
+        transport: descriptor.transport,
+        capabilities: descriptor.capabilities,
+        identity: input.identity,
+        base_commit: input.base,
+        current_commit: input.base,
+        checkpoint_seq: 0,
+        last_checkpoint_reason: null,
+        worktree_path: worktree.path,
+        worktree_parent: worktree.parentPath,
+        resume:
+          report.resume_state ??
+          this.initialResume(provider, input.resume, report.provider_session_id, descriptor.transport),
+        // `open` resolved ⇒ the transport is ready to accept commands;
+        // `starting` would describe this record only if the write itself
+        // were still in flight, which recovery re-derives from the lease.
+        status: "idle",
+        revision: 1,
+        last_error: null,
+        created_at: createdAt,
+        updated_at: createdAt,
+      };
+
+      await withLiveLock(
+        { commonDir, liveSessionId, acquireLock: this.options.acquireLock },
+        () =>
+          applyLiveTransition(
+            { commonDir, repositoryCwd },
+            {
+              kind: "create",
+              live_session_id: liveSessionId,
+              ref: liveRefFor(liveSessionId),
+              expected_ref: null,
+              new_commit: input.base,
+              next_state: state,
+            },
+          ),
+      );
+
+      const session = this.registerSession(transport, lease, worktree, state);
+      void this.pumpLoop(session);
       return {
         live_session_id: liveSessionId,
         state: session.state,
         workspace: worktree.path,
         capabilities: session.state.capabilities,
+        warnings: input.warnings.length > 0 ? input.warnings : undefined,
       };
+    } catch (error) {
+      throw await this.conservativeLaunchFailure(transport, lease, worktree, processFacts, error);
+    }
+  }
+
+  /**
+   * The awaited process-owned boundary: provider facts land on the lease the
+   * moment the transport has a spawned process, before any handshake can
+   * fail. `pgid` is recorded as observed (not assumed from the pid).
+   */
+  private async recordProviderOwnership(
+    lease: LiveLeaseRecord,
+    facts: LiveProviderProcessFacts,
+  ): Promise<LiveLeaseRecord> {
+    return updateLiveLeaseProvider(
+      this.options.commonDir,
+      lease,
+      {
+        provider_pid: facts.pid,
+        provider_pgid: facts.pgid,
+        provider_start_token: await this.probes.startToken(facts.pid),
+      },
+      () => this.now(),
+    );
+  }
+
+  /**
+   * A launch that rejected after spawning may only give its resources back
+   * when `stop` PROVES the complete owned group is dead. Otherwise the lease
+   * (now carrying the provider facts), the worktree, and the recorded
+   * ownership metadata are all RETAINED, and the error says so — recovery
+   * or a human finishes the job that cannot be proven safe here.
+   */
+  private async conservativeLaunchFailure(
+    transport: LiveTransport,
+    lease: LiveLeaseRecord,
+    worktree: LiveWorktree,
+    processFacts: LiveProviderProcessFacts | null,
+    cause: unknown,
+  ): Promise<AgentHubError> {
+    const failure = asDelegateError(cause);
+    let stop: LiveStopReport;
+    try {
+      stop = await transport.stop("terminate");
+    } catch (stopError) {
+      // Stop trouble never proves the process is gone.
+      stop = {
+        status: "orphaned",
+        exit_code: null,
+        exit_signal: null,
+        waited_ms: 0,
+      };
+      void stopError;
+    }
+
+    if (processFacts !== null && stop.status !== "closed") {
+      return new AgentHubError(
+        failure.code,
+        `${failure.message}; the provider process (pid ${processFacts.pid}, group ${processFacts.pgid}) could not be proven gone, so its lease, the worktree at ${worktree.path}, and the recorded ownership facts are retained for recovery or manual cleanup`,
+      );
+    }
+
+    const cleanupErrors = await this.releaseLaunchResources(lease, worktree);
+    if (cleanupErrors.length > 0) {
+      return new AgentHubError(
+        "LIVE_WORKTREE_RETAINED",
+        `${failure.message}; cleanup reported: ${cleanupErrors.map((e) => e.message).join("; ")} — the lease stays as the audit trail for whatever remains`,
+      );
+    }
+    return new AgentHubError(failure.code, failure.message);
+  }
+
+  /** Worktree removal (under the live-admin lock) then lease release. */
+  private async releaseLaunchResources(
+    lease: LiveLeaseRecord,
+    worktree: LiveWorktree,
+  ): Promise<{ code: string; message: string }[]> {
+    const errors: { code: string; message: string }[] = [];
+    const adminLock = await this.acquireAdminLock().catch((error) => {
+      errors.push(asDelegateError(error));
+      return null;
+    });
+    try {
+      const removal = await removeLiveWorktree(this.options.repositoryCwd, worktree);
+      if (removal.cleanup_error) {
+        errors.push(removal.cleanup_error);
+      }
     } finally {
-      if (lease !== null && !registered) {
-        await removeLiveLease(commonDir, liveSessionId, lease.token).catch(() => undefined);
-        if (worktree !== null) {
-          await removeLiveWorktree(repositoryCwd, worktree).catch(() => undefined);
+      if (adminLock !== null) {
+        try {
+          await adminLock.release();
+        } catch (releaseError) {
+          errors.push({
+            code: "LIVE_ADMIN_LOCK_RELEASE_FAILED",
+            message: `worktree operations finished but the live-admin lock release failed: ${asDelegateError(releaseError).message}`,
+          });
         }
       }
-      await adminLock.release().catch(() => undefined);
     }
+    if (errors.length > 0) {
+      // The lease is the audit trail: it survives whenever the resources it
+      // names are not provably gone.
+      return errors;
+    }
+    try {
+      await removeLiveLease(this.options.commonDir, lease.live_session_id, lease.token);
+    } catch (error) {
+      errors.push(asDelegateError(error));
+    }
+    return errors;
+  }
+
+  private async acquireAdminLock(): Promise<RepositoryLock> {
+    return (this.options.acquireLock ?? acquireRepositoryLock)({
+      commonDir: this.options.commonDir,
+      name: LIVE_ADMIN_LOCK_NAME,
+      waitMs: 30_000,
+    });
+  }
+
+  private registerSession(
+    transport: LiveTransport,
+    lease: LiveLeaseRecord,
+    worktree: LiveWorktree,
+    state: LiveSessionState,
+  ): ManagedSession {
+    const session: ManagedSession = {
+      id: state.live_session_id,
+      transport,
+      lease,
+      worktree,
+      state,
+      ring: new LiveEventRing(),
+      status: "idle",
+      prompt_accepted: false,
+      turn: null,
+      queue: [],
+      provider_queued: [],
+      queue_bytes: 0,
+      open_permissions: new Set(),
+      pump: deferred<void>(),
+      closing: false,
+      torn_down: false,
+      durable_tail: Promise.resolve(),
+    };
+    this.sessions.set(session.id, session);
+    return session;
   }
 
   private selectFactory(
@@ -600,10 +935,11 @@ export class LiveSessionManager {
     const result = deferred<LiveTurnResult>();
 
     if (session.turn !== null || session.status === "running") {
-      if (session.queue.length >= LIVE_FOLLOW_UP_QUEUE_MAX_MESSAGES) {
+      const pendingCount = session.queue.length + session.provider_queued.length;
+      if (pendingCount >= LIVE_FOLLOW_UP_QUEUE_MAX_MESSAGES) {
         throw new AgentHubError(
           "LIVE_QUEUE_FULL",
-          `live session "${id}" already queues ${LIVE_FOLLOW_UP_QUEUE_MAX_MESSAGES} follow-ups`,
+          `live session "${id}" already has ${LIVE_FOLLOW_UP_QUEUE_MAX_MESSAGES} follow-ups pending (hub- and provider-queued together)`,
         );
       }
       if (session.queue_bytes + bytes > LIVE_FOLLOW_UP_QUEUE_MAX_BYTES) {
@@ -611,6 +947,24 @@ export class LiveSessionManager {
           "LIVE_QUEUE_FULL",
           `queued bytes would cross ${LIVE_FOLLOW_UP_QUEUE_MAX_BYTES} with a ${bytes}-byte message`,
         );
+      }
+      if (claim.support === "native") {
+        // Capability honesty: a `native` claim means the PROVIDER queues
+        // next-turn input mid-run. The hub delivers immediately and tracks
+        // the pending result; it must never route the text through its own
+        // queue while still claiming `native`.
+        try {
+          await session.transport.send(command);
+        } catch (error) {
+          const failure = asDelegateError(error);
+          throw new AgentHubError(
+            failure.code,
+            `live follow-up delivery failed: ${failure.message}`,
+          );
+        }
+        session.provider_queued.push({ command, bytes, result });
+        session.queue_bytes += bytes;
+        return result.promise;
       }
       session.queue.push({ command, bytes, result });
       session.queue_bytes += bytes;
@@ -630,6 +984,7 @@ export class LiveSessionManager {
     session: ManagedSession,
     command: LivePromptCommand | LiveFollowUpCommand,
     result: Deferred<LiveTurnResult> = deferred<LiveTurnResult>(),
+    alreadyDelivered = false,
   ): Promise<LiveTurnResult> {
     session.turn = {
       command,
@@ -640,7 +995,11 @@ export class LiveSessionManager {
       error_seen: null,
       usage: null,
       streams: new Map(),
+      delivered: alreadyDelivered,
     };
+    if (alreadyDelivered) {
+      return result.promise;
+    }
     try {
       await session.transport.send(command);
     } catch (error) {
@@ -738,10 +1097,18 @@ export class LiveSessionManager {
   async respondPermission(
     id: string,
     requestId: string,
-    decision: "allow_once" | "allow_session" | "deny",
+    decision: LivePermissionDecision,
     note: string | null,
   ): Promise<LiveTurnResult> {
     const session = this.must(id);
+    // v3 accepts exactly `allow_once` and `deny`. Anything else is a caller
+    // error surfaced as such — never silently converted into a deny.
+    if (decision !== "allow_once" && decision !== "deny") {
+      throw new AgentHubError(
+        "LIVE_COMMAND_INVALID",
+        `permission decision "${String(decision)}" is outside the v3 vocabulary (allow_once, deny)`,
+      );
+    }
     if (session.state.capabilities.permission_response.support === "unsupported") {
       return this.refused(session, "permission_response");
     }
@@ -780,6 +1147,15 @@ export class LiveSessionManager {
       );
     }
     return { events: replay.events, next_cursor: replay.next_cursor };
+  }
+
+  /** The newest stamped cursor for a session (for expiry resynchronization). */
+  eventCursor(id: string): number {
+    const session = this.sessions.get(id);
+    if (!session) {
+      throw new AgentHubError("LIVE_SESSION_NOT_FOUND", `no live session "${id}" in this hub process`);
+    }
+    return session.ring.nextSeq - 1;
   }
 
   /** The authoritative durable mirror for a live session. */
@@ -968,6 +1344,9 @@ export class LiveSessionManager {
       ...current,
       current_commit: advanced ? capture.checkpoint.commit : current.current_commit,
       checkpoint_seq: advanced ? current.checkpoint_seq + 1 : current.checkpoint_seq,
+      // The reason belongs to the chain head: only a capture that actually
+      // pinned a new commit records its reason.
+      last_checkpoint_reason: advanced ? reason : current.last_checkpoint_reason,
       status: options.statusOverride ?? session.status,
       revision: current.revision + 1,
       last_error: options.lastError !== undefined ? options.lastError : current.last_error,
@@ -1061,22 +1440,30 @@ export class LiveSessionManager {
     };
     turn.result.resolve(result);
 
-    // The queue drains only toward another turn.
+    // The queue drains only toward another turn. A provider-queued follow-up
+    // was ALREADY delivered (the native claim promised immediate delivery):
+    // it becomes the tracked next turn without re-sending; hub-queued items
+    // are delivered now that the terminal boundary has arrived.
     if (
       outcome !== "unsupported" &&
       !session.closing &&
       !session.torn_down &&
       session.turn === null &&
-      session.queue.length > 0
+      session.provider_queued.length + session.queue.length > 0
     ) {
-      const nextItem = session.queue.shift() as QueuedFollowUp;
+      const fromProviderQueue = session.provider_queued.length > 0;
+      const nextItem = (
+        fromProviderQueue ? session.provider_queued : session.queue
+      ).shift() as QueuedFollowUp;
       session.queue_bytes -= nextItem.bytes;
-      void this.dispatchTurn(session, nextItem.command, nextItem.result).catch((error) => {
-        const failure = asDelegateError(error);
-        nextItem.result.resolve(
-          this.failedResult(session, nextItem.command, failure.code, failure.message),
-        );
-      });
+      void this.dispatchTurn(session, nextItem.command, nextItem.result, fromProviderQueue).catch(
+        (error) => {
+          const failure = asDelegateError(error);
+          nextItem.result.resolve(
+            this.failedResult(session, nextItem.command, failure.code, failure.message),
+          );
+        },
+      );
     }
     return result;
   }
@@ -1159,8 +1546,9 @@ export class LiveSessionManager {
     await this.teardown(session);
   }
 
-  /** Orderly shutdown requested by the caller. */
-  async close(id: string): Promise<LiveCloseResult> {
+  /** Orderly shutdown requested by the caller. `terminate` skips the
+   * unproven graceful attempt and goes straight to bounded escalation. */
+  async close(id: string, mode: LiveStopMode = "graceful"): Promise<LiveCloseResult> {
     const session = this.sessions.get(id);
     if (!session) {
       throw new AgentHubError("LIVE_SESSION_NOT_FOUND", `no live session "${id}" in this hub process`);
@@ -1180,8 +1568,8 @@ export class LiveSessionManager {
       "LIVE_SESSION_CLOSING",
       "the live session was closed before the queued follow-up ran",
     );
-    let stop = await session.transport.stop("graceful");
-    if (stop.status !== "closed") {
+    let stop = await session.transport.stop(mode);
+    if (stop.status !== "closed" && mode === "graceful") {
       stop = await session.transport.stop("terminate");
     }
     await this.options.observePhase?.("transport-stopped");
@@ -1281,29 +1669,24 @@ export class LiveSessionManager {
 
   private async failQueued(session: ManagedSession, code: string, message: string): Promise<void> {
     const queued = session.queue.splice(0, session.queue.length);
+    const providerQueued = session.provider_queued.splice(0, session.provider_queued.length);
     session.queue_bytes = 0;
-    for (const item of queued) {
+    for (const item of [...queued, ...providerQueued]) {
+      // Provider-queued follow-ups reached the provider but will never see a
+      // terminal boundary here; their caller-visible future still settles.
       item.result.resolve(this.failedResult(session, item.command, code, message));
     }
   }
 
   /**
    * Lease is the last thing to go: while a worktree or resource survives, the
-   * lease keeps its audit trail and blocks double-ownership. Pruning is NOT
-   * done here — it races with concurrent `worktree add`; `start` and `recover`
-   * prune while holding the live-admin lock.
+   * lease keeps its audit trail and blocks double-ownership. The worktree
+   * removal runs under the same short live-admin lock as every other worktree
+   * mutation; pruning is NOT done here — it races with concurrent
+   * `worktree add`; the launch path prunes while holding the lock.
    */
   private async teardown(session: ManagedSession): Promise<{ code: string; message: string }[]> {
-    const errors: { code: string; message: string }[] = [];
-    const removal = await removeLiveWorktree(this.options.repositoryCwd, session.worktree);
-    if (removal.cleanup_error) {
-      errors.push(removal.cleanup_error);
-    }
-    try {
-      await removeLiveLease(this.options.commonDir, session.id, session.lease.token);
-    } catch (error) {
-      errors.push(asDelegateError(error));
-    }
+    const errors = await this.releaseLaunchResources(session.lease, session.worktree);
     this.sessions.delete(session.id);
     session.torn_down = true;
     return errors;
@@ -1428,6 +1811,7 @@ export class LiveSessionManager {
               ...current,
               current_commit: advanced ? capture.checkpoint.commit : current.current_commit,
               checkpoint_seq: advanced ? current.checkpoint_seq + 1 : current.checkpoint_seq,
+              last_checkpoint_reason: advanced ? "crash_recovery" : current.last_checkpoint_reason,
               status: "orphaned",
               revision: current.revision + 1,
               last_error: {
@@ -1498,18 +1882,37 @@ export class LiveSessionManager {
       }
 
       // Teardown strictly after the durable rewrite; the lease is released
-      // last so its audit trail outlives every resource it named.
+      // last so its audit trail outlives every resource it named. The
+      // worktree removal runs under the same short live-admin lock as every
+      // other worktree mutation. A cleanup that is NOT proven keeps the
+      // lease and names the surviving path — it is never reported as clean.
       let detail = action.detail;
       if (action.worktreePath !== null) {
-        const removal = await removeLiveWorktree(repositoryCwd, {
-          path: action.worktreePath,
-          parentPath: dirname(action.worktreePath),
-          // `removeLiveWorktree` never reads `base` and recovery does not
-          // re-derive it; the empty string keeps the record honest.
-          base: "",
+        const adminLock = await this.acquireAdminLock().catch((error) => {
+          detail = `${detail}; worktree cleanup refused: ${asDelegateError(error).message}; lease retained`;
+          return null;
         });
-        if (removal.cleanup_error) {
-          detail = `${detail}; worktree cleanup reported: ${removal.cleanup_error.message}`;
+        if (adminLock !== null) {
+          try {
+            const removal = await removeLiveWorktree(repositoryCwd, {
+              path: action.worktreePath,
+              parentPath: dirname(action.worktreePath),
+              // `removeLiveWorktree` never reads `base` and recovery does not
+              // re-derive it; the empty string keeps the record honest.
+              base: "",
+            });
+            if (removal.cleanup_error) {
+              detail = `${detail}; worktree cleanup reported: ${removal.cleanup_error.message}; lease retained as the audit trail for ${action.worktreePath}`;
+              report.sessions.push({ live_session_id: lease.live_session_id, outcome: action.kind, detail });
+              continue;
+            }
+          } finally {
+            try {
+              await adminLock.release();
+            } catch (lockReleaseError) {
+              detail = `${detail}; live-admin lock release: ${asDelegateError(lockReleaseError).message}`;
+            }
+          }
         }
       }
       try {

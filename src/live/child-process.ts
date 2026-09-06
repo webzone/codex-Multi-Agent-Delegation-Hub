@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import type { Readable, Writable } from "node:stream";
 
 import { deferred } from "../deferred.js";
 import { AgentHubError } from "../errors.js";
@@ -21,8 +22,8 @@ import type { LiveStopMode, LiveStopReport } from "./types.js";
  *     truncated*, never relied on for termination proof;
  *   - exit is *observed* (the `exit`/`close` events), never inferred from a
  *     quiet stdout or a vanished socket.
- *
- * `stop` reports `closed` only with an observed exit, and `orphaned` honestly
+ * `stop` reports `closed` only when the leader exit has been observed AND
+ * (on POSIX) the owned process group is proven gone, and `orphaned` honestly
  * otherwise. `terminate` mode authorizes bounded SIGKILL escalation of the
  * group; graceful mode stops at SIGTERM and reports survival instead of
  * pretending.
@@ -59,8 +60,14 @@ export interface LiveChildHandle {
   readonly pgid: number;
   /** Command used to launch, for lease/audit display. */
   readonly command: string;
+  /** Raw stdout pipe (same stream the `onStdout` sinks read from). */
+  readonly stdout: Readable | null;
+  /** Raw stdin pipe; transports may also use `writeStdin`/`closeStdin`. */
+  readonly stdin: Writable | null;
   /** Attach the transport's stdout consumer. Chunk order is stream order. */
   onStdout(sink: StdoutSink): void;
+  /** Attach an additional stderr consumer; capture+drain runs regardless. */
+  onStderr(sink: StdoutSink): void;
   writeStdin(data: string): Promise<void>;
   closeStdin(): void;
   /** Captured stderr text (bounded); the truncation flag is observable. */
@@ -70,14 +77,27 @@ export interface LiveChildHandle {
   readonly exitInfo: LiveChildExitInfo | null;
   /** Resolves exactly once, when the exit has been observed. */
   exited(): Promise<LiveChildExitInfo>;
-  /** Signal the whole group. False once exit was observed (or ESRCH proves gone). */
+  /**
+   * Whether any member of the owned group is still signal-reachable. False
+   * only when the OS proves the group is gone (ESRCH). Always false on
+   * platforms without POSIX process groups (the leader-exit proof is then
+   * the only proof available, and `stop` reports it honestly).
+   */
+  groupAlive(): boolean;
+  /** Signal the whole group. False when the signal cannot be delivered. */
   signalGroup(signal: NodeJS.Signals): boolean;
+  /** Resolves true once `groupAlive()` is false; false when it never was. */
+  proveGroupGone(timeoutMs: number): Promise<boolean>;
   stop(mode: LiveStopMode, options?: LiveChildStopOptions): Promise<LiveStopReport>;
 }
 
 const DEFAULT_GRACE_MS = 5_000;
 const DEFAULT_KILL_WAIT_MS = 5_000;
 const POLL_INTERVAL_MS = 25;
+
+/** POSIX process-group signalling is unavailable on Windows; there `stop`
+ * falls back to leader-exit proof alone and says so through `groupAlive`. */
+export const SUPPORTS_GROUP_SIGNALS = process.platform !== "win32";
 
 function sleep(ms: number): Promise<void> {
   const { promise, resolve } = deferred<void>();
@@ -128,9 +148,13 @@ export function launchLiveChild(spec: LiveChildSpec): Promise<LiveChildHandle> {
   });
 
   const stderrChunks: Buffer[] = [];
+  const stderrSinks: StdoutSink[] = [];
   let stderrBytes = 0;
   let stderrTruncated = false;
   child.stderr?.on("data", (chunk: Buffer) => {
+    for (const sink of stderrSinks) {
+      sink(chunk);
+    }
     if (stderrBytes >= spec.maxStderrBytes) {
       stderrTruncated = true;
       return;
@@ -191,8 +215,17 @@ export function launchLiveChild(spec: LiveChildSpec): Promise<LiveChildHandle> {
       return pid();
     },
     command: spec.command,
+    get stdout(): Readable | null {
+      return child.stdout ?? null;
+    },
+    get stdin(): Writable | null {
+      return child.stdin ?? null;
+    },
     onStdout(sink): void {
       stdoutSinks.push(sink);
+    },
+    onStderr(sink): void {
+      stderrSinks.push(sink);
     },
     writeStdin(data): Promise<void> {
       const stdin = child.stdin;
@@ -238,18 +271,51 @@ export function launchLiveChild(spec: LiveChildSpec): Promise<LiveChildHandle> {
     exited(): Promise<LiveChildExitInfo> {
       return exitDeferred.promise;
     },
-    signalGroup(signal): boolean {
-      if (exitInfo !== null) {
+    groupAlive(): boolean {
+      if (!SUPPORTS_GROUP_SIGNALS || child.pid === undefined) {
         return false;
       }
       try {
-        // Negative pid targets the whole group. ESRCH means the group is
-        // already gone; EPERM means unreachable — neither is ever treated as
-        // proof of death; only the observed exit is.
+        process.kill(-pid(), 0);
+        return true;
+      } catch (error) {
+        // Only ESRCH proves the group gone; EPERM proves presence with
+        // unreachable ownership, which is never treated as absence.
+        return (error as NodeJS.ErrnoException).code !== "ESRCH";
+      }
+    },
+    signalGroup(signal): boolean {
+      if (!SUPPORTS_GROUP_SIGNALS) {
+        // No group semantics on this platform: the leader alone gets the
+        // signal, and `stop` reports leader-exit proof without group proof.
+        try {
+          child.kill(signal);
+          return true;
+        } catch {
+          return false;
+        }
+      }
+      try {
+        // Negative pid targets the whole group — including helpers that
+        // outlived the leader. ESRCH means the group is already gone; EPERM
+        // means unreachable — neither is ever treated as proof of death;
+        // only the observed exit plus a group probe is.
         process.kill(-pid(), signal);
         return true;
       } catch {
         return false;
+      }
+    },
+    async proveGroupGone(timeoutMs): Promise<boolean> {
+      const deadline = Date.now() + Math.max(0, timeoutMs);
+      for (;;) {
+        if (!handle.groupAlive()) {
+          return true;
+        }
+        if (Date.now() >= deadline) {
+          return false;
+        }
+        await sleep(POLL_INTERVAL_MS);
       }
     },
     async stop(mode, options): Promise<LiveStopReport> {
@@ -280,6 +346,23 @@ export function launchLiveChild(spec: LiveChildSpec): Promise<LiveChildHandle> {
           status: "orphaned",
           exit_code: null,
           exit_signal: null,
+          waited_ms: Date.now() - started,
+        };
+      }
+
+      // Leader reaped is not enough: `closed` additionally requires proof the
+      // whole owned group is gone. A helper that outlived its leader gets one
+      // bounded SIGKILL sweep; survival is reported as `orphaned`, never
+      // assumed dead.
+      if (SUPPORTS_GROUP_SIGNALS && handle.groupAlive()) {
+        handle.signalGroup("SIGKILL");
+        await handle.proveGroupGone(killWaitMs);
+      }
+      if (SUPPORTS_GROUP_SIGNALS && handle.groupAlive()) {
+        return {
+          status: "orphaned",
+          exit_code: observed.exit_code,
+          exit_signal: observed.exit_signal,
           waited_ms: Date.now() - started,
         };
       }

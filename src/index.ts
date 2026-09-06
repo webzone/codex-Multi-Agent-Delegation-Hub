@@ -25,44 +25,46 @@ export * from "./competition.js";
 export * from "./session.js";
 export * from "./state.js";
 
-// v3 — Package 4: live surfaces (CLI `agent-hub live`, MCP `live_session_*`)
-// on the Gate 0 live contract. The live vocabulary is separate: legacy
-// `supportedAgents` stays `omp, agy, grok`; `supportedLiveAgents` adds
-// `pi`/`hermes` for live sessions only.
+// v3 — live surfaces (CLI `agent-hub live`, MCP `live_session_*`). The live
+// vocabulary is separate: legacy `supportedAgents` stays `omp, agy, grok`;
+// `supportedLiveAgents` adds `pi`/`hermes` for live sessions only. The
+// authoritative production manager is the core `LiveSessionManager`; the
+// surfaces build it per workspace through `createLiveManager`, which registers
+// all four real transports and wires the durable live-state reader.
 export {
   assertLiveSessionState,
+  createLiveManager,
+  durableLiveResumeSource,
   getLiveResumeSource,
   isLiveProvider,
   isTerminalLiveStatus,
-  LIVE_DEFAULT_EVENT_BUFFER,
   LIVE_DEFAULT_MAX_TEXT_BYTES,
-  LIVE_MAX_SESSIONS,
   LIVE_TRANSPORT_PAIRINGS,
-  liveSessionManager,
   liveTransportRegistry,
   LiveSessionManager,
   LiveTransportRegistry,
   probeLiveAgent,
+  productionTransportFactories,
   registerLiveTransport,
+  registerProductionLiveTransports,
   runLiveSession,
   setLiveResumeSource,
   supportedLiveAgents,
-  unwiredLiveResumeSource,
   validateLiveCapabilities,
+  wireDurableLiveResumeSource,
 } from "./live/index.js";
 export type {
-  LiveCloseReport,
-  LiveEventPage,
+  CreateLiveManagerOptions,
+  LiveCloseResult,
   LiveIo,
   LiveLaunchInvocation,
+  LiveManagerOptions,
   LiveProbeDocument,
-  LiveResumeRequest,
+  LiveResumeFromStateRequest,
   LiveResumeSource,
   LiveRunnerDependencies,
-  LiveSessionManagerOptions,
-  LiveSessionSummary,
   LiveStartRequest,
-  LiveTurnCommand,
+  LiveStartResult,
 } from "./live/index.js";
 
 // v3 — the Gate 0 live contract types (identity, commands, events, durable
@@ -88,10 +90,14 @@ export type {
   LiveProbeResult,
   LiveProviderFactory,
   LiveProviderId,
+  LiveProviderProcessFacts,
   LiveSessionState,
+  CheckpointReason,
   LiveStatus,
   LiveStopMode,
   LiveStopReport,
+  ProviderResumeState,
+  ResumeVerification,
   LiveTransport,
   LiveTransportDescriptor,
   LiveTransportFactory,

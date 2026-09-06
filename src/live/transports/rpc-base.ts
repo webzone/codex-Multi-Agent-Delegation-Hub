@@ -27,9 +27,9 @@
  *     tolerated as a `provider_notice` log event (kind + label only, never
  *     raw content).
  */
-import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { AgentHubError } from "../../errors.js";
+import { launchLiveChild } from "../child-process.js";
 import type {
   LiveBoundedText,
   LiveCommand,
@@ -90,73 +90,61 @@ export interface RpcWireExit {
 /** The narrow child-process surface the base needs — nothing else reaches through. */
 export interface RpcWireHandle {
   readonly pid: number;
+  /**
+   * Process group the hub owns (equals `pid` for the detached group leaders
+   * `spawnRpcWire` launches). Optional only for injected test wires.
+   */
+  readonly pgid?: number;
   onData(next: (chunk: Buffer) => void): void;
   /** Writes one outbound record; the caller supplies the trailing LF. */
   write(line: string): void;
   endStdin(): void;
+  /** Signals the whole owned group when the wire is group-owned. */
   signal(signal: NodeJS.Signals): void;
   readonly exited: Promise<RpcWireExit>;
+  /** Resolves true once the owned group is proven gone (ESRCH). */
+  proveGroupGone?(timeoutMs: number): Promise<boolean>;
 }
 
 export type RpcWireSpawner = (argv: readonly string[], cwd: string) => Promise<RpcWireHandle>;
 
-/** Launch argv arrays, `shell:false`, piped stdio — the production spawner. */
+/** Bound on captured provider stderr; excess is marked, never stored. */
+const WIRE_STDERR_BYTES = 64 * 1024;
+
+/** Launch argv arrays, `shell:false`, detached group leader via the shared
+ * primitive — the production spawner. Stderr is continuously drained there,
+ * so a chatty provider can never deadlock on a full pipe. */
 export const spawnRpcWire: RpcWireSpawner = async (argv, cwd) => {
   const [command, ...args] = argv;
   if (!command) {
     throw new Error("rpc wire spawner requires a non-empty argv");
   }
-  const child = spawn(command, args, {
-    cwd,
-    env: process.env,
-    shell: false,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-
-  let settled = false;
-  let resolveExit: (exit: RpcWireExit) => void = () => {};
-  const exited = new Promise<RpcWireExit>((resolve) => {
-    resolveExit = resolve;
-  });
-
-  child.once("error", () => {
-    if (!settled) {
-      settled = true;
-      resolveExit({ exitCode: null, exitSignal: null });
-    }
-  });
-  child.once("close", (exitCode, exitSignal) => {
-    if (!settled) {
-      settled = true;
-      resolveExit({ exitCode, exitSignal });
-    }
-  });
-
-  if (child.pid === undefined) {
-    throw new Error(`failed to spawn ${command}`);
-  }
-  const pid = child.pid;
-  const stdin = child.stdin;
-  const stdout = child.stdout;
-  if (!stdin || !stdout) {
-    throw new Error(`failed to pipe stdio for ${command}`);
-  }
-
+  const child = await launchLiveChild({ command, args, cwd, maxStderrBytes: WIRE_STDERR_BYTES });
+  const exited = child.exited().then((info) => ({
+    exitCode: info.exit_code,
+    exitSignal: info.exit_signal,
+  }));
   return {
-    pid,
+    pid: child.pid,
+    pgid: child.pgid,
     onData(next) {
-      stdout.on("data", (chunk: Buffer) => next(chunk));
+      child.onStdout(next);
     },
     write(line) {
-      stdin.write(line);
+      // Delivery failure surfaces through the command timeout or the exit
+      // observation, never as an unhandled stream error.
+      child.writeStdin(line).catch(() => undefined);
     },
     endStdin() {
-      stdin.end();
+      child.closeStdin();
     },
     signal(signal) {
-      child.kill(signal);
+      child.signalGroup(signal);
     },
     exited,
+    async proveGroupGone(timeoutMs) {
+      return child.proveGroupGone(timeoutMs);
+    },
   };
 };
 
@@ -316,6 +304,18 @@ export abstract class RpcSessionBase implements LiveTransport {
    */
   protected abstract resumeHandle(resume: ProviderResumeState): string | null;
 
+  /**
+   * Build the durable-ready resume state from what this launch actually
+   * observed. `verification` is the transport's own evidence: a verified
+   * round trip only when `runResume` proved the locator echo, never because
+   * a flag was accepted.
+   */
+  protected abstract buildResumeState(
+    locator: string | null,
+    prior: ProviderResumeState | null,
+    verification: ResumeVerification,
+  ): ProviderResumeState;
+
   // -- LiveTransport --------------------------------------------------------
 
   async open(request: LiveLaunchRequest): Promise<LiveLaunchReport> {
@@ -345,7 +345,30 @@ export abstract class RpcSessionBase implements LiveTransport {
       this.wire = wire;
       wire.onData((chunk) => this.ingest(chunk));
       void wire.exited.then((exit) => this.onExit(exit));
+      // Durable ownership boundary: the hub records the spawned process
+      // BEFORE any handshake can fail, so a launch that later rejects can
+      // never leave an unowned process behind.
+      if (request.report_process) {
+        try {
+          await request.report_process({ pid: wire.pid, pgid: wire.pgid ?? wire.pid });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw await this.failLaunch(
+            liveError(
+              this.provider,
+              "LIVE_OWNERSHIP_RECORDING_FAILED",
+              `the hub could not durably record ownership of the spawned provider (${message}); refusing to proceed with an unowned process`,
+              "launch",
+              false,
+            ),
+            true,
+          );
+        }
+      }
     } catch (error) {
+      if (error instanceof LiveTransportError) {
+        throw error;
+      }
       const message = error instanceof Error ? error.message : String(error);
       throw await this.failLaunch(
         liveError(this.provider, "LIVE_LAUNCH_SPAWN_FAILED", `failed to spawn the provider process (${message})`, "launch", true),
@@ -383,6 +406,11 @@ export abstract class RpcSessionBase implements LiveTransport {
       pid: this.wire?.pid ?? null,
       provider_session_id: this.providerSessionId,
       launched_at: new Date().toISOString(),
+      resume_state: this.buildResumeState(
+        this.providerSessionId,
+        request.resume,
+        this.resumeVerification ?? { verified: false, verified_via: null },
+      ),
     };
   }
 
@@ -589,10 +617,20 @@ export abstract class RpcSessionBase implements LiveTransport {
       this.currentStatus = "orphaned";
       return { status: "orphaned", exit_code: null, exit_signal: null, waited_ms: waitedMs };
     }
-    // `onExit` (attached first) records the exit event and terminal status;
-    // `closed` is reported only with that proof.
+    // `onExit` (attached first) records the exit event and terminal status.
+    // `closed` additionally requires proof the whole owned group is gone —
+    // a provider helper that outlived its leader keeps shutdown `orphaned`.
+    if (wire.proveGroupGone && !(await wire.proveGroupGone(this.shutdownGraceMs))) {
+      this.currentStatus = "orphaned";
+      return {
+        status: "orphaned",
+        exit_code: exit.exitCode,
+        exit_signal: exit.exitSignal,
+        waited_ms: Date.now() - startedAt,
+      };
+    }
     await this.pumpSettled;
-    return { status: "closed", exit_code: exit.exitCode, exit_signal: exit.exitSignal, waited_ms: waitedMs };
+    return { status: "closed", exit_code: exit.exitCode, exit_signal: exit.exitSignal, waited_ms: Date.now() - startedAt };
   }
 
   // -- Frame ingest -----------------------------------------------------------

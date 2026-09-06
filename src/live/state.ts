@@ -9,6 +9,7 @@ import { runProcess } from "../process.js";
 import { zeroOidFor } from "../state.js";
 import type { RepositoryIdentity } from "../types.js";
 import type {
+  CheckpointReason,
   LiveCapabilities,
   LiveCapabilityClaim,
   LiveCapabilityName,
@@ -28,8 +29,8 @@ import type {
  * ever reads (v1 fan-out refs, v2 `refs/agent-hub/sessions` and
  * `agent-hub/sessions` stay untouched and unread by this module):
  *
- *   <common>/agent-hub/live/<id>.json            state record (schema 1)
- *   <common>/agent-hub/live/<id>.pending.json    pending transaction sidecar
+ *   <common>/agent-hub/live/sessions/<id>.json         state record (schema agent-hub-live/v1)
+ *   <common>/agent-hub/live/sessions/<id>.pending.json pending transaction sidecar
  *   refs/agent-hub/live/<id>                     live checkpoint chain ref
  *   <common>/agent-hub/locks/live-<id>.lock      per-session short-op lock
  *   <common>/agent-hub/locks/live-admin.lock     create/launch worktree lock
@@ -58,8 +59,9 @@ import type {
  */
 
 export const LIVE_STATE_SUBDIR = join("agent-hub", "live");
+export const LIVE_SESSIONS_SUBDIR = join("agent-hub", "live", "sessions");
 export const LIVE_REF_NAMESPACE = "refs/agent-hub/live";
-export const LIVE_SCHEMA_VERSION = 1;
+export const LIVE_SCHEMA_VERSION = "agent-hub-live/v1" as const;
 export const LIVE_ADMIN_LOCK_NAME = "live-admin";
 
 const LIVE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -108,8 +110,18 @@ const CAPABILITY_NAMES: readonly LiveCapabilityName[] = [
   "resume",
   "checkpoint",
   "usage_reporting",
-];
+] as const;
+
 const SUPPORT_VALUES = ["native", "hub-queued", "derived", "signal", "unsupported"] as const;
+
+const CHECKPOINT_REASONS: readonly CheckpointReason[] = [
+  "turn_end",
+  "requested",
+  "cancel",
+  "close",
+  "error",
+  "crash_recovery",
+];
 
 export type LiveTransitionKind = "create" | "advance";
 
@@ -179,7 +191,7 @@ export function newLiveSessionId(): string {
 
 function liveFileBase(commonDir: string, liveSessionId: string): string {
   liveRefFor(liveSessionId); // Shape gate for every path derived below.
-  return join(liveStateRoot(commonDir), liveSessionId);
+  return join(liveStateRoot(commonDir), "sessions", liveSessionId);
 }
 
 export function liveStatePath(commonDir: string, liveSessionId: string): string {
@@ -494,6 +506,30 @@ export function parseLiveSessionState(value: unknown): LiveSessionState | null {
   if ((value.checkpoint_seq as number) === 0 && currentCommit !== baseCommit) {
     return null;
   }
+  const lastCheckpointReason =
+    value.last_checkpoint_reason === null
+      ? null
+      : CHECKPOINT_REASONS.includes(value.last_checkpoint_reason as CheckpointReason)
+        ? (value.last_checkpoint_reason as CheckpointReason)
+        : undefined;
+  if (lastCheckpointReason === undefined) {
+    return null;
+  }
+  if ((value.checkpoint_seq as number) === 0 ? lastCheckpointReason !== null : lastCheckpointReason === null) {
+    return null;
+  }
+  const worktreePath = nonEmptyString(value.worktree_path);
+  const worktreeParent = nonEmptyString(value.worktree_parent);
+  if (
+    !worktreePath ||
+    !worktreeParent ||
+    !isAbsolute(worktreePath) ||
+    !isAbsolute(worktreeParent) ||
+    worktreePath === worktreeParent ||
+    !worktreePath.startsWith(`${worktreeParent}/`)
+  ) {
+    return null;
+  }
   const resume = parseResume(value.resume);
   if (resume === undefined) {
     return null;
@@ -525,6 +561,9 @@ export function parseLiveSessionState(value: unknown): LiveSessionState | null {
     base_commit: baseCommit,
     current_commit: currentCommit,
     checkpoint_seq: value.checkpoint_seq as number,
+    last_checkpoint_reason: lastCheckpointReason,
+    worktree_path: worktreePath,
+    worktree_parent: worktreeParent,
     resume,
     status: value.status as LiveStatus,
     revision: value.revision as number,

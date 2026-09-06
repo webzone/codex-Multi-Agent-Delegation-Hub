@@ -173,7 +173,7 @@ export function assertLiveSessionState(value: unknown): asserts value is LiveSes
   }
   const record = value as Partial<LiveSessionState>;
   if (
-    record.schema !== 1 ||
+    record.schema !== "agent-hub-live/v1" ||
     typeof record.live_session_id !== "string" ||
     record.live_session_id.length === 0 ||
     (record.session_id !== null && typeof record.session_id !== "string") ||
@@ -182,11 +182,15 @@ export function assertLiveSessionState(value: unknown): asserts value is LiveSes
     typeof record.capabilities !== "object" ||
     record.capabilities === null ||
     typeof record.status !== "string" ||
-    typeof record.revision !== "number"
+    !Number.isInteger(record.revision) ||
+    typeof record.worktree_path !== "string" ||
+    record.worktree_path.length === 0 ||
+    typeof record.worktree_parent !== "string" ||
+    record.worktree_parent.length === 0
   ) {
     throw new AgentHubError(
       "LIVE_STATE_INVALID",
-      "live session state does not match the Gate 0 durable record shape",
+      "live session state does not match the frozen agent-hub-live/v1 durable record shape",
     );
   }
   // Provider-specific resume handles may never disagree with the record's own
