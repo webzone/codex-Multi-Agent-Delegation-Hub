@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { access, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -45,7 +45,13 @@ import type {
   LiveTransportFactory,
   LiveTurnResult,
 } from "../src/live/types.js";
-import { createGitRepository, removeDirectory, resolveRef, runGit } from "./helpers.js";
+import {
+  BLOCKED_WRITE_IS_MEANINGFUL,
+  createGitRepository,
+  removeDirectory,
+  resolveRef,
+  runGit,
+} from "./helpers.js";
 import {
   realProcessAlive,
   runLeaderFirstSurvivorScenario,
@@ -248,6 +254,8 @@ interface HarnessConfig {
   leaseProbes?: LiveLeaseProbes;
   acquireLock?: LiveManagerOptions["acquireLock"];
   phases?: LiveManagerPhase[];
+  /** When set, the durable ordering seam throws (once) at this phase. */
+  failPhase?: LiveManagerPhase;
 }
 
 interface Harness {
@@ -266,6 +274,16 @@ async function harness(config: HarnessConfig = {}): Promise<Harness> {
     () => new FakeTransport(config.caps ?? fullCapabilities(), config.transportOptions),
   );
   const phases = config.phases;
+  const seam = (): ((phase: LiveManagerPhase) => Promise<void>) => {
+    let failed = false;
+    return async (phase) => {
+      if (!failed && phase === config.failPhase) {
+        failed = true;
+        throw new AgentHubError("INJECTED_DURABLE_FAILURE", `injected failure at ${phase}`);
+      }
+      phases?.push(phase);
+    };
+  };
   const manager = new LiveSessionManager({
     commonDir: identity.common_dir,
     repositoryCwd: repository,
@@ -276,11 +294,7 @@ async function harness(config: HarnessConfig = {}): Promise<Harness> {
     tmpRoot,
     leaseProbes: config.leaseProbes ?? fakeProbes(),
     acquireLock: config.acquireLock,
-    observePhase: phases
-      ? async (phase) => {
-          phases.push(phase);
-        }
-      : undefined,
+    observePhase: phases || config.failPhase ? seam() : undefined,
   });
   return { repository, commonDir: identity.common_dir, tmpRoot, manager, factory };
 }
@@ -1614,5 +1628,449 @@ describe("process-group child ownership", () => {
       }),
     );
     expect(failure?.code).toBe("LIVE_CHILD_SPAWN_FAILED");
+  });
+
+  it("owns provider stdin EPIPE as a structured LIVE_CHILD_STDIN_CLOSED, never an uncaught hub error", async () => {
+    // A trap stands in for Node's default crash-on-uncaught behavior: with
+    // the fix nothing lands in it; before the fix the unowned stream
+    // 'error' emission lands here and the assertion fails.
+    const uncaught: unknown[] = [];
+    const trap = (error: unknown): void => {
+      uncaught.push(error);
+    };
+    process.on("uncaughtException", trap);
+    try {
+      // A provider that closes its stdin and then lives until signaled —
+      // exactly the shape of a real agent that stops reading input.
+      // closeSync(0) provably closes the pipe's read end (a not-yet-started
+      // stdin stream's destroy() leaves the fd open), so the hub's next
+      // write is guaranteed to EPIPE.
+      const child = await launchLiveChild({
+        command: process.execPath,
+        args: [
+          "-e",
+          "require(\"fs\").closeSync(0); console.log(\"ready\"); setInterval(() => {}, 1000);",
+        ],
+        cwd: "/",
+        maxStderrBytes: 64,
+      });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          let seen = "";
+          const fallback = setTimeout(() => reject(new Error(`provider never announced readiness (${seen})`)), 5_000);
+          child.onStdout((chunk) => {
+            seen += chunk.toString("utf8");
+            if (seen.includes("ready")) {
+              clearTimeout(fallback);
+              resolve();
+            }
+          });
+        });
+        // The pipe's read end is provably gone: this write must EPIPE.
+        await expectCode(child.writeStdin("ping\n"), "LIVE_CHILD_STDIN_CLOSED");
+        // Every later write is refused structured, without touching the stream.
+        await expectCode(child.writeStdin("again\n"), "LIVE_CHILD_STDIN_CLOSED");
+
+        // Observation pipes may fail too; the hub owns those errors as well.
+        child.stdout?.destroy(new Error("injected stdout failure"));
+        child.stderr?.destroy(new Error("injected stderr failure"));
+        await tick();
+        await tick();
+        expect(uncaught).toEqual([]);
+
+        // Shutdown and exit observation remain fully operational.
+        const stop = await child.stop("terminate", { graceMs: 2_000, killWaitMs: 2_000 });
+        expect(stop.status).toBe("closed");
+        expect(child.exitInfo?.intentional).toBe(true);
+      } finally {
+        await child.stop("terminate", { graceMs: 50, killWaitMs: 2_000 });
+      }
+    } finally {
+      process.off("uncaughtException", trap);
+    }
+  }, 20_000);
+});
+
+// ---------------------------------------------------------------------------
+// Durable failure: every accepted turn settles exactly once
+// ---------------------------------------------------------------------------
+
+describe("durable failure settlement", () => {
+  const sessionsDirOf = (commonDir: string): string =>
+    join(commonDir, "agent-hub", "live", "sessions");
+
+  async function spinUntil(condition: () => Promise<boolean>, message: string): Promise<void> {
+    for (let spin = 0; !(await condition()); spin += 1) {
+      if (spin > 50_000) {
+        throw new Error(message);
+      }
+      await tick();
+    }
+  }
+
+  const runningMirror = (scope: Harness, liveSessionId: string): Promise<void> =>
+    spinUntil(
+      async () => (await scope.manager.view(liveSessionId)).status === "running",
+      "the running-status mirror write never landed",
+    );
+
+  // Each test `await`s the turn promises: a hang surfaces as the test timeout
+  // (the pre-fix behavior), and an outcome other than `failed` fails the
+  // assertion. Neither is allowed; success would be a lie.
+
+  it("checkpoint/commit-phase failure: prompt fails, queued follow-up fails undispached, resources retained", async () => {
+    const phases: LiveManagerPhase[] = [];
+    const scope = await harness({
+      caps: hubQueuedFollowUps,
+      transportOptions: writingTransportOptions,
+      phases,
+      failPhase: "checkpoint-captured",
+    });
+    const { live_session_id, workspace } = await startSession(scope.manager);
+    const t = scope.factory.created[0];
+
+    const first = scope.manager.prompt(live_session_id, "one");
+    t.push({ kind: "status", status: "running", note: null });
+    await runningMirror(scope, live_session_id);
+    const second = scope.manager.followUp(live_session_id, "two");
+
+    // The terminal boundary now hits the injected durable failure.
+    t.push({ kind: "status", status: "idle", note: null });
+
+    const result = await first;
+    expect(result.outcome).toBe("failed");
+    expect(result.checkpoint).toBeNull();
+    expect(result.error?.code).toBe("INJECTED_DURABLE_FAILURE");
+    expect(result.error?.stage).toBe("state");
+
+    const queued = await second;
+    expect(queued.outcome).toBe("failed");
+    expect(queued.error?.code).toBe("INJECTED_DURABLE_FAILURE");
+
+    // A broken chain fails the queue, it never dispatches from it.
+    expect(t.commands.filter((c) => c.kind === "follow_up")).toHaveLength(0);
+
+    // The best-effort honest rewrite lands: the record says `error` with the
+    // durable failure — and still carries NO checkpoint the chain never took.
+    // `state-advanced` is pushed strictly after the state file is committed,
+    // so waiting on it deterministically also guarantees the file is readable.
+    await spinUntil(
+      async () => phases.includes("state-advanced"),
+      "the best-effort durable error rewrite never landed",
+    );
+    const durable = await durableState(scope.commonDir, live_session_id);
+    expect(durable.last_error).toMatchObject({ code: "INJECTED_DURABLE_FAILURE", stage: "state" });
+    expect(durable.checkpoint_seq).toBe(0);
+    // Exactly the honest rewrite ran; no checkpoint phase was ever recorded.
+    expect(phases).toEqual(["state-advanced"]);
+    const names = await readdir(sessionsDirOf(scope.commonDir));
+    expect(names.filter((name) => name.endsWith(".pending.json"))).toEqual([]);
+
+    // Safety unproven ⇒ nothing released; the degraded session refuses work.
+    expect(scope.manager.activeCount).toBe(1);
+    expect(await leasesOf(scope.commonDir)).toHaveLength(1);
+    await access(workspace);
+    await expectCode(scope.manager.followUp(live_session_id, "three"), "LIVE_SESSION_NOT_LIVE");
+
+    await settle(scope);
+  });
+
+  it("live-ref CAS divergence: the turn fails with LIVE_STATE_INCONSISTENT; the concurrent ref stands", async () => {
+    const scope = await harness({
+      caps: hubQueuedFollowUps,
+      transportOptions: writingTransportOptions,
+    });
+    const { live_session_id } = await startSession(scope.manager);
+    const t = scope.factory.created[0];
+
+    const first = scope.manager.prompt(live_session_id, "one");
+    t.push({ kind: "status", status: "running", note: null });
+    await runningMirror(scope, live_session_id);
+    const second = scope.manager.followUp(live_session_id, "two");
+
+    // A concurrent mover pins the live ref somewhere else; the hub's CAS
+    // must refuse it, never overwrite it.
+    await writeFile(join(scope.repository, "external.txt"), "external\n");
+    await runGit(scope.repository, ["add", "external.txt"]);
+    await runGit(scope.repository, ["commit", "-qm", "external commit"]);
+    const external = (await runGit(scope.repository, ["rev-parse", "HEAD"])).trim();
+    await runGit(scope.repository, [
+      "update-ref",
+      `refs/agent-hub/live/${live_session_id}`,
+      external,
+    ]);
+
+    t.push({ kind: "status", status: "idle", note: null });
+    const result = await first;
+    expect(result.outcome).toBe("failed");
+    expect(result.error?.code).toBe("LIVE_STATE_INCONSISTENT");
+    expect(result.checkpoint).toBeNull();
+
+    const queued = await second;
+    expect(queued.outcome).toBe("failed");
+    expect(queued.error?.code).toBe("LIVE_STATE_INCONSISTENT");
+    expect(t.commands.filter((c) => c.kind === "follow_up")).toHaveLength(0);
+
+    // The externally-moved ref stays put; the record never moved; the lease
+    // and worktree stay for recovery.
+    expect(await resolveRef(scope.repository, `refs/agent-hub/live/${live_session_id}`)).toBe(
+      external,
+    );
+    const durable = await durableState(scope.commonDir, live_session_id);
+    expect(durable.status).toBe("running"); // last honestly committed mirror
+    expect(durable.checkpoint_seq).toBe(0);
+    expect(await leasesOf(scope.commonDir)).toHaveLength(1);
+    await settle(scope);
+  });
+
+  it.skipIf(!BLOCKED_WRITE_IS_MEANINGFUL)("state-record write failure: turns fail, the record stays at its last committed truth", async () => {
+    const scope = await harness({
+      caps: hubQueuedFollowUps,
+      transportOptions: writingTransportOptions,
+    });
+    const { live_session_id, workspace } = await startSession(scope.manager);
+    const t = scope.factory.created[0];
+    const sessionsDir = sessionsDirOf(scope.commonDir);
+
+    const first = scope.manager.prompt(live_session_id, "one");
+    t.push({ kind: "status", status: "running", note: null });
+    await runningMirror(scope, live_session_id);
+    const second = scope.manager.followUp(live_session_id, "two");
+
+    // The durable state directory itself refuses writes (real EACCES).
+    await chmod(sessionsDir, 0o500);
+    try {
+      t.push({ kind: "status", status: "idle", note: null });
+      const result = await first;
+      expect(result.outcome).toBe("failed");
+      expect(result.error?.code).toBe("LIVE_STATE_WRITE_FAILED");
+      expect(result.checkpoint).toBeNull();
+
+      const queued = await second;
+      expect(queued.outcome).toBe("failed");
+      expect(queued.error?.code).toBe("LIVE_STATE_WRITE_FAILED");
+      expect(t.commands.filter((c) => c.kind === "follow_up")).toHaveLength(0);
+
+      expect(await leasesOf(scope.commonDir)).toHaveLength(1);
+      await access(workspace);
+    } finally {
+      await chmod(sessionsDir, 0o755);
+    }
+
+    const durable = await durableState(scope.commonDir, live_session_id);
+    expect(durable.status).toBe("running"); // last honest mirror
+    const names = await readdir(sessionsDir);
+    expect(names.filter((name) => name.endsWith(".pending.json"))).toEqual([]);
+    await settle(scope);
+  });
+
+  it.skipIf(!BLOCKED_WRITE_IS_MEANINGFUL)("proven close over a broken state write: honest failure, retained resources, no closed lie", async () => {
+    const scope = await harness();
+    const { live_session_id, workspace } = await startSession(scope.manager);
+    await chmod(sessionsDirOf(scope.commonDir), 0o500);
+    try {
+      const closed = await scope.manager.close(live_session_id);
+      // The shutdown proof stands, but nothing was committed and nothing
+      // was torn down: the close reports its own failure.
+      expect(closed.stop?.status).toBe("closed");
+      expect(closed.checkpoint_taken).toBe(false);
+      expect(closed.cleanup_errors.map((error) => error.code)).toContain("LIVE_STATE_WRITE_FAILED");
+      expect(await leasesOf(scope.commonDir)).toHaveLength(1);
+      await access(workspace);
+    } finally {
+      await chmod(sessionsDirOf(scope.commonDir), 0o755);
+    }
+    const durable = await durableState(scope.commonDir, live_session_id);
+    expect(durable.status).toBe("idle"); // the record never claimed closed
+    await settle(scope);
+  });
+
+  it("crash whose ordering seam fails: the taken-over turn still settles once as failed, conservatively orphaned", async () => {
+    const phases: LiveManagerPhase[] = [];
+    const scope = await harness({
+      transportOptions: writingTransportOptions,
+      phases,
+      failPhase: "transport-stopped",
+    });
+    const { live_session_id } = await startSession(scope.manager);
+    const t = scope.factory.created[0];
+
+    const first = scope.manager.prompt(live_session_id, "hot work");
+    t.push({ kind: "status", status: "running", note: null });
+    t.push({ kind: "exit", intentional: false, exit_code: 137, exit_signal: null });
+
+    const result = await first;
+    expect(result.outcome).toBe("failed");
+    expect(result.exit_code).toBe(137);
+    expect(t.stopCalls).toEqual(["terminate"]);
+
+    // The seam aborted crash handling right after the stop: the session is
+    // conservatively orphaned (the stop report is abandoned), pinned by the
+    // best-effort honest rewrite, and nothing is torn down. `state-advanced`
+    // is pushed strictly after the rewrite commits — await that, not the file.
+    await spinUntil(
+      async () => phases.includes("state-advanced"),
+      "the conservative orphan rewrite never landed",
+    );
+    const durable = await durableState(scope.commonDir, live_session_id);
+    expect(durable.last_error).toMatchObject({ code: "INJECTED_DURABLE_FAILURE" });
+    expect(durable.checkpoint_seq).toBe(0);
+    expect(phases).toEqual(["state-advanced"]);
+    expect(await leasesOf(scope.commonDir)).toHaveLength(1);
+    await settle(scope);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Caller-worktree allow_dirty contract
+// ---------------------------------------------------------------------------
+
+describe("caller worktree allow_dirty contract", () => {
+  it("refuses untracked local changes by default, claiming nothing", async () => {
+    const scope = await harness();
+    await writeFile(join(scope.repository, "scratch.txt"), "mine\n");
+    await expectCode(scope.manager.start({ provider: "omp" }), "DIRTY_WORKTREE");
+    expect(await leasesOf(scope.commonDir)).toEqual([]);
+    expect(await readdir(scope.tmpRoot)).toEqual([]);
+    await settle(scope);
+  });
+
+  it("refuses tracked local changes by default, launching nothing", async () => {
+    const scope = await harness();
+    await writeFile(join(scope.repository, "README.md"), "uncommitted caller work\n");
+    await expectCode(scope.manager.start({ provider: "omp" }), "DIRTY_WORKTREE");
+    expect(scope.factory.created).toHaveLength(0);
+    await settle(scope);
+  });
+
+  it("allow_dirty starts from committed HEAD and never copies caller changes", async () => {
+    const scope = await harness();
+    await writeFile(join(scope.repository, "scratch.txt"), "mine\n");
+    await writeFile(join(scope.repository, "README.md"), "uncommitted caller work\n");
+
+    const started = await scope.manager.start({ provider: "omp", allow_dirty: true });
+    const identity = await resolveRepositoryIdentity(scope.repository);
+    expect(started.state.base_commit).toBe(identity.head);
+    expect((await runGit(started.workspace, ["rev-parse", "HEAD"])).trim()).toBe(identity.head);
+    // Committed HEAD content only — the caller's uncommitted state never
+    // crosses into the isolated live worktree.
+    expect(await readFile(join(started.workspace, "README.md"), "utf8")).toBe("initial\n");
+    await expect(access(join(started.workspace, "scratch.txt"))).rejects.toThrow();
+    await settle(scope);
+  });
+
+  it("resumeFromState applies the same gate; allow_dirty resumes at the committed chain head", async () => {
+    const scope = await harness();
+    const started = await startSession(scope.manager);
+    const closed = await scope.manager.close(started.live_session_id);
+    expect(closed.state.status).toBe("closed");
+
+    const resumable = new LiveSessionManager({
+      commonDir: scope.commonDir,
+      repositoryCwd: scope.repository,
+      transportFactories: [
+        new FakeTransportFactory(() => new FakeTransport(fullCapabilities(), { resumeState: "echo" })),
+      ],
+      providerFactories: [ompProviderFactory],
+      tmpRoot: scope.tmpRoot,
+      leaseProbes: fakeProbes(),
+    });
+
+    await writeFile(join(scope.repository, "scratch.txt"), "mine\n");
+    await expectCode(
+      resumable.resumeFromState({ live_session_id: started.live_session_id }),
+      "DIRTY_WORKTREE",
+    );
+    expect(await leasesOf(scope.commonDir)).toHaveLength(0);
+
+    const resumed = await resumable.resumeFromState({
+      live_session_id: started.live_session_id,
+      allow_dirty: true,
+    });
+    expect(resumed.state.status).toBe("idle");
+    expect(await readFile(join(resumed.workspace, "README.md"), "utf8")).toBe("initial\n");
+    await expect(access(join(resumed.workspace, "scratch.txt"))).rejects.toThrow();
+
+    await resumable.closeAll();
+    await settle(scope);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Permission policy contract
+// ---------------------------------------------------------------------------
+
+describe("permission policy contract", () => {
+  it("defaults to deny and threads the explicit policy into the provider launch", async () => {
+    const scope = await harness();
+    await startSession(scope.manager);
+    expect(scope.factory.created[0].launch?.permission_policy).toBe("deny");
+    await settle(scope);
+
+    const interactive = await harness();
+    await interactive.manager.start({ provider: "omp", permission_policy: "interactive" });
+    expect(interactive.factory.created[0].launch?.permission_policy).toBe("interactive");
+    await settle(interactive);
+  });
+
+  it("resume launches with the requested policy, defaulting to deny", async () => {
+    const scope = await harness();
+    const started = await startSession(scope.manager);
+    await scope.manager.close(started.live_session_id);
+
+    const factory = new FakeTransportFactory(
+      () => new FakeTransport(fullCapabilities(), { resumeState: "echo" }),
+    );
+    const resumable = new LiveSessionManager({
+      commonDir: scope.commonDir,
+      repositoryCwd: scope.repository,
+      transportFactories: [factory],
+      providerFactories: [ompProviderFactory],
+      tmpRoot: scope.tmpRoot,
+      leaseProbes: fakeProbes(),
+    });
+    await resumable.resumeFromState({
+      live_session_id: started.live_session_id,
+      permission_policy: "interactive",
+    });
+    expect(factory.created[0].launch?.permission_policy).toBe("interactive");
+
+    // Close, then resume again with no policy: the default re-applies deny.
+    const closedAgain = await resumable.closeAll();
+    expect(closedAgain[0]?.state.status).toBe("closed");
+    await resumable.resumeFromState({ live_session_id: started.live_session_id });
+    expect(factory.created[1].launch?.permission_policy).toBe("deny");
+
+    await resumable.closeAll();
+    await settle(scope);
+  });
+
+  it("keeps capability truth representable under deny: claims pass through untouched", async () => {
+    const scope = await harness();
+    const started = await scope.manager.start({ provider: "omp", permission_policy: "deny" });
+    // Deny mode may not rewrite the evidence-backed claim the transport made.
+    expect(started.capabilities.permission_response).toEqual({
+      support: "native",
+      evidence: "fake rpc accepted",
+    });
+    const t = scope.factory.created[0];
+    t.push({
+      kind: "permission_request",
+      request_id: "req-1",
+      tool: "write",
+      summary: { text: "overwrite README", truncated: false },
+    });
+    await tick();
+    const answered = await scope.manager.respondPermission(
+      started.live_session_id,
+      "req-1",
+      "deny",
+      null,
+    );
+    expect(answered.outcome).toBe("succeeded");
+    expect(
+      t.commands.some((c) => c.kind === "permission_response" && c.decision === "deny"),
+    ).toBe(true);
+    await settle(scope);
   });
 });

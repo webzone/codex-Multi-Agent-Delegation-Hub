@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 
 import { deferred, type Deferred } from "../deferred.js";
 import { asDelegateError, AgentHubError } from "../errors.js";
+import { assertCleanUnlessAllowed } from "../execution.js";
 import { resolveRepositoryIdentity } from "../git.js";
 import { acquireRepositoryLock, type RepositoryLock } from "../locks.js";
 import {
@@ -42,10 +43,12 @@ import type {
   LiveCancelCommand,
   LiveCheckpoint,
   LiveCommand,
+  LiveError,
   LiveEvent,
   LiveFollowUpCommand,
   LiveLaunchRequest,
   LivePermissionDecision,
+  LivePermissionPolicy,
   LivePermissionResponseCommand,
   LivePromptCommand,
   LiveProviderFactory,
@@ -94,6 +97,16 @@ import type {
  *   - recovery: an orphaned provider group is reaped (only under start-
  *     identity proof) before the `crash_recovery` checkpoint, the checkpoint
  *     before the state rewrite to `orphaned`, the rewrite before teardown.
+ *
+ * Turn settlement (exactly once): every accepted prompt/follow-up owns one
+ * `Deferred`. It resolves exactly once on every path — including when the
+ * durable chain itself is broken. If a checkpoint capture, live-ref CAS, or
+ * state write fails, the session `degrade`s: the in-flight turn resolves
+ * `failed` with no checkpoint (never hangs, never a false success), queued
+ * follow-ups resolve `failed` and are never dispatched, and the lease and
+ * worktree are retained for recovery because safety cannot be proven. The
+ * pump never rejects into an unhandled crash — `handleCrash` failures degrade
+ * the session so the hub process stays alive.
  *
  * Durability discipline: every committed transition is a sidecar-guarded CAS
  * on the session's live ref (state.ts). Event bodies, queue text, and
@@ -159,6 +172,16 @@ export interface LiveStartRequest {
   max_text_bytes?: number;
   /** Base commit; defaults to the captured identity head. */
   base?: string;
+  /**
+   * Caller-worktree gate (same contract as v1/v2): default false refuses to
+   * start over a caller checkout with tracked OR untracked local changes
+   * (`DIRTY_WORKTREE`). `true` explicitly permits starting anyway — from the
+   * committed HEAD only. The isolated live worktree is created from the base
+   * commit, so the caller's uncommitted state is NEVER copied into it.
+   */
+  allow_dirty?: boolean;
+  /** Hermes-style permission policy; omitting it means the contract default `deny`. */
+  permission_policy?: LivePermissionPolicy;
 }
 
 export interface LiveStartResult {
@@ -180,6 +203,10 @@ export interface LiveResumeFromStateRequest {
   /** Optional transport pin; must pair with the durable record. */
   transport?: LiveTransportId;
   max_text_bytes?: number;
+  /** Same caller-worktree gate as `start`; default false refuses a dirty checkout. */
+  allow_dirty?: boolean;
+  /** Permission policy for the resumed launch; omitting it means the default `deny`. */
+  permission_policy?: LivePermissionPolicy;
 }
 
 export interface LiveCloseResult {
@@ -243,6 +270,14 @@ interface ManagedSession {
   pump: Deferred<void>;
   closing: boolean;
   torn_down: boolean;
+  /**
+   * Non-null once a durable write (checkpoint capture, live-ref CAS, or
+   * state record) failed in flight: the first such failure is retained as a
+   * `LiveError`, the session goes terminal, every unsettled turn settles as
+   * `failed`, and the lease/worktree are retained for recovery. Terminal
+   * paths read this flag to skip teardown that safety can no longer prove.
+   */
+  degrade: LiveError | null;
   durable_tail: Promise<unknown>;
   /**
    * Per-session close pipeline. `close_tail` serializes every close attempt
@@ -300,6 +335,11 @@ export class LiveSessionManager {
       request.live_session_id ?? (this.options.newLiveSessionId ?? newLiveSessionId)();
     const identity = await resolveRepositoryIdentity(repositoryCwd);
     const base = request.base ?? identity.head;
+    // Caller-worktree gate (v1/v2 contract): default rejects tracked AND
+    // untracked local changes. `allow_dirty` proceeds, but `base` is a
+    // committed object and `createLiveWorktree` detaches at it, so the
+    // caller's uncommitted state is never carried into the live worktree.
+    await assertCleanUnlessAllowed(repositoryCwd, request.allow_dirty);
 
     const prepared = await this.reserveLaunchResources(liveSessionId, provider, base);
     return this.launchSession({
@@ -310,6 +350,7 @@ export class LiveSessionManager {
       base,
       maxTextBytes: request.max_text_bytes ?? this.options.maxTextBytes,
       resume: request.resume ?? null,
+      permissionPolicy: request.permission_policy ?? "deny",
       factory,
       worktree: prepared.worktree,
       lease: prepared.lease,
@@ -365,6 +406,10 @@ export class LiveSessionManager {
       );
     }
 
+    // Same caller-worktree gate as `start`; the resume worktree is created
+    // detached at the durable `current_commit`, never from caller changes.
+    await assertCleanUnlessAllowed(repositoryCwd, request.allow_dirty);
+
     const prepared = await this.reserveLaunchResources(
       liveSessionId,
       prior.provider,
@@ -380,6 +425,7 @@ export class LiveSessionManager {
         workspace: prepared.worktree.path,
         max_text_bytes: request.max_text_bytes ?? this.options.maxTextBytes,
         resume: prior.resume,
+        permission_policy: request.permission_policy ?? "deny",
         report_process: async (facts) => {
           processFacts = facts;
           lease = await this.recordProviderOwnership(lease, facts);
@@ -530,6 +576,7 @@ export class LiveSessionManager {
     base: string;
     maxTextBytes: number;
     resume: ProviderResumeState | null;
+    permissionPolicy: LivePermissionPolicy;
     factory: LiveTransportFactory;
     worktree: LiveWorktree;
     lease: LiveLeaseRecord;
@@ -546,6 +593,7 @@ export class LiveSessionManager {
         workspace: worktree.path,
         max_text_bytes: input.maxTextBytes,
         resume: input.resume,
+        permission_policy: input.permissionPolicy,
         report_process: async (facts) => {
           processFacts = facts;
           lease = await this.recordProviderOwnership(lease, facts);
@@ -761,6 +809,7 @@ export class LiveSessionManager {
       pump: deferred<void>(),
       closing: false,
       torn_down: false,
+      degrade: null,
       durable_tail: Promise.resolve(),
       close_in_flight: null,
       close_tail: Promise.resolve(),
@@ -1222,17 +1271,39 @@ export class LiveSessionManager {
       // Stream ended without the session being closed: treat as a crash,
       // never as success.
       if (!session.closing && !session.torn_down) {
-        await this.handleCrash(session, {
+        await this.crashSafely(session, {
           code: "LIVE_TRANSPORT_EXHAUSTED",
           message: "the provider event stream ended without the session reaching a terminal status",
         });
       }
     } catch (error) {
       if (!session.closing && !session.torn_down) {
-        await this.handleCrash(session, asDelegateError(error));
+        await this.crashSafely(session, asDelegateError(error));
       }
     } finally {
       session.pump.resolve();
+    }
+  }
+
+  /**
+   * `handleCrash` must never reject into the pump: a failure inside the
+   * hub's own terminal path (e.g. the durable boundary itself is broken)
+   * degrades the session — in-memory terminal status, any still-owned turn
+   * settled exactly once as `failed`, queue failed not dispatched, resources
+   * retained — and the hub process stays alive to serve close/recovery.
+   */
+  private async crashSafely(
+    session: ManagedSession,
+    error: { code: string; message: string },
+    exit: { exit_code: number | null; exit_signal: string | null } | null = null,
+  ): Promise<void> {
+    try {
+      await this.handleCrash(session, error, exit);
+    } catch (crashError) {
+      await this.degradeOnDurableFailure(session, crashError, {
+        settleTurn: session.turn,
+        status: "error",
+      });
     }
   }
 
@@ -1253,7 +1324,20 @@ export class LiveSessionManager {
           seen !== session.status
         ) {
           session.status = seen;
-          await this.enqueueDurable(session, () => this.commitStatus(session, seen));
+          try {
+            await this.enqueueDurable(session, () => this.commitStatus(session, seen));
+          } catch (durableError) {
+            // A status mirror write that cannot land means the durable chain
+            // is no longer trustworthy: the session degrades now — in-flight
+            // turn settled once as failed with no checkpoint, queue failed
+            // not dispatched, lease and worktree retained — instead of the
+            // pump dying, hanging the turn, or advancing on an unprovable
+            // record.
+            await this.degradeOnDurableFailure(session, durableError, {
+              settleTurn: session.turn,
+              status: "error",
+            });
+          }
         }
         break;
       }
@@ -1296,7 +1380,7 @@ export class LiveSessionManager {
       }
       case "exit": {
         if (!session.closing && !session.torn_down) {
-          await this.handleCrash(
+          await this.crashSafely(
             session,
             {
               code: "LIVE_PROVIDER_EXITED",
@@ -1421,6 +1505,88 @@ export class LiveSessionManager {
     return this.finalizeTurn(session, turn, outcome, null);
   }
 
+  /**
+   * Maps a failed durable write to a structured `LiveError`. Passes an
+   * `AgentHubError` through with its own code (`LIVE_STATE_INCONSISTENT`
+   * for a diverged live ref, `GIT_COMMAND_FAILED` for a failed capture);
+   * anything else — a raw EACCES/EIO from the state file path — becomes
+   * `LIVE_STATE_WRITE_FAILED`. Never echoes raw provider or filesystem
+   * content beyond Node's own error message.
+   */
+  private durableWriteError(
+    session: ManagedSession,
+    cause: unknown,
+    what: string,
+  ): LiveError {
+    const failure = asDelegateError(cause);
+    return {
+      code: cause instanceof AgentHubError ? failure.code : "LIVE_STATE_WRITE_FAILED",
+      message: `${what}: ${failure.message}`,
+      stage: "state",
+      retryable: false,
+      provider: session.state.provider,
+    };
+  }
+
+  /**
+   * The durable chain (checkpoint capture, live-ref CAS, or state record
+   * write) failed mid-flight. The session's durable history can no longer
+   * be trusted, so — exactly once, and never throwing:
+   *
+   *   - a still-owned in-flight turn settles as `failed` with NO checkpoint;
+   *     accepted turns hang for no reason, and an uncommitted boundary can
+   *     never be reported as success;
+   *   - queued and provider-queued follow-ups settle as `failed` too —
+   *     a broken chain dispatches nothing further;
+   *   - the session goes terminal in memory under `status` and records the
+   *     first durable failure on `degrade`, which terminal paths read as
+   *     the "safety unproven" flag;
+   *   - a best-effort durable status rewrite is attempted so an outside
+   *     observer can see the failure. If that write fails through the same
+   *     broken path the hub swallows it, stays alive, and the in-memory
+   *     terminal status stands;
+   *   - nothing is torn down: the lease, worktree, and ownership facts are
+   *     RETAINED — with the durable record unprovable there is no safe
+   *     cleanup, and recovery or a human finishes the job.
+   */
+  private async degradeOnDurableFailure(
+    session: ManagedSession,
+    cause: unknown,
+    options: { settleTurn: ActiveTurn | null; status: LiveStatus },
+  ): Promise<void> {
+    const lastError = this.durableWriteError(
+      session,
+      cause,
+      "the durable live chain could not be written, so this session is pinned nowhere — queued work is failed, never dispatched, and the lease and worktree are retained for recovery",
+    );
+    session.degrade ??= lastError;
+
+    const turn = options.settleTurn;
+    if (turn !== null && session.turn === turn) {
+      session.turn = null;
+      turn.error_seen ??= lastError;
+      this.settleTurnResult(session, turn, "failed", null, null);
+    }
+    session.status = options.status;
+
+    await this.failQueued(
+      session,
+      lastError.code,
+      "the durable live state write failed; queued follow-ups are failed, never dispatched",
+    );
+
+    try {
+      await this.enqueueDurable(session, () =>
+        this.commitStatusWith(session, options.status, lastError),
+      );
+    } catch {
+      // The best-effort rewrite failed through the same broken path. The
+      // in-memory terminal status stands, resources stay retained, and the
+      // hub process remains alive — recovery re-derives everything from
+      // the lease and the last committed record.
+    }
+  }
+
   private async finalizeTurn(
     session: ManagedSession,
     turn: ActiveTurn,
@@ -1429,11 +1595,29 @@ export class LiveSessionManager {
   ): Promise<LiveTurnResult> {
     const reason: CheckpointReason =
       outcome === "cancelled" ? "cancel" : outcome === "failed" ? "error" : "turn_end";
-    const checkpoint = await this.enqueueDurable(session, () =>
-      this.captureAndCommit(session, reason, {
-        lastError: turn.error_seen ?? undefined,
-      }),
-    );
+    let checkpoint: LiveCheckpoint | null;
+    try {
+      checkpoint = await this.enqueueDurable(session, () =>
+        this.captureAndCommit(session, reason, {
+          lastError: turn.error_seen ?? undefined,
+        }),
+      );
+    } catch (error) {
+      // The terminal boundary could not be committed. Exactly once, right
+      // now: the turn resolves `failed` with NO checkpoint (a write that
+      // never landed pins nothing), never hangs, and never reports success;
+      // the durable-failure handler then fails — never dispatches — every
+      // queued follow-up and retains the lease and worktree, because with
+      // the chain unprovable no teardown is safe.
+      turn.error_seen ??= this.durableWriteError(
+        session,
+        error,
+        "the live turn could not be committed to the durable chain",
+      );
+      const failed = this.settleTurnResult(session, turn, "failed", exit, null);
+      await this.degradeOnDurableFailure(session, error, { settleTurn: null, status: "error" });
+      return failed;
+    }
     const result = this.settleTurnResult(session, turn, outcome, exit, checkpoint);
 
     // The queue drains only toward another turn. A provider-queued follow-up
@@ -1574,24 +1758,58 @@ export class LiveSessionManager {
     } catch {
       stop = { status: "orphaned", exit_code: null, exit_signal: null, waited_ms: 0 };
     }
-    await this.options.observePhase?.("transport-stopped");
+    try {
+      await this.options.observePhase?.("transport-stopped");
+    } catch (seamError) {
+      // A throwing ordering seam must never strand the crash pipeline: the
+      // taken-over turn settles exactly once as failed, the stop report is
+      // abandoned (nothing is pinned or torn down after a seam failure —
+      // the session degrades conservatively to `orphaned`, retaining lease
+      // and worktree for a terminate-authorized close or recovery), and the
+      // hub process stays alive.
+      if (turn !== null) {
+        this.settleTurnResult(session, turn, "failed", exit, null);
+      }
+      await this.degradeOnDurableFailure(session, seamError, {
+        settleTurn: null,
+        status: "orphaned",
+      });
+      await this.failQueued(
+        session,
+        "LIVE_SESSION_CRASHED",
+        "the live session crashed before the queued follow-up ran",
+      );
+      return;
+    }
 
     if (stop.status !== "closed") {
       if (turn !== null) {
         this.settleTurnResult(session, turn, "failed", exit, null);
       }
       session.status = "orphaned";
-      await this.enqueueDurable(session, () =>
-        this.commitStatusWith(session, "orphaned", {
-          code: "LIVE_STOP_UNPROVEN",
-          message:
-            `${error.message}; crash handling could not prove the provider process group is gone, ` +
-            "so nothing was pinned: the lease, worktree, and ownership facts are retained for recovery",
-          stage: "shutdown",
-          retryable: false,
-          provider: session.state.provider,
-        }),
-      );
+      try {
+        await this.enqueueDurable(session, () =>
+          this.commitStatusWith(session, "orphaned", {
+            code: "LIVE_STOP_UNPROVEN",
+            message:
+              `${error.message}; crash handling could not prove the provider process group is gone, ` +
+              "so nothing was pinned: the lease, worktree, and ownership facts are retained for recovery",
+            stage: "shutdown",
+            retryable: false,
+            provider: session.state.provider,
+          }),
+        );
+      } catch (durableError) {
+        // Even the honest orphan rewrite failed. The turn above settled
+        // once already; the handler owns the queue, the in-memory
+        // `orphaned` status is kept so a later authorized terminate can
+        // finish the shutdown, and everything stays retained. Never
+        // rethrows: the hub must survive its own terminal path.
+        await this.degradeOnDurableFailure(session, durableError, {
+          settleTurn: null,
+          status: "orphaned",
+        });
+      }
       await this.failQueued(
         session,
         "LIVE_SESSION_CRASHED",
@@ -1603,25 +1821,37 @@ export class LiveSessionManager {
     if (turn !== null) {
       await this.finalizeTurn(session, turn, "failed", exit);
     } else {
-      await this.enqueueDurable(session, () =>
-        this.captureAndCommit(session, "error", {
-          statusOverride: "error",
-          lastError: {
-            code: error.code,
-            message: error.message,
-            stage: "provider",
-            retryable: false,
-            provider: session.state.provider,
-          },
-        }),
-      );
+      try {
+        await this.enqueueDurable(session, () =>
+          this.captureAndCommit(session, "error", {
+            statusOverride: "error",
+            lastError: {
+              code: error.code,
+              message: error.message,
+              stage: "provider",
+              retryable: false,
+              provider: session.state.provider,
+            },
+          }),
+        );
+      } catch (durableError) {
+        await this.degradeOnDurableFailure(session, durableError, {
+          settleTurn: null,
+          status: "error",
+        });
+      }
     }
     await this.failQueued(
       session,
       "LIVE_SESSION_CRASHED",
       "the live session crashed before the queued follow-up ran",
     );
-    await this.teardown(session);
+    // Safety gate: a durable failure during finalization means the work was
+    // never provably pinned — deleting the worktree would destroy evidence
+    // the durable record does not carry. Retain for recovery instead.
+    if (session.degrade === null) {
+      await this.teardown(session);
+    }
   }
 
   /**
@@ -1742,10 +1972,37 @@ export class LiveSessionManager {
       });
     }
 
+    // A durable failure inside the cancelled turn's finalization already
+    // made the chain unprovable: report the close as failed, retain lease
+    // and worktree, and never run teardown on top of an unwritable record.
+    if (session.degrade !== null) {
+      return {
+        state: structuredClone(session.state),
+        stop,
+        checkpoint_taken: false,
+        cleanup_errors: [session.degrade],
+      };
+    }
+
     session.status = "closed";
-    const checkpoint = await this.enqueueDurable(session, () =>
-      this.captureAndCommit(session, "close", { statusOverride: "closed" }),
-    );
+    let checkpoint: LiveCheckpoint | null;
+    try {
+      checkpoint = await this.enqueueDurable(session, () =>
+        this.captureAndCommit(session, "close", { statusOverride: "closed" }),
+      );
+    } catch (error) {
+      // The shutdown is PROVEN but the close commit is not. Report the
+      // failure honestly instead of committing a closed lie: no checkpoint,
+      // no teardown — the lease and worktree stay for a later close attempt
+      // (which will re-check the durable record) or for recovery.
+      await this.degradeOnDurableFailure(session, error, { settleTurn: null, status: "error" });
+      return {
+        state: structuredClone(session.state),
+        stop,
+        checkpoint_taken: false,
+        cleanup_errors: [session.degrade ?? asDelegateError(error)],
+      };
+    }
     const cleanupErrors = await this.teardown(session);
 
     return {

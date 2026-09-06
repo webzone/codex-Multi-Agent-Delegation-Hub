@@ -182,6 +182,15 @@ export function launchLiveChild(spec: LiveChildSpec): Promise<LiveChildHandle> {
   // stderr must always drain, or a chatty provider deadlocks on a full pipe.
   child.stderr?.resume();
 
+  // Permanent ownership of stderr stream failures (Task 1 / C2C review):
+  // capture is observational, and a failed capture may never surface as an
+  // uncaught 'error' event on the hub process. The exit observation runs its
+  // course regardless, so close/recovery stay possible.
+  child.stderr?.on("error", () => {
+    // Owned and deliberately silent: the bounded capture simply stops
+    // growing; `exitInfo`/`close` remain the authority on the process.
+  });
+
   const stdoutSinks: StdoutSink[] = [];
   child.stdout?.on("data", (chunk: Buffer) => {
     for (const sink of stdoutSinks) {
@@ -189,10 +198,31 @@ export function launchLiveChild(spec: LiveChildSpec): Promise<LiveChildHandle> {
     }
   });
 
+  // Permanent ownership of stdout stream failures: the transport's sinks read
+  // the same raw stream, but a failed stdout pipe must not raise an uncaught
+  // 'error' on the hub. Losing observation is not losing the session — the
+  // exit/close observation (below) still decides the process's fate.
+  child.stdout?.on("error", () => {
+    // Owned and silent; stdout simply stops delivering chunks.
+  });
+
   const exitDeferred = deferred<LiveChildExitInfo>();
   let shutdownRequested = false;
   let exitInfo: LiveChildExitInfo | null = null;
   let stdinBroken = false;
+  // Permanent ownership of stdin failures. A provider that closes or dies
+  // mid-session makes the OS pipe answer EPIPE; Node *also* emits that as an
+  // 'error' event on the stdin Writable, and an unowned emission is an
+  // uncaught exception that kills the hub process. This listener lives for
+  // the whole child lifetime (not just around one write): every stdin error,
+  // whenever it arrives — during a write, after `closeStdin`, after the
+  // provider is gone — is owned here, marks the pipe broken, and any
+  // caller-visible failure surfaces as the structured
+  // `LIVE_CHILD_STDIN_CLOSED` rejection from `writeStdin`. Close/recovery
+  // stay fully possible afterwards.
+  child.stdin?.on("error", () => {
+    stdinBroken = true;
+  });
 
   const observation = {
     finish(raw: { exit_code: number | null; exit_signal: string | null }): void {

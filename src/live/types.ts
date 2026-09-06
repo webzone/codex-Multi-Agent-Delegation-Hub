@@ -519,6 +519,28 @@ export interface LiveProviderProcessFacts {
   pgid: number;
 }
 
+/**
+ * Explicit permission policy for sessions whose provider surfaces permission
+ * decisions (Hermes/ACP is the named consumer; the field itself is
+ * provider-neutral so no wire shape ever crosses this boundary).
+ *
+ * - `deny` (the contract default when a request omits it): the session may
+ *   NOT escalate a permission decision to a human; hub-side handling answers
+ *   it without user interaction. Capability truth stays fully representable
+ *   under either policy: the `permission_response` claim in the launch
+ *   capability snapshot keeps describing what the transport *actually* does
+ *   (with its evidence), and a transport MUST NOT flip, soften, or drop a
+ *   claim because of the chosen policy — `unsupported` remains the honest
+ *   claim when nothing is forwarded, `native` stays when verdicts really do
+ *   reach the provider.
+ * - `interactive`: observed permission requests are surfaced to the caller
+ *   verbatim and answered only through `permission_response` commands.
+ *
+ * This is the binding contract; the MCP/CLI surface and the Hermes transport
+ * wiring are later packages and may not reinterpret it.
+ */
+export type LivePermissionPolicy = "deny" | "interactive";
+
 /** Everything a transport needs to start a live session. Contains no task text — prompts arrive only via `send`. */
 export interface LiveLaunchRequest {
   live_session_id: string;
@@ -528,6 +550,8 @@ export interface LiveLaunchRequest {
   max_text_bytes: number;
   /** Durable resume hint; a transport that cannot honor it must fail launch with a `LiveError`, never silently start fresh. */
   resume: ProviderResumeState | null;
+  /** Permission policy for this launch/resume; omitting it means the contract default `deny`. */
+  permission_policy?: LivePermissionPolicy;
   /**
    * Durable ownership boundary: a transport that spawned a local provider
    * process MUST await this callback with the spawn facts immediately after
