@@ -400,12 +400,13 @@ export async function removeLiveLease(
  * keyed: foreign host and live-with-matching-identity are hands-off; a dead
  * hub pid (ESRCH is presence-proof) hands the provider over for reaping, and
  * a live provider pid may only be reaped when its start identity matches the
- * lease exactly. Leader death alone never proves the WORK is dead: a leader
- * PID may exit while its process group (helper children) survives, so a dead
- * leader only yields `dead` when the group probe itself answers ESRCH. Group
- * still present, unprobeable, or an unrecorded group identity all classify
- * `uncertain`: the tree may still be under mutation; nothing may be reaped,
- * checkpointed, or cleaned up on this evidence.
+ * lease exactly AND the lease recorded the group it leads (pgid == pid, the
+ * detached-launch invariant). Leader death alone never proves the WORK is
+ * dead: a leader PID may exit while its process group (helper children)
+ * survives, so a dead leader only yields `dead` when the group probe itself
+ * answers ESRCH. Group still present, unprobeable, or an unrecorded group
+ * identity all classify `uncertain`: the tree may still be under mutation;
+ * nothing may be reaped, checkpointed, or cleaned up on this evidence.
  */
 export async function classifyLiveLease(
   lease: LiveLeaseRecord,
@@ -464,13 +465,31 @@ export async function classifyLiveLease(
     }
   } else {
     const observedStart = await probes.startToken(lease.provider_pid);
-    if (
+    const identityMatched =
       lease.provider_start_token !== null &&
       observedStart !== null &&
-      lease.provider_start_token === observedStart &&
-      (lease.provider_pgid === null || lease.provider_pgid === lease.provider_pid)
-    ) {
+      lease.provider_start_token === observedStart;
+    if (identityMatched && lease.provider_pgid === lease.provider_pid) {
       provider = { state: "alive", reapable: true };
+    } else if (identityMatched && lease.provider_pgid === null) {
+      // The pid IS the launched provider, but no group identity was ever
+      // recorded. `kill(-pid)` would assume PGID == PID — a guess, and a
+      // wrong one can hit an innocent group. The session goes to manual.
+      provider = {
+        state: "uncertain",
+        reapable: false,
+        reason:
+          `pid ${lease.provider_pid} is alive with a matching start identity, but the lease records no process-group identity; ` +
+          "signalling the pid as a group would be a guess, so nothing may be reaped on this evidence",
+      };
+    } else if (identityMatched) {
+      provider = {
+        state: "uncertain",
+        reapable: false,
+        reason:
+          `pid ${lease.provider_pid} is alive with a matching start identity, but the recorded process group ${lease.provider_pgid} ` +
+          "is not the group the detached leader provably leads; group ownership is unprovable",
+      };
     } else if (
       lease.provider_start_token !== null &&
       observedStart !== null &&
@@ -527,7 +546,10 @@ export interface ReapOptions {
  * group to answer ESRCH to a group probe — leader death alone never counts,
  * because a helper that outlived its leader can still mutate the worktree.
  * A group that cannot be probed at all (only ESRCH proves absence) yields
- * `uncertain`, never a fake reap.
+ * `uncertain`, never a fake reap. The signalled target is ONLY ever the
+ * group identity the lease itself recorded: a provider pid is never signalled
+ * as a group, because PGID == PID is a hub-launch invariant, not a fact an
+ * unrecorded lease may be guessed from.
  */
 export async function reapOrphanedProvider(
   lease: LiveLeaseRecord,
@@ -541,9 +563,18 @@ export async function reapOrphanedProvider(
       reason: status.state === "uncertain" ? status.reason : "no reapable provider process",
     };
   }
-  const target = lease.provider_pgid ?? lease.provider_pid;
+  const target = lease.provider_pgid;
   if (target === null) {
-    return { status: "not-attempted", reason: "lease records no pid to signal" };
+    // No recorded group identity: `kill(-pid)` would be an unproven guess
+    // about who leads what group. Manual review keeps the lease and the
+    // worktree; this path refuses to signal a pid as a group.
+    return {
+      status: "not-attempted",
+      reason:
+        lease.provider_pid === null
+          ? "lease records neither a provider pid nor a process-group identity; nothing provable to signal"
+          : `lease records provider pid ${lease.provider_pid} but no process-group identity; refusing to signal a pid as a group`,
+    };
   }
 
   const graceMs = options.graceMs ?? 5_000;

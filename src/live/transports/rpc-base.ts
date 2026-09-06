@@ -647,16 +647,32 @@ export abstract class RpcSessionBase implements LiveTransport {
       return { status: "orphaned", exit_code: null, exit_signal: null, waited_ms: waitedMs };
     }
     // `onExit` (attached first) records the exit event and terminal status.
-    // `closed` additionally requires proof the whole owned group is gone —
-    // a provider helper that outlived its leader keeps shutdown `orphaned`.
-    if (wire.proveGroupGone && !(await wire.proveGroupGone(this.shutdownGraceMs))) {
-      this.currentStatus = "orphaned";
-      return {
-        status: "orphaned",
-        exit_code: exit.exitCode,
-        exit_signal: exit.exitSignal,
-        waited_ms: Date.now() - startedAt,
-      };
+    // `closed` additionally requires proof the whole owned group is gone.
+    // Authorization decides what a surviving group gets: `graceful` may
+    // never signal it once the leader is down — it only watches for natural
+    // death; `terminate` re-probes the owned group identity and runs the
+    // bounded TERM→KILL ladder against the actual PGID. A leader exit that
+    // already resolved `wire.exited` must never let terminate skip the
+    // escalation; the group, not the exit promise, is the thing being proven.
+    if (wire.proveGroupGone) {
+      let groupGone = await wire.proveGroupGone(mode === "terminate" ? 0 : this.shutdownGraceMs);
+      if (!groupGone && mode === "terminate") {
+        wire.signal("SIGTERM");
+        groupGone = await wire.proveGroupGone(this.shutdownGraceMs);
+        if (!groupGone) {
+          wire.signal("SIGKILL");
+          groupGone = await wire.proveGroupGone(this.shutdownGraceMs);
+        }
+      }
+      if (!groupGone) {
+        this.currentStatus = "orphaned";
+        return {
+          status: "orphaned",
+          exit_code: exit.exitCode,
+          exit_signal: exit.exitSignal,
+          waited_ms: Date.now() - startedAt,
+        };
+      }
     }
     await this.pumpSettled;
     return { status: "closed", exit_code: exit.exitCode, exit_signal: exit.exitSignal, waited_ms: Date.now() - startedAt };

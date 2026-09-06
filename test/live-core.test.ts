@@ -22,7 +22,11 @@ import {
   type LiveManagerOptions,
   type LiveManagerPhase,
 } from "../src/live/manager.js";
-import type { LiveLeaseProbes } from "../src/live/lease.js";
+import {
+  liveLeasePath,
+  readLiveLease,
+  type LiveLeaseProbes,
+} from "../src/live/lease.js";
 import { acquireRepositoryLock } from "../src/locks.js";
 import { LIVE_ADMIN_LOCK_NAME } from "../src/live/state.js";
 import type {
@@ -42,6 +46,10 @@ import type {
   LiveTurnResult,
 } from "../src/live/types.js";
 import { createGitRepository, removeDirectory, resolveRef, runGit } from "./helpers.js";
+import {
+  realProcessAlive,
+  runLeaderFirstSurvivorScenario,
+} from "./live-stop-authority.js";
 
 // ---------------------------------------------------------------------------
 // Shared fixtures
@@ -74,6 +82,9 @@ class FakeTransport implements LiveTransport {
   launch: LiveLaunchRequest | null = null;
   readonly stopCalls: LiveStopMode[] = [];
   stopResults: LiveStopReport[] = [];
+  /** Overlap detector: stop() calls must never nest under the manager. */
+  activeStops = 0;
+  maxActiveStops = 0;
   private queue: LiveEventBody[] = [];
   private wake: (() => void) | null = null;
   private ended = false;
@@ -87,6 +98,8 @@ class FakeTransport implements LiveTransport {
       /** Echo the launch resume hint back as a transport-verified resume state. */
       resumeState?: "echo";
       onSend?: (command: LiveCommand, transport: FakeTransport) => void;
+      /** Gates every stop() until resolved; proves pipelines never overlap. */
+      stopHold?: Promise<void>;
     } = {},
   ) {}
 
@@ -158,14 +171,23 @@ class FakeTransport implements LiveTransport {
 
   async stop(mode: LiveStopMode): Promise<LiveStopReport> {
     this.stopCalls.push(mode);
-    const report = this.stopResults.shift() ?? {
-      status: "closed" as const,
-      exit_code: 0,
-      exit_signal: null,
-      waited_ms: 1,
-    };
-    this.endStream();
-    return report;
+    this.activeStops += 1;
+    this.maxActiveStops = Math.max(this.maxActiveStops, this.activeStops);
+    try {
+      if (this.opts.stopHold) {
+        await this.opts.stopHold;
+      }
+      const report = this.stopResults.shift() ?? {
+        status: "closed" as const,
+        exit_code: 0,
+        exit_signal: null,
+        waited_ms: 1,
+      };
+      this.endStream();
+      return report;
+    } finally {
+      this.activeStops -= 1;
+    }
   }
 }
 
@@ -512,6 +534,105 @@ describe("live manager lifecycle", () => {
     expect(durable.status).toBe("closed");
     expect(await leasesOf(scope.commonDir)).toHaveLength(0);
 
+    await settle(scope);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Close single-flight (manager terminal pipeline)
+// ---------------------------------------------------------------------------
+
+describe("close single-flight", () => {
+  it("concurrent same-mode closes share one pipeline: one stop, one result, one teardown", async () => {
+    const phases: LiveManagerPhase[] = [];
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const scope = await harness({ phases, transportOptions: { stopHold: hold } });
+    const { live_session_id } = await startSession(scope.manager);
+    const t = scope.factory.created[0];
+
+    const first = scope.manager.close(live_session_id);
+    const second = scope.manager.close(live_session_id);
+    release();
+    const [a, b] = await Promise.all([first, second]);
+
+    expect(a).toBe(b); // the same shared result, not a replayed pipeline
+    expect(a.state.status).toBe("closed");
+    expect(t.stopCalls).toEqual(["graceful"]);
+    expect(t.maxActiveStops).toBe(1);
+    expect(await leasesOf(scope.commonDir)).toHaveLength(0);
+    // Exactly one shutdown, one durable write, one teardown.
+    expect(phases).toEqual(["transport-stopped", "checkpoint-captured", "state-advanced"]);
+    await settle(scope);
+  });
+
+  it("simultaneous graceful and terminate never overlap: terminate upgrades the settled orphan", async () => {
+    const phases: LiveManagerPhase[] = [];
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const scope = await harness({ phases, transportOptions: { stopHold: hold } });
+    const { live_session_id } = await startSession(scope.manager);
+    const t = scope.factory.created[0];
+    t.stopResults = [
+      { status: "orphaned", exit_code: 0, exit_signal: null, waited_ms: 3 },
+      { status: "closed", exit_code: 0, exit_signal: "SIGKILL", waited_ms: 4 },
+    ];
+
+    const graceful = scope.manager.close(live_session_id);
+    const upgrade = scope.manager.close(live_session_id, "terminate");
+    // A third attempt queued behind both: it must observe the final record.
+    const late = scope.manager.close(live_session_id);
+    release();
+    const [orphaned, closed, lateResult] = await Promise.all([graceful, upgrade, late]);
+
+    expect(orphaned.state.status).toBe("orphaned");
+    expect(orphaned.state.last_error?.code).toBe("LIVE_STOP_UNPROVEN");
+    expect(orphaned.checkpoint_taken).toBe(false);
+    expect(orphaned.stop).toMatchObject({ status: "orphaned" });
+
+    expect(closed.state.status).toBe("closed");
+    expect(closed.stop).toMatchObject({ status: "closed", exit_signal: "SIGKILL" });
+
+    expect(lateResult.stop).toBeNull(); // terminal record, never a fourth pipeline
+
+    // Serialized: exactly one stop per pipeline, and never two at once.
+    expect(t.stopCalls).toEqual(["graceful", "terminate"]);
+    expect(t.maxActiveStops).toBe(1);
+
+    const durable = await durableState(scope.commonDir, live_session_id);
+    expect(durable.status).toBe("closed");
+    expect(await leasesOf(scope.commonDir)).toHaveLength(0);
+    // One orphaned CAS, then one close chain: no duplicated checkpoint or CAS.
+    expect(phases).toEqual([
+      "transport-stopped",
+      "state-advanced",
+      "transport-stopped",
+      "checkpoint-captured",
+      "state-advanced",
+    ]);
+    await settle(scope);
+  });
+
+  it("a second graceful after a settled orphan gets the terminal record, not a second stop", async () => {
+    const scope = await harness();
+    const { live_session_id } = await startSession(scope.manager);
+    const t = scope.factory.created[0];
+    t.stopResults = [{ status: "orphaned", exit_code: 0, exit_signal: null, waited_ms: 2 }];
+
+    const first = await scope.manager.close(live_session_id);
+    expect(first.state.status).toBe("orphaned");
+    expect(first.stop).toMatchObject({ status: "orphaned" });
+
+    const second = await scope.manager.close(live_session_id);
+    expect(second.stop).toBeNull();
+    expect(second.state.status).toBe("orphaned");
+    expect(t.stopCalls).toEqual(["graceful"]);
+    expect(scope.manager.activeCount).toBe(1);
+    expect(await leasesOf(scope.commonDir)).toHaveLength(1);
     await settle(scope);
   });
 });
@@ -963,6 +1084,35 @@ describe("recovery", () => {
     await removeDirectory(scope.tmpRoot);
   });
 
+  it("routes a live provider whose lease lost the pgid to manual and never signals", async () => {
+    const kills: KillRecord[] = [];
+    const probes = fakeProbes({
+      kills,
+      alive: (pid) => pid === 424_242, // hub pid dead, provider alive
+      startToken: (pid) => (pid === process.pid ? "hub-tok" : "prov-tok"),
+    });
+    const scope = await stranded(probes);
+    // Same provider, but the lease lost its group identity: recovery may
+    // NEVER reconstruct PGID == PID and signal the pid as a group.
+    const lease = await readLiveLease(scope.commonDir, scope.liveSessionId);
+    expect(lease).toBeDefined();
+    await writeFile(
+      liveLeasePath(scope.commonDir, scope.liveSessionId),
+      JSON.stringify({ ...lease, provider_pgid: null }),
+      "utf8",
+    );
+
+    const report = await scope.second.recover();
+    expect(report.sessions.map((s) => s.outcome)).toEqual(["manual"]);
+    expect(report.sessions[0]?.detail).toContain("process-group identity");
+    expect(kills).toEqual([]);
+    const durable = await durableState(scope.commonDir, scope.liveSessionId);
+    expect(durable.status).toBe("idle"); // no checkpoint, no rewrite
+    expect(await leasesOf(scope.commonDir)).toHaveLength(1);
+    await removeDirectory(scope.repository);
+    await removeDirectory(scope.tmpRoot);
+  });
+
   it("escalates recovery to KILL and certifies only when the group answers gone", async () => {
     const phases: LiveManagerPhase[] = [];
     const kills: KillRecord[] = [];
@@ -1352,6 +1502,43 @@ describe("process-group child ownership", () => {
     // group was signaled — a leader-only kill would leave it behind.
     expect(() => process.kill(helperPid, 0)).toThrow();
   });
+
+  it("graceful never signals a leaderless group; a later terminate escalates and closes", async () => {
+    // Shared authorization scenario (test/live-stop-authority.ts) on the
+    // primitive seam. The leader exits FIRST, having handed its `sleep`
+    // helper an ignored disposition for TERM/INT (SIG_IGN survives exec),
+    // so only a terminate-authorized SIGKILL can dissolve the group.
+    const child = await launchLiveChild({
+      command: "/bin/sh",
+      args: ["-c", "trap '' TERM INT; sleep 120 & echo helper:$!; exit 0"],
+      cwd: "/",
+      maxStderrBytes: 64,
+    });
+    try {
+      const helperPid = await new Promise<number>((resolve, reject) => {
+        let seen = "";
+        const fallback = setTimeout(() => reject(new Error(`no helper pid line (${seen})`)), 5_000);
+        child.onStdout((chunk) => {
+          seen += chunk.toString("utf8");
+          const match = /helper:(\d+)/.exec(seen);
+          if (match) {
+            clearTimeout(fallback);
+            resolve(Number(match[1]));
+          }
+        });
+      });
+      await child.exited();
+      expect(realProcessAlive(helperPid)).toBe(true);
+
+      await runLeaderFirstSurvivorScenario({
+        stop: (mode) => child.stop(mode, { graceMs: 100, killWaitMs: 5_000 }),
+        survivorAlive: () => realProcessAlive(helperPid),
+      });
+      expect(child.groupAlive()).toBe(false);
+    } finally {
+      await child.stop("terminate", { graceMs: 50, killWaitMs: 2_000 });
+    }
+  }, 20_000);
 
   it("capability-gates signal-only cancel to platforms with reliable group signals", async () => {
     const transport = new AgyStreamJsonTransport({ command: "definitely-not-a-real-binary-xyzzy" });

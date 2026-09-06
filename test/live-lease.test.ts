@@ -262,6 +262,31 @@ describe("classifyLiveLease", () => {
     }
     expect(noIdentity.provider.reason).toContain("no process-group identity");
   });
+
+  it("classifies a live pid with an unrecorded or foreign group as uncertain, never reapable", async () => {
+    const commonDir = await tempCommonDir();
+    // Start identity matches perfectly — yet without a recorded PGID the
+    // hub owns NO provable group; `kill(-pid)` would be a guess.
+    const noPgid = await seedLease(commonDir, { provider_pgid: null });
+    const aliveProbes = fakeProbes({ alive: [PROVIDER_PID], starts: { [PROVIDER_PID]: "prov-start" } });
+    const verdict = await classifyLiveLease(noPgid, aliveProbes);
+    if (verdict.state !== "hub-gone" || verdict.provider.state !== "uncertain") {
+      expect.unreachable("a live provider with no recorded pgid must stay uncertain/manual");
+    }
+    expect(verdict.provider.reapable).toBe(false);
+    expect(verdict.provider.reason).toContain("no process-group identity");
+
+    // A recorded pgid that is not the leader pid breaks the detached-launch
+    // invariant: group ownership is unprovable, so nothing is reapable.
+    const otherDir = await tempCommonDir();
+    const foreignPgid = await seedLease(otherDir, { provider_pgid: PROVIDER_PID + 1 });
+    const foreign = await classifyLiveLease(foreignPgid, aliveProbes);
+    if (foreign.state !== "hub-gone" || foreign.provider.state !== "uncertain") {
+      expect.unreachable("a pgid that differs from the leader pid must stay uncertain");
+    }
+    expect(foreign.provider.reapable).toBe(false);
+    expect(foreign.provider.reason).toContain("not the group");
+  });
 });
 
 describe("reapOrphanedProvider", () => {
@@ -374,6 +399,30 @@ describe("reapOrphanedProvider", () => {
       { graceMs: 10, killWaitMs: 10 },
     );
     expect(outcome.status).toBe("not-attempted");
+    expect(kills).toEqual([]);
+  });
+
+  it("refuses to signal a pid as a group when the lease records no pgid", async () => {
+    const commonDir = await tempCommonDir();
+    const noPgid = await seedLease(commonDir, { provider_pgid: null });
+    const kills: Array<{ target: number; signal: string }> = [];
+    const probes = fakeProbes({
+      kills,
+      alive: [PROVIDER_PID],
+      starts: { [PROVIDER_PID]: "prov-start" },
+    });
+    // Even a caller ASSERTING `alive, reapable` cannot make this path guess
+    // PGID == PID: no recorded group identity, no group signal, ever.
+    const outcome = await reapOrphanedProvider(
+      noPgid,
+      { state: "alive", reapable: true },
+      probes,
+      { graceMs: 10, killWaitMs: 10 },
+    );
+    expect(outcome.status).toBe("not-attempted");
+    if (outcome.status === "not-attempted") {
+      expect(outcome.reason).toContain("refusing to signal a pid as a group");
+    }
     expect(kills).toEqual([]);
   });
 });

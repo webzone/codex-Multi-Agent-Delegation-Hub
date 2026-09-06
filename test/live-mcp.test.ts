@@ -134,6 +134,11 @@ class ScriptedTransport implements LiveTransport {
   readonly sent: LiveCommand[] = [];
   readonly stopCalls: LiveStopMode[] = [];
   reportProcessCalls = 0;
+  /** Gates every stop() until resolved; proves manager pipelines never overlap. */
+  holdStop: Promise<void> | null = null;
+  stopPolicy: ((mode: LiveStopMode) => LiveStopReport | undefined) | null = null;
+  activeStops = 0;
+  maxActiveStops = 0;
   private queue: LiveEvent[] = [];
   private wakeups: Array<() => void> = [];
   private ended = false;
@@ -252,11 +257,22 @@ class ScriptedTransport implements LiveTransport {
 
   async stop(mode: LiveStopMode): Promise<LiveStopReport> {
     this.stopCalls.push(mode);
-    if (!this.ended) {
-      this.emit({ kind: "exit", intentional: true, exit_code: 0, exit_signal: null });
-      this.ended = true;
+    this.activeStops += 1;
+    this.maxActiveStops = Math.max(this.maxActiveStops, this.activeStops);
+    try {
+      if (this.holdStop) {
+        await this.holdStop;
+      }
+      const report: LiveStopReport =
+        this.stopPolicy?.(mode) ?? { status: "closed", exit_code: 0, exit_signal: null, waited_ms: 5 };
+      if (report.status === "closed" && !this.ended) {
+        this.emit({ kind: "exit", intentional: true, exit_code: 0, exit_signal: null });
+        this.ended = true;
+      }
+      return report;
+    } finally {
+      this.activeStops -= 1;
     }
-    return { status: "closed", exit_code: 0, exit_signal: null, waited_ms: 5 };
   }
 }
 
@@ -746,6 +762,93 @@ describe("live MCP tools", () => {
       expect(events.isError).toBe(true);
       expect(documentFrom(events).error).toMatchObject({ code: "LIVE_SESSION_NOT_FOUND" });
 
+      await h.cleanup();
+    },
+    HEAVY,
+  );
+
+  it(
+    "single-flights concurrent live_session_close calls: one pipeline, one shutdown report",
+    async () => {
+      const h = await harness();
+      const start = await startLive(h);
+      const id = start.live_session_id as string;
+      const transport = h.factories[0]!.created[0]!;
+
+      let release!: () => void;
+      transport.holdStop = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+
+      const closeA = h.client.callTool({
+        name: "live_session_close",
+        arguments: { live_session_id: id },
+      });
+      const closeB = h.client.callTool({
+        name: "live_session_close",
+        arguments: { live_session_id: id },
+      });
+      release();
+      const [a, b] = await Promise.all([closeA, closeB]);
+
+      expect(a.isError ?? false).toBe(false);
+      expect(b.isError ?? false).toBe(false);
+      const docA = documentFrom(a);
+      expect(documentFrom(b)).toEqual(docA);
+      expect(docA.stop).toMatchObject({ status: "closed" });
+      // Exactly one shutdown ran behind the two tool calls.
+      expect(transport.stopCalls).toEqual(["graceful"]);
+      expect(transport.maxActiveStops).toBe(1);
+      expect(docA.state).toMatchObject({ status: "closed" });
+      await h.cleanup();
+    },
+    HEAVY,
+  );
+
+  it(
+    "simultaneous graceful and terminate closes serialize: the terminate upgrades the orphan",
+    async () => {
+      const h = await harness();
+      const start = await startLive(h);
+      const id = start.live_session_id as string;
+      const transport = h.factories[0]!.created[0]!;
+
+      let release!: () => void;
+      transport.holdStop = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      transport.stopPolicy = (mode) =>
+        mode === "graceful"
+          ? { status: "orphaned", exit_code: 0, exit_signal: null, waited_ms: 2 }
+          : { status: "closed", exit_code: 0, exit_signal: "SIGKILL", waited_ms: 3 };
+
+      const closeA = h.client.callTool({
+        name: "live_session_close",
+        arguments: { live_session_id: id },
+      });
+      const closeB = h.client.callTool({
+        name: "live_session_close",
+        arguments: { live_session_id: id, terminate: true },
+      });
+      release();
+      const [a, b] = await Promise.all([closeA, closeB]);
+
+      // An orphaned close is honestly an isError on this tool — the upgrade
+      // below is exactly what the honest report tells the caller to do.
+      expect(a.isError).toBe(true);
+      expect(b.isError ?? false).toBe(false);
+      const orphaned = documentFrom(a);
+      const closed = documentFrom(b);
+      expect(orphaned.stop).toMatchObject({ status: "orphaned" });
+      expect(orphaned.state).toMatchObject({ status: "orphaned" });
+      expect(orphaned.checkpoint_taken).toBe(false);
+      expect(closed.stop).toMatchObject({ status: "closed", exit_signal: "SIGKILL" });
+      expect(closed.state).toMatchObject({ status: "closed" });
+
+      // One stop per pipeline, strictly serialized; one teardown.
+      expect(transport.stopCalls).toEqual(["graceful", "terminate"]);
+      expect(transport.maxActiveStops).toBe(1);
+      await expect(stat(start.workspace as string)).rejects.toThrow();
       await h.cleanup();
     },
     HEAVY,

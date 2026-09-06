@@ -19,6 +19,10 @@ import type {
   LiveStatusCommand,
 } from "../src/live/types.js";
 import { removeDirectory } from "./helpers.js";
+import {
+  realProcessAlive,
+  runLeaderFirstSurvivorScenario,
+} from "./live-stop-authority.js";
 
 /**
  * Fake-protocol tests for the Hermes ACP transport (Hermes 0.20.5, ACP v1).
@@ -61,7 +65,16 @@ function fakeHermesSource(): string {
     "      if (mode === 'bad-version') return { protocolVersion: 2, agentCapabilities: {} };",
     "      return { protocolVersion: 1, agentCapabilities: { loadSession: mode !== 'no-load' } };",
     "    },",
-    "    async newSession(params) { journal({ m: 'new', params }); return { sessionId: 'hermes-sess-1' }; },",
+    "    async newSession(params) {",
+    "      journal({ m: 'new', params });",
+    "      if (mode === 'orphan') {",
+    "        const { spawn } = await import('node:child_process');",
+    "        const helper = spawn('/bin/sh', ['-c', \"trap '' TERM INT HUP; while :; do sleep 1; done\"], { stdio: 'ignore' });",
+    "        journal({ m: 'helper', pid: helper.pid });",
+    "        setTimeout(() => process.exit(0), 150);",
+    "      }",
+    "      return { sessionId: 'hermes-sess-1' };",
+    "    },",
     "    async loadSession(params) {",
     "      journal({ m: 'load', params });",
     "      await conn.sessionUpdate({ sessionId: params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'restored' } } });",
@@ -576,4 +589,33 @@ describe("hermes acp transport", () => {
       await removeDirectory(fake.dir);
     }
   });
+
+  it(
+    "leader exits first, helper survives: graceful orphaned with no group signal; terminate kills and closes",
+    async () => {
+      const fake = await makeFakeHermes("orphan");
+      const t = transport(fake);
+      try {
+        const recorder = new EventRecorder(t.events());
+        await t.open(launchRequest(fake.dir));
+        await recorder.waitUntil("leader exit", (events) =>
+          events.some((e) => e.body.kind === "exit"),
+        );
+
+        const journal = await readJournal(fake);
+        const helperPid = journal.find((entry) => entry.m === "helper")?.pid;
+        expect(typeof helperPid).toBe("number");
+        expect(realProcessAlive(helperPid as number)).toBe(true);
+
+        await runLeaderFirstSurvivorScenario({
+          stop: (mode) => t.stop(mode),
+          survivorAlive: () => realProcessAlive(helperPid as number),
+        });
+      } finally {
+        await t.stop("terminate");
+        await removeDirectory(fake.dir);
+      }
+    },
+    30_000,
+  );
 });

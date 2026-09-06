@@ -244,6 +244,14 @@ interface ManagedSession {
   closing: boolean;
   torn_down: boolean;
   durable_tail: Promise<unknown>;
+  /**
+   * Per-session close pipeline. `close_tail` serializes every close attempt
+   * so two terminal pipelines never run concurrently; `close_in_flight` lets
+   * concurrent same-mode closes share exactly one promise/result. A terminate
+   * upgrade after a graceful orphan queues behind the graceful pipeline.
+   */
+  close_in_flight: { mode: LiveStopMode; promise: Promise<LiveCloseResult> } | null;
+  close_tail: Promise<unknown>;
 }
 
 export class LiveSessionManager {
@@ -754,6 +762,8 @@ export class LiveSessionManager {
       closing: false,
       torn_down: false,
       durable_tail: Promise.resolve(),
+      close_in_flight: null,
+      close_tail: Promise.resolve(),
     };
     this.sessions.set(session.id, session);
     return session;
@@ -1623,34 +1633,70 @@ export class LiveSessionManager {
    * orphaned. An orphan keeps its lease, worktree, and ownership evidence
    * precisely so the later terminate can be proven and completed. A stop
    * that THROWS is as unproven as one that reports `orphaned`.
+   *
+   * Single-flight per session: concurrent same-mode closes share one
+   * promise and one result, and two close pipelines never run concurrently.
+   * A `terminate` upgrade after a settled orphan queues behind the pipeline
+   * it orphaned from, re-checking the session's current record when its
+   * turn arrives — so a checkpoint, teardown, or CAS transition is never
+   * duplicated by a racing close.
    */
   async close(id: string, mode: LiveStopMode = "graceful"): Promise<LiveCloseResult> {
     const session = this.sessions.get(id);
     if (!session) {
       throw new AgentHubError("LIVE_SESSION_NOT_FOUND", `no live session "${id}" in this hub process`);
     }
-    if (session.torn_down) {
-      return {
-        state: structuredClone(session.state),
-        stop: null,
-        checkpoint_taken: false,
-        cleanup_errors: [],
-      };
-    }
-    if (
-      TERMINAL_STATUSES.includes(session.status) &&
-      !(session.status === "orphaned" && mode === "terminate")
-    ) {
-      // A terminal record gets its shutdown report once; only an authorized
-      // terminate may re-attempt shutdown for an orphan.
-      return {
-        state: structuredClone(session.state),
-        stop: null,
-        checkpoint_taken: false,
-        cleanup_errors: [],
-      };
+    const inFlight = session.close_in_flight;
+    if (inFlight !== null && inFlight.mode === mode) {
+      // A concurrent same-mode close joins the single running pipeline; it
+      // never re-runs signals, durable writes, or teardown on its own.
+      return inFlight.promise;
     }
     session.closing = true;
+    const attempt = (): Promise<LiveCloseResult> => {
+      if (session.torn_down) {
+        return Promise.resolve({
+          state: structuredClone(session.state),
+          stop: null,
+          checkpoint_taken: false,
+          cleanup_errors: [],
+        });
+      }
+      if (
+        TERMINAL_STATUSES.includes(session.status) &&
+        !(session.status === "orphaned" && mode === "terminate")
+      ) {
+        // A terminal record got its shutdown report once; only an authorized
+        // terminate may re-attempt shutdown for an orphan.
+        return Promise.resolve({
+          state: structuredClone(session.state),
+          stop: null,
+          checkpoint_taken: false,
+          cleanup_errors: [],
+        });
+      }
+      return this.runCloseAttempt(session, mode);
+    };
+    const promise = session.close_tail.then(attempt, attempt);
+    session.close_in_flight = { mode, promise };
+    session.close_tail = promise.then(
+      () => undefined,
+      () => undefined,
+    );
+    const clear = (): void => {
+      if (session.close_in_flight !== null && session.close_in_flight.promise === promise) {
+        session.close_in_flight = null;
+      }
+    };
+    void promise.then(clear, clear);
+    return promise;
+  }
+
+  /**
+   * The one terminal pipeline for a single close attempt. Only the dispatcher
+   * above may run these bodies, and never two of them at once.
+   */
+  private async runCloseAttempt(session: ManagedSession, mode: LiveStopMode): Promise<LiveCloseResult> {
     session.status = "closing";
     await this.failQueued(
       session,

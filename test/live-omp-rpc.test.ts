@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OmpRpcTransport } from "../src/live/transports/omp-rpc.js";
 import type { RpcWireExit, RpcWireHandle } from "../src/live/transports/rpc-base.js";
 import type { LiveCommand, LiveEvent, LiveLaunchRequest } from "../src/live/types.js";
+import { runLeaderFirstSurvivorScenario } from "./live-stop-authority.js";
 
 // ---------------------------------------------------------------------------
 // Fake wire
@@ -59,6 +60,41 @@ class FakeWire implements RpcWireHandle {
   }
   pushBytes(bytes: Buffer): void {
     this.dataHandler?.(bytes);
+  }
+}
+
+/**
+ * Group-owned wire for the shared authorization scenario: the leader exits
+ * via `exit()`, a helper keeps the owned PGID alive, and only SIGKILL takes
+ * the group down (the helper shrugs TERM off, like a trapped process).
+ */
+class GroupSurvivorWire extends FakeWire {
+  groupAlive = true;
+
+  constructor() {
+    super(false);
+  }
+
+  override signal(signal: NodeJS.Signals): void {
+    this.signals.push(signal);
+    if (signal === "SIGKILL") {
+      this.groupAlive = false;
+    }
+  }
+
+  async proveGroupGone(timeoutMs: number): Promise<boolean> {
+    let left = Math.max(0, timeoutMs);
+    for (;;) {
+      if (!this.groupAlive) {
+        return true;
+      }
+      if (left <= 0) {
+        return false;
+      }
+      const step = Math.min(5, left);
+      await new Promise<void>((resolve) => setTimeout(resolve, step));
+      left -= step;
+    }
   }
 }
 
@@ -685,5 +721,30 @@ describe("omp-rpc transport (fake wire, OMP 18.1.10 dialect)", () => {
     const second = await retry;
     expect(second.status).toBe("closed");
     expect(second.exit_code).toBe(137);
+  });
+
+  it("leader exits first, helper survives: graceful proves-only; terminate escalates the owned PGID", async () => {
+    const wire = new GroupSurvivorWire();
+    const transport = new OmpRpcTransport({
+      ...FAST,
+      spawner: async () => wire,
+    });
+    await openStarted(transport, wire);
+    new Pump(transport);
+
+    // The leader exits FIRST, before any shutdown is requested; the helper
+    // keeps the owned group alive and ignores everything but KILL.
+    wire.exit(0);
+    await flush();
+
+    await runLeaderFirstSurvivorScenario({
+      stop: async (mode) => {
+        const stopping = transport.stop(mode);
+        await vi.advanceTimersByTimeAsync(500);
+        return stopping;
+      },
+      survivorAlive: () => wire.groupAlive,
+      signals: () => wire.signals,
+    });
   });
 });

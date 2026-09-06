@@ -68,6 +68,9 @@ const INIT_TIMEOUT_MS = 15_000;
 const GRACEFUL_EXIT_MS = 5_000;
 const TERMINATE_STEP_MS = 1_500;
 
+/** Graceful never signals a leaderless group: it observes natural death only. */
+const GRACEFUL_GROUP_PROVE_MS = 250;
+
 /** One decoded stdout line: JSON object with a string `event` discriminator. */
 interface AgyEnvelope {
   event: string;
@@ -905,28 +908,45 @@ export class AgyStreamJsonTransport implements LiveTransport {
       ]);
     };
 
-    if (mode === "graceful") {
-      this.signalGroup("SIGINT");
-      if (!(await waitForExit(GRACEFUL_EXIT_MS))) {
+    // The signal ladder is only live while the leader has not yet exited:
+    // its purpose is to request the provider's own shutdown. Once the leader
+    // exit has been observed, nothing is signalled here — the group phase
+    // below decides, under the mode's authority.
+    if (!this.exitInfo) {
+      if (mode === "graceful") {
+        this.signalGroup("SIGINT");
+        if (!(await waitForExit(GRACEFUL_EXIT_MS))) {
+          this.signalGroup("SIGTERM");
+          await waitForExit(GRACEFUL_EXIT_MS);
+        }
+      } else {
         this.signalGroup("SIGTERM");
-        await waitForExit(GRACEFUL_EXIT_MS);
-      }
-    } else {
-      this.signalGroup("SIGTERM");
-      if (!(await waitForExit(TERMINATE_STEP_MS))) {
-        this.signalGroup("SIGKILL");
-        await waitForExit(GRACEFUL_EXIT_MS);
+        if (!(await waitForExit(TERMINATE_STEP_MS))) {
+          this.signalGroup("SIGKILL");
+          await waitForExit(GRACEFUL_EXIT_MS);
+        }
       }
     }
 
     if (!this.exitInfo) {
       return { status: "orphaned", exit_code: null, exit_signal: null, waited_ms: Date.now() - started };
     }
-    // `closed` requires the leader exit AND proof the owned group is gone;
-    // a surviving helper gets one bounded SIGKILL sweep first.
+    // `closed` requires the leader exit AND proof the owned group is gone.
+    // Authorization decides a group that outlived its leader: only
+    // `terminate` may signal it (bounded TERM→KILL against the owned PGID);
+    // `graceful` sends nothing, watches natural death briefly, and reports
+    // `orphaned` while retaining the child so a later terminate can escalate
+    // with fresh authority.
     if (child.groupAlive()) {
-      child.signalGroup("SIGKILL");
-      await child.proveGroupGone(GRACEFUL_EXIT_MS);
+      if (mode === "terminate") {
+        this.signalGroup("SIGTERM");
+        if (!(await child.proveGroupGone(TERMINATE_STEP_MS))) {
+          this.signalGroup("SIGKILL");
+          await child.proveGroupGone(GRACEFUL_EXIT_MS);
+        }
+      } else {
+        await child.proveGroupGone(GRACEFUL_GROUP_PROVE_MS);
+      }
     }
     if (child.groupAlive()) {
       return {

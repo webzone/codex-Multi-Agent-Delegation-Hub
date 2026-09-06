@@ -17,6 +17,10 @@ import type {
   LiveStatusCommand,
 } from "../src/live/types.js";
 import { removeDirectory } from "./helpers.js";
+import {
+  realProcessAlive,
+  runLeaderFirstSurvivorScenario,
+} from "./live-stop-authority.js";
 
 /**
  * Fake-protocol tests for the AGY 1.1.26 stream-json contract. The fake is a
@@ -31,6 +35,7 @@ interface FakeJournalEntry {
   argv?: string[];
   line?: string;
   event?: string;
+  pid?: number;
 }
 
 const HELP_WITH_RESUME =
@@ -105,6 +110,15 @@ rl.on('line', (line) => {
   journal({ m: 'stdin', line });
   out({ event: 'telepathy', payload: 'control frame the hub must never invent' });
 });
+`,
+  orphan: `
+const { spawn } = require('node:child_process');
+out({ event: 'init', conversation_id: 'conv-orphan' });
+// An owned-group helper that shrugs off everything but SIGKILL, then the
+// leader exits FIRST — before the hub ever requests a shutdown.
+const helper = spawn('/bin/sh', ['-c', "trap '' TERM INT HUP; while :; do sleep 1; done"], { stdio: 'ignore' });
+journal({ m: 'helper', pid: helper.pid });
+setTimeout(() => process.exit(0), 150);
 `,
 };
 
@@ -628,5 +642,34 @@ describe("agy stream-json transport", () => {
       await removeDirectory(fake.dir);
     }
   });
+
+  it(
+    "leader exits first, helper survives: graceful orphaned with no group signal; terminate kills and closes",
+    async () => {
+      const fake = await makeFakeAgy("orphan");
+      const transport = new AgyStreamJsonTransport({ command: fake.bin, environment: fake.environment });
+      try {
+        const recorder = new EventRecorder(transport.events());
+        await transport.open(launchRequest(fake.dir));
+        await recorder.waitUntil("leader exit", (events) =>
+          events.some((e) => e.body.kind === "exit"),
+        );
+
+        const journal = await readJournal(fake);
+        const helperPid = journal.find((entry) => entry.m === "helper")?.pid;
+        expect(typeof helperPid).toBe("number");
+        expect(realProcessAlive(helperPid as number)).toBe(true);
+
+        await runLeaderFirstSurvivorScenario({
+          stop: (mode) => transport.stop(mode),
+          survivorAlive: () => realProcessAlive(helperPid as number),
+        });
+      } finally {
+        await transport.stop("terminate");
+        await removeDirectory(fake.dir);
+      }
+    },
+    30_000,
+  );
 });
 

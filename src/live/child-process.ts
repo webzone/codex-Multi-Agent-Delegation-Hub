@@ -24,9 +24,11 @@ import type { LiveStopMode, LiveStopReport } from "./types.js";
  *     quiet stdout or a vanished socket.
  * `stop` reports `closed` only when the leader exit has been observed AND
  * (on POSIX) the owned process group is proven gone, and `orphaned` honestly
- * otherwise. `terminate` mode authorizes bounded SIGKILL escalation of the
- * group; graceful mode stops at SIGTERM and reports survival instead of
- * pretending.
+ * otherwise. Authorization boundary: `terminate` is the ONLY mode allowed to
+ * signal a group that outlived its leader, and then only with a bounded
+ * TERM→KILL escalation. A graceful stop never escalates after the leader is
+ * gone — it proves the group gone or reports `orphaned` while retaining the
+ * handle, so a later `terminate` can finish the shutdown with fresh proof.
  */
 
 export interface LiveChildSpec {
@@ -94,6 +96,14 @@ export interface LiveChildHandle {
 const DEFAULT_GRACE_MS = 5_000;
 const DEFAULT_KILL_WAIT_MS = 5_000;
 const POLL_INTERVAL_MS = 25;
+
+/**
+ * How long a graceful stop observes a surviving owned group after the leader
+ * exit. Graceful sends the group nothing at that point (only `terminate`
+ * authorizes group signals once the leader is down), so this window only
+ * watches helpers that die naturally; survival past it reports `orphaned`.
+ */
+const GRACEFUL_GROUP_PROVE_MS = 250;
 
 /** POSIX process-group signalling is unavailable on Windows; there `stop`
  * falls back to leader-exit proof alone and says so through `groupAlive`. */
@@ -351,12 +361,21 @@ export function launchLiveChild(spec: LiveChildSpec): Promise<LiveChildHandle> {
       }
 
       // Leader reaped is not enough: `closed` additionally requires proof the
-      // whole owned group is gone. A helper that outlived its leader gets one
-      // bounded SIGKILL sweep; survival is reported as `orphaned`, never
-      // assumed dead.
+      // whole owned group is gone. Authorization decides what happens to a
+      // group that outlived its leader: `terminate` may run the bounded
+      // TERM→KILL ladder against the owned PGID; `graceful` signals the group
+      // nothing — it only watches for natural death and reports `orphaned`
+      // (retaining this handle) when the group is still there.
       if (SUPPORTS_GROUP_SIGNALS && handle.groupAlive()) {
-        handle.signalGroup("SIGKILL");
-        await handle.proveGroupGone(killWaitMs);
+        if (mode === "terminate") {
+          handle.signalGroup("SIGTERM");
+          if (!(await handle.proveGroupGone(graceMs))) {
+            handle.signalGroup("SIGKILL");
+            await handle.proveGroupGone(killWaitMs);
+          }
+        } else {
+          await handle.proveGroupGone(GRACEFUL_GROUP_PROVE_MS);
+        }
       }
       if (SUPPORTS_GROUP_SIGNALS && handle.groupAlive()) {
         return {
