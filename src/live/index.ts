@@ -482,13 +482,25 @@ export async function runLiveSession(
       try {
         page = manager.eventsAfter(sessionId, cursor);
       } catch (error) {
+        if (asDelegateError(error).code === "LIVE_SESSION_NOT_FOUND") {
+          // The runner's own `close` just tore the session (and its ring)
+          // down. That is this runner's terminal path, not ring expiry:
+          // stop the relay quietly — never a spurious error document and
+          // never a second manager call that would re-throw.
+          relayStopped = true;
+          return false;
+        }
         // Honest ring expiry: the runner never silently drops events; it
         // resynchronizes the cursor from the manager and says so.
         io.stdout({
           type: "error",
           error: toLiveError(error, { stage: "transport", provider: started.state.provider }),
         });
-        cursor = manager.eventCursor(sessionId);
+        try {
+          cursor = manager.eventCursor(sessionId);
+        } catch {
+          relayStopped = true;
+        }
         return false;
       }
       if (page.events.length === 0) {

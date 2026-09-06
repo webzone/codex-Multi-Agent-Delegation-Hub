@@ -39,8 +39,11 @@ function fullCapabilities(overrides: Partial<LiveCapabilities> = {}): LiveCapabi
 
 function makeState(commonDir: string, head: string, overrides: Partial<LiveSessionState> = {}): LiveSessionState {
   const at = "2026-09-05T00:00:00.000Z";
+  // Key order mirrors parseLiveSessionState's rebuild so the byte-stable
+  // round-trip assertion is meaningful.
+  const worktreeParent = join(commonDir, "agent-hub", "live", "worktrees");
   return {
-    schema: 1,
+    schema: LIVE_SCHEMA_VERSION,
     live_session_id: LIVE_ID,
     session_id: null,
     provider: "omp",
@@ -55,6 +58,9 @@ function makeState(commonDir: string, head: string, overrides: Partial<LiveSessi
     base_commit: head,
     current_commit: head,
     checkpoint_seq: 0,
+    last_checkpoint_reason: null,
+    worktree_path: join(worktreeParent, LIVE_ID),
+    worktree_parent: worktreeParent,
     resume: null,
     status: "idle",
     revision: 1,
@@ -137,6 +143,49 @@ describe("live state schema gate", () => {
     ).toBeNull();
   });
 
+  it("rejects the legacy numeric schema, impossible checkpoint reasons, and bad worktree paths", () => {
+    const base = makeState("/abs/common", "a".repeat(40));
+    // The old numeric schema is dead data, never silently upgraded.
+    expect(parseLiveSessionState({ ...base, schema: 1 })).toBeNull();
+    expect(parseLiveSessionState({ ...base, schema: "agent-hub-live/v2" })).toBeNull();
+
+    // last_checkpoint_reason is non-null iff checkpoint_seq > 0.
+    expect(parseLiveSessionState({ ...base, last_checkpoint_reason: "turn_end" })).toBeNull();
+    expect(
+      parseLiveSessionState({
+        ...base,
+        checkpoint_seq: 1,
+        current_commit: "b".repeat(40),
+        last_checkpoint_reason: null,
+      }),
+    ).toBeNull();
+    expect(
+      parseLiveSessionState({
+        ...base,
+        checkpoint_seq: 1,
+        current_commit: "b".repeat(40),
+        last_checkpoint_reason: "turn_end",
+      }),
+    ).not.toBeNull();
+    expect(
+      parseLiveSessionState({ ...base, last_checkpoint_reason: "because-i-said-so" }),
+    ).toBeNull();
+
+    // Worktree paths are absolute, and the path sits strictly inside its parent.
+    expect(parseLiveSessionState({ ...base, worktree_path: "worktrees/live" })).toBeNull();
+    expect(parseLiveSessionState({ ...base, worktree_parent: "worktrees" })).toBeNull();
+    expect(
+      parseLiveSessionState({ ...base, worktree_path: "/abs/common/agent-hub/live/worktrees" }),
+    ).toBeNull();
+    expect(parseLiveSessionState({ ...base, worktree_path: "/somewhere/else/live" })).toBeNull();
+    expect(
+      parseLiveSessionState({
+        ...base,
+        worktree_path: "/abs/common/agent-hub/live/worktreesX/live",
+      }),
+    ).toBeNull();
+  });
+
   it("validates resume variants per provider", () => {
     const base = makeState("/abs/common", "a".repeat(40));
     expect(
@@ -202,6 +251,13 @@ describe("live transition protocol", () => {
     expect(await resolveRef(repository, liveRefFor(LIVE_ID))).toBe(head);
     expect(await resolveRef(repository, `refs/agent-hub/sessions/${LIVE_ID}`)).toBeNull();
     expect(await readFile(liveStatePath(commonDir, LIVE_ID), "utf8")).toContain('"revision": 1');
+    // The durable record and its sidecar live in the live/sessions subdir.
+    expect(liveStatePath(commonDir, LIVE_ID)).toBe(
+      join(commonDir, "agent-hub", "live", "sessions", `${LIVE_ID}.json`),
+    );
+    expect(livePendingPath(commonDir, LIVE_ID)).toBe(
+      join(commonDir, "agent-hub", "live", "sessions", `${LIVE_ID}.pending.json`),
+    );
     expect(
       await loadLiveState({ commonDir, repositoryCwd: repository, liveSessionId: LIVE_ID }),
     ).toEqual(state);
@@ -241,7 +297,13 @@ describe("live transition protocol", () => {
         ref: liveRefFor(LIVE_ID),
         expected_ref: head,
         new_commit: next,
-        next_state: { ...state, current_commit: next, checkpoint_seq: 1, revision: state.revision + 2 },
+        next_state: {
+          ...state,
+          current_commit: next,
+          checkpoint_seq: 1,
+          last_checkpoint_reason: "requested",
+          revision: state.revision + 2,
+        },
       }),
       "LIVE_STATE_INCONSISTENT",
     );
@@ -282,6 +344,7 @@ describe("live transition protocol", () => {
       ...state,
       current_commit: next,
       checkpoint_seq: 1,
+      last_checkpoint_reason: "turn_end",
       revision: 2,
       updated_at: "2026-09-05T00:00:05.000Z",
     };
@@ -315,6 +378,7 @@ describe("live transition protocol", () => {
       ...state,
       current_commit: next,
       checkpoint_seq: 1,
+      last_checkpoint_reason: "turn_end",
       revision: 2,
       updated_at: "2026-09-05T00:00:09.000Z",
     };
@@ -370,7 +434,13 @@ describe("live transition protocol", () => {
       ref: liveRefFor(LIVE_ID),
       expected_ref: head,
       new_commit: next,
-      next_state: { ...state, current_commit: next, checkpoint_seq: 1, revision: 2 },
+      next_state: {
+        ...state,
+        current_commit: next,
+        checkpoint_seq: 1,
+        last_checkpoint_reason: "requested",
+        revision: 2,
+      },
     };
     await writeFile(livePendingPath(commonDir, LIVE_ID), JSON.stringify(sidecar), "utf8");
 

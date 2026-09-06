@@ -1,35 +1,46 @@
 import { randomUUID } from "node:crypto";
+import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { describe, expect, it } from "vitest";
 
-import { AgentHubError } from "../src/errors.js";
 import { createHubServer } from "../src/mcp.js";
-import { LiveSessionManager, LiveTransportRegistry } from "../src/live/index.js";
-import type { LiveResumeSource } from "../src/live/index.js";
+import { resolveRepositoryIdentity } from "../src/git.js";
+import { LiveSessionManager, LIVE_DEFAULT_MAX_TEXT_BYTES } from "../src/live/manager.js";
+import { liveRefFor, liveStatePath } from "../src/live/state.js";
+import type { LiveLeaseProbes } from "../src/live/lease.js";
+import type { RepositoryIdentity } from "../src/types.js";
 import type {
   LiveBoundedText,
   LiveCapabilities,
   LiveCapabilityClaim,
   LiveCommand,
+  LiveEvent,
   LiveEventBody,
   LiveLaunchRequest,
   LiveLaunchReport,
+  LiveProbeResult,
   LiveProviderId,
-  LiveSessionState,
   LiveStopMode,
   LiveStopReport,
   LiveTransport,
   LiveTransportDescriptor,
   LiveTransportFactory,
   LiveTransportId,
+  ProviderResumeState,
 } from "../src/live/types.js";
 
+import { createGitRepository, removeDirectory, resolveRef } from "./helpers.js";
+
 // ---------------------------------------------------------------------------
-// Scripted transport harness (same contract surface as the CLI test; the
-// file boundary keeps each test file self-contained).
+// A scripted transport wired into the CORE LiveSessionManager, injected as
+// `dependencies.live` — the exact production seam (production builds the same
+// manager via `createLiveManager`; here the transports are fakes and the
+// repository is a throwaway git fixture under the OS temp dir).
 // ---------------------------------------------------------------------------
 
 function native(evidence: string): LiveCapabilityClaim {
@@ -68,19 +79,62 @@ const PROVIDER_BY_TRANSPORT: Record<LiveTransportId, LiveProviderId> = {
   "hermes-acp": "hermes",
 };
 
+/**
+ * Post-handshake resume state built from what the fake actually observed,
+ * mirroring the real transports: `verified` only ever becomes true when a
+ * durable hint round-tripped through the fake session identity.
+ */
+function scriptedResumeState(
+  provider: LiveProviderId,
+  observedSessionId: string,
+  prior: ProviderResumeState | null,
+): ProviderResumeState {
+  const roundTripped =
+    prior !== null && prior.provider === provider && prior.provider_session_id === observedSessionId;
+  const verification = roundTripped
+    ? { verified: true as const, verified_via: `fake-stream-echo:${observedSessionId}` }
+    : { verified: false as const, verified_via: null };
+  switch (provider) {
+    case "omp":
+      return {
+        provider: "omp",
+        provider_session_id: observedSessionId,
+        ...verification,
+        last_event_seq: prior?.provider === "omp" ? prior.last_event_seq : 0,
+      };
+    case "agy":
+      return {
+        provider: "agy",
+        provider_session_id: observedSessionId,
+        ...verification,
+        resume_argv_verified: false,
+      };
+    case "pi":
+      return {
+        provider: "pi",
+        provider_session_id: observedSessionId,
+        ...verification,
+        resume_token: prior?.provider === "pi" ? prior.resume_token : "tok-1",
+      };
+    case "hermes":
+      return {
+        provider: "hermes",
+        provider_session_id: observedSessionId,
+        ...verification,
+        session_load_advertised:
+          prior?.provider === "hermes" ? prior.session_load_advertised : false,
+      };
+  }
+}
+
 class ScriptedTransport implements LiveTransport {
   readonly id: LiveTransportId;
   readonly provider: LiveProviderId;
   readonly launchRequests: LiveLaunchRequest[] = [];
   readonly sent: LiveCommand[] = [];
   readonly stopCalls: LiveStopMode[] = [];
-  private queue: Array<{
-    live_session_id: string;
-    seq: number;
-    transport: LiveTransportId;
-    occurred_at: string;
-    body: LiveEventBody;
-  }> = [];
+  reportProcessCalls = 0;
+  private queue: LiveEvent[] = [];
   private wakeups: Array<() => void> = [];
   private ended = false;
   private seq = 0;
@@ -112,9 +166,18 @@ class ScriptedTransport implements LiveTransport {
   async open(request: LiveLaunchRequest): Promise<LiveLaunchReport> {
     this.launchRequests.push(request);
     this.sessionId = request.live_session_id;
-    this.emit({ kind: "status", status: "starting", note: null });
-    this.emit({ kind: "status", status: "idle", note: null });
-    return { pid: 4321, provider_session_id: "psess-1", launched_at: new Date().toISOString() };
+    // The new launch contract: a spawned provider reports its process facts
+    // before any handshake can fail.
+    if (request.report_process) {
+      this.reportProcessCalls += 1;
+      await request.report_process({ pid: 4321, pgid: 4321 });
+    }
+    return {
+      pid: 4321,
+      provider_session_id: "psess-1",
+      launched_at: new Date().toISOString(),
+      resume_state: scriptedResumeState(this.provider, "psess-1", request.resume),
+    };
   }
 
   async send(command: LiveCommand): Promise<void> {
@@ -171,7 +234,7 @@ class ScriptedTransport implements LiveTransport {
     }
   }
 
-  async *events() {
+  async *events(): AsyncGenerator<LiveEvent> {
     for (;;) {
       const next = this.queue.shift();
       if (next !== undefined) {
@@ -181,7 +244,9 @@ class ScriptedTransport implements LiveTransport {
       if (this.ended) {
         return;
       }
-      await new Promise<void>((resolve) => this.wakeups.push(resolve));
+      const wake = Promise.withResolvers<void>();
+      this.wakeups.push(wake.resolve);
+      await wake.promise;
     }
   }
 
@@ -208,7 +273,7 @@ class ScriptedFactory implements LiveTransportFactory {
     this.provider = PROVIDER_BY_TRANSPORT[transport];
   }
 
-  async probe() {
+  async probe(): Promise<LiveProbeResult> {
     return { found: true, version: "9.9.9-scripted", detail: "scripted provider present" };
   }
 
@@ -219,12 +284,84 @@ class ScriptedFactory implements LiveTransportFactory {
   }
 }
 
-function managerWith(factories: LiveTransportFactory[]): LiveSessionManager {
-  const registry = new LiveTransportRegistry();
-  for (const factory of factories) {
-    registry.register(factory);
+/** Lease probes that never touch the real OS (same fixture as live-core). */
+function fakeProbes(): LiveLeaseProbes {
+  return {
+    probePid: (pid) => (pid === process.pid ? "live" : "dead"),
+    startToken: async (pid) => (pid === process.pid ? "hub-tok" : "prov-tok"),
+    killGroup: () => true,
+    now: () => new Date(),
+  };
+}
+
+interface Harness {
+  repository: string;
+  identity: RepositoryIdentity;
+  commonDir: string;
+  tmpRoot: string;
+  manager: LiveSessionManager;
+  factories: ScriptedFactory[];
+  client: Client;
+  cleanup: () => Promise<void>;
+}
+
+async function harness(
+  options: { capabilities?: LiveCapabilities; factories?: ScriptedFactory[] } = {},
+): Promise<Harness> {
+  const repository = await createGitRepository();
+  const identity = await resolveRepositoryIdentity(repository);
+  const tmpRoot = await mkdtemp(join(tmpdir(), "agent-hub-live-mcp-"));
+  const factories = options.factories ?? [new ScriptedFactory("pi-rpc", options.capabilities)];
+  const manager = new LiveSessionManager({
+    commonDir: identity.common_dir,
+    repositoryCwd: repository,
+    transportFactories: factories,
+    tmpRoot,
+    leaseProbes: fakeProbes(),
+  });
+  const client = await connectClient(createHubServer({ live: manager }));
+  return {
+    repository,
+    identity,
+    commonDir: identity.common_dir,
+    tmpRoot,
+    manager,
+    factories,
+    client,
+    cleanup: async () => {
+      await manager.closeAll();
+      await removeDirectory(repository);
+      await removeDirectory(tmpRoot);
+    },
+  };
+}
+
+async function tick(): Promise<void> {
+  const deferred = Promise.withResolvers<void>();
+  setImmediate(deferred.resolve);
+  await deferred.promise;
+}
+
+/**
+ * The hub event ring is stamped BEFORE the pump handles each event, and the
+ * permission_request branch adds to `open_permissions` synchronously, so a
+ * request visible in the ring is guaranteed answerable. Poll it rather than
+ * racing the durable status writes the pump performs in between.
+ */
+async function waitForPermissionRequests(
+  manager: LiveSessionManager,
+  liveSessionId: string,
+  count: number,
+): Promise<void> {
+  for (let attempt = 0; attempt < 10_000; attempt += 1) {
+    const { events } = manager.eventsAfter(liveSessionId, 0);
+    const seen = events.filter((event) => event.body.kind === "permission_request").length;
+    if (seen >= count) {
+      return;
+    }
+    await tick();
   }
-  return new LiveSessionManager({ registry, launchSettleMs: 500, turnTimeoutMs: 5_000 });
+  throw new Error(`permission request #${count} never reached the hub event ring`);
 }
 
 async function connectClient(server: McpServer): Promise<Client> {
@@ -235,54 +372,59 @@ async function connectClient(server: McpServer): Promise<Client> {
   return client;
 }
 
-function documentFrom(result: unknown): Record<string, any> {
-  const content = (result as { content?: unknown }).content;
-  if (!Array.isArray(content) || content.length === 0) {
-    throw new Error("expected a content-bearing tool result");
+function textOf(result: unknown): string {
+  const missing = new Error("expected a content-bearing tool result");
+  if (typeof result !== "object" || result === null || !("content" in result)) {
+    throw missing;
   }
-  return JSON.parse((content[0] as { text: string }).text) as Record<string, any>;
+  const content: unknown = result.content;
+  const first = Array.isArray(content) ? content[0] : undefined;
+  if (
+    typeof first !== "object" ||
+    first === null ||
+    !("text" in first) ||
+    typeof first.text !== "string"
+  ) {
+    throw missing;
+  }
+  return first.text;
 }
 
-function liveStateFixture(overrides: Partial<LiveSessionState> = {}): LiveSessionState {
-  const iso = new Date().toISOString();
-  return {
-    schema: 1,
-    live_session_id: randomUUID(),
-    session_id: null,
-    provider: "pi",
-    transport: "pi-rpc",
-    capabilities: capabilitySnapshot(),
-    identity: {
-      common_dir: "/repo/.git",
-      worktree_root: "/repo",
-      branch: "main",
-      head: "f".repeat(40),
-    },
-    base_commit: "f".repeat(40),
-    current_commit: "f".repeat(40),
-    checkpoint_seq: 0,
-    resume: {
-      provider: "pi",
-      provider_session_id: "psess-9",
-      resume_token: "tok-1",
-      verified: false,
-      verified_via: null,
-    },
-    status: "orphaned",
-    revision: 3,
-    last_error: null,
-    created_at: iso,
-    updated_at: iso,
-    ...overrides,
-  };
+function documentFrom(result: unknown): Record<string, any> {
+  return JSON.parse(textOf(result)) as Record<string, any>;
 }
+
+async function startLive(
+  h: Harness,
+  agent: LiveProviderId = "pi",
+): Promise<Record<string, any>> {
+  const result = await h.client.callTool({
+    name: "live_session_start",
+    arguments: { agent, workspace: h.repository },
+  });
+  expect(result.isError ?? false).toBe(false);
+  return documentFrom(result);
+}
+
+async function command(
+  h: Harness,
+  liveSessionId: string,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  return h.client.callTool({
+    name: "live_session_command",
+    arguments: { live_session_id: liveSessionId, ...args },
+  });
+}
+
+const HEAVY = 30_000;
 
 // ---------------------------------------------------------------------------
 
 describe("live MCP tools", () => {
   it("registers the five live tools next to the unchanged legacy tools", async () => {
-    const client = await connectClient(createHubServer({ live: managerWith([]) }));
-    const { tools } = await client.listTools();
+    const h = await harness();
+    const { tools } = await h.client.listTools();
 
     expect(tools.map((tool) => tool.name)).toEqual(
       expect.arrayContaining([
@@ -298,272 +440,403 @@ describe("live MCP tools", () => {
         "live_session_close",
       ]),
     );
+    await h.cleanup();
   });
 
   it("starts a live session and answers with the frozen capability snapshot", async () => {
-    const factory = new ScriptedFactory("pi-rpc");
-    const client = await connectClient(createHubServer({ live: managerWith([factory]) }));
+    const h = await harness();
+    const factory = h.factories[0]!;
 
-    const result = await client.callTool({
-      name: "live_session_start",
-      arguments: { agent: "pi", workspace: "/tmp/repo" },
-    });
-
-    expect(result.isError ?? false).toBe(false);
-    const document = documentFrom(result);
+    const document = await startLive(h);
     expect(document).toMatchObject({
+      capabilities: capabilitySnapshot(),
+      state: {
+        schema: "agent-hub-live/v1",
+        provider: "pi",
+        transport: "pi-rpc",
+        status: "idle",
+        revision: 1,
+        checkpoint_seq: 0,
+        last_checkpoint_reason: null,
+        base_commit: h.identity.head,
+        current_commit: h.identity.head,
+      },
+    });
+    const liveSessionId = document.live_session_id as string;
+    expect(liveSessionId).toMatch(/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+
+    // The provider runs in a hub-owned OS-temp worktree, never the caller checkout.
+    expect(document.state.worktree_path).toBe(document.workspace);
+    expect(document.state.worktree_parent).toBe(dirname(document.workspace as string));
+    expect((document.workspace as string).startsWith(join(h.tmpRoot, "agent-hub-live-"))).toBe(
+      true,
+    );
+    expect(document.workspace).not.toBe(h.repository);
+    expect(document.state.identity).toEqual(h.identity);
+
+    // The launch request carries provider cwd = the hub worktree, the default
+    // byte bound, no resume hint, and reported its process facts at spawn.
+    const launch = factory.created[0]!.launchRequests[0]!;
+    expect(launch.workspace).toBe(document.workspace);
+    expect(launch.live_session_id).toBe(liveSessionId);
+    expect(launch.max_text_bytes).toBe(LIVE_DEFAULT_MAX_TEXT_BYTES);
+    expect(launch.resume).toBeNull();
+    expect(factory.created[0]!.reportProcessCalls).toBe(1);
+
+    // The durable record landed next to the repository's live state root.
+    const durable = JSON.parse(
+      await readFile(liveStatePath(h.commonDir, liveSessionId), "utf8"),
+    ) as Record<string, unknown>;
+    expect(durable).toMatchObject({
+      schema: "agent-hub-live/v1",
+      live_session_id: liveSessionId,
       provider: "pi",
       transport: "pi-rpc",
-      pid: 4321,
-      provider_session_id: "psess-1",
-      capabilities: { prompt: { support: "native", evidence: "scripted prompt round-trip" } },
+      worktree_path: document.workspace,
+      worktree_parent: document.state.worktree_parent,
     });
-    // The launch request carries the default byte bound and no resume hint.
-    expect(factory.created[0]?.launchRequests[0]).toMatchObject({
-      max_text_bytes: 32_768,
-      resume: null,
-    });
+
+    await h.cleanup();
   });
 
-  it("fails honestly when the provider transport is unwired", async () => {
-    const client = await connectClient(createHubServer({ live: managerWith([]) }));
+  it("fails honestly when the fake transport registry lacks the provider", async () => {
+    const h = await harness({ factories: [] });
 
-    const result = await client.callTool({
+    const result = await h.client.callTool({
       name: "live_session_start",
-      arguments: { agent: "hermes", workspace: "/tmp/repo" },
+      arguments: { agent: "hermes", workspace: h.repository },
     });
 
     expect(result.isError).toBe(true);
     expect(documentFrom(result).error).toMatchObject({ code: "LIVE_TRANSPORT_UNAVAILABLE" });
+    expect(h.manager.activeCount).toBe(0);
+    await h.cleanup();
   });
 
-  it("runs a prompt turn, exposes events by cursor, and gates the second prompt", async () => {
-    const factory = new ScriptedFactory("pi-rpc");
-    const client = await connectClient(createHubServer({ live: managerWith([factory]) }));
+  it(
+    "runs a prompt turn, exposes events by cursor, and gates the second prompt",
+    async () => {
+      const h = await harness();
+      const start = await startLive(h);
+      const id = start.live_session_id as string;
 
-    const start = documentFrom(
-      await client.callTool({
-        name: "live_session_start",
-        arguments: { agent: "pi", workspace: "/tmp/repo" },
-      }),
-    );
-    const id = start.live_session_id as string;
+      const prompt = documentFrom(await command(h, id, { action: "prompt", text: "write tests" }));
+      expect(prompt.status).toBe("idle");
+      expect(prompt.result).toMatchObject({
+        kind: "prompt",
+        outcome: "succeeded",
+        final_text: { text: "Answer: write tests", truncated: false },
+        checkpoint: null,
+        usage: { input_tokens: 10, output_tokens: 2, cached_tokens: null, cost_usd: null },
+      });
 
-    const prompt = await client.callTool({
-      name: "live_session_command",
-      arguments: { live_session_id: id, action: "prompt", text: "write tests" },
-    });
-    expect(prompt.isError ?? false).toBe(false);
-    const promptDoc = documentFrom(prompt);
-    expect(promptDoc).toMatchObject({ status: "idle" });
-    expect(promptDoc.result).toMatchObject({
-      kind: "prompt",
-      outcome: "succeeded",
-      final_text: { text: "Answer: write tests" },
-      checkpoint: null,
-    });
+      const page1 = documentFrom(
+        await h.client.callTool({
+          name: "live_session_events",
+          arguments: { live_session_id: id, cursor: 0 },
+        }),
+      );
+      const seen: number[] = page1.events.map((event: { seq: number }) => event.seq);
+      expect(seen).toEqual(seen.map((_: number, index: number) => index + 1)); // 1-based, no gaps
+      expect(page1.next_cursor).toBe(seen[seen.length - 1]);
+      expect(
+        page1.events.every(
+          (event: { live_session_id: string; transport: string }) =>
+            event.live_session_id === id && event.transport === "pi-rpc",
+        ),
+      ).toBe(true); // the hub owns the envelope, not the transport
+      expect(
+        page1.events.some(
+          (event: { body: { kind: string; text?: { text: string } } }) =>
+            event.body.kind === "text" && event.body.text?.text === "Answer: write tests",
+        ),
+      ).toBe(true);
 
-    const page1 = documentFrom(
-      await client.callTool({
-        name: "live_session_events",
-        arguments: { live_session_id: id, cursor: 0, limit: 3 },
-      }),
-    );
-    expect(page1.events).toHaveLength(3);
-    expect(page1.next_cursor).toBe(3);
-    expect(page1.earliest_seq).toBe(1);
-    expect(page1.dropped).toBe(false);
+      const page2 = documentFrom(
+        await h.client.callTool({
+          name: "live_session_events",
+          arguments: { live_session_id: id, cursor: page1.next_cursor },
+        }),
+      );
+      expect(page2.events).toEqual([]);
+      expect(page2.next_cursor).toBe(page1.next_cursor);
 
-    const page2 = documentFrom(
-      await client.callTool({
-        name: "live_session_events",
-        arguments: { live_session_id: id, cursor: page1.next_cursor, limit: 100 },
-      }),
-    );
-    expect(page2.events[0].seq).toBe(4);
-    const seen: number[] = page2.events.map((event: { seq: number }) => event.seq);
-    expect(seen).toEqual(seen.map((_: number, index: number) => index + 4)); // contiguous after cursor
+      // The one prompt is spent — the second prompt is refused as a caller error.
+      const second = await command(h, id, { action: "prompt", text: "again" });
+      expect(second.isError).toBe(true);
+      expect(documentFrom(second).error).toMatchObject({
+        code: "LIVE_PROMPT_ALREADY_ACCEPTED",
+      });
 
-    const second = await client.callTool({
-      name: "live_session_command",
-      arguments: { live_session_id: id, action: "prompt", text: "again" },
-    });
-    expect(second.isError).toBe(true);
-    const secondDoc = documentFrom(second);
-    expect(secondDoc.result).toMatchObject({ outcome: "failed" });
-    expect(secondDoc.result.error).toMatchObject({ code: "LIVE_STATE_REJECTED" });
-  });
+      // ...and the session remains usable for follow-ups.
+      const follow = documentFrom(await command(h, id, { action: "follow_up", text: "and more" }));
+      expect(follow.result).toMatchObject({
+        kind: "follow_up",
+        outcome: "succeeded",
+        final_text: { text: "Answer: and more" },
+      });
+
+      await h.cleanup();
+    },
+    HEAVY,
+  );
 
   it("refuses a capability-unsupported steer pre-dispatch with isError", async () => {
-    const factory = new ScriptedFactory("pi-rpc", capabilitySnapshot({ steer: unclaimed() }));
-    const client = await connectClient(createHubServer({ live: managerWith([factory]) }));
+    const h = await harness({ capabilities: capabilitySnapshot({ steer: unclaimed() }) });
+    const start = await startLive(h);
 
-    const start = documentFrom(
-      await client.callTool({
-        name: "live_session_start",
-        arguments: { agent: "pi", workspace: "/tmp/repo" },
-      }),
-    );
-    const result = await client.callTool({
-      name: "live_session_command",
-      arguments: { live_session_id: start.live_session_id, action: "steer", text: "left" },
+    const result = await command(h, start.live_session_id as string, {
+      action: "steer",
+      text: "left",
     });
 
     expect(result.isError).toBe(true);
     const document = documentFrom(result);
     expect(document.result).toMatchObject({ outcome: "unsupported" });
     expect(document.result.error).toMatchObject({ stage: "capability", retryable: false });
-    expect(factory.created[0]?.sent).toHaveLength(0); // never delivered
+    expect(h.factories[0]!.created[0]!.sent).toHaveLength(0); // never delivered
+    await h.cleanup();
   });
 
-  it("cancels an in-flight turn through the command tool", async () => {
-    const factory = new ScriptedFactory("pi-rpc");
-    const client = await connectClient(createHubServer({ live: managerWith([factory]) }));
+  it(
+    "cancels an in-flight turn through the command tool",
+    async () => {
+      const h = await harness();
+      const start = await startLive(h);
+      const id = start.live_session_id as string;
 
-    const start = documentFrom(
-      await client.callTool({
-        name: "live_session_start",
-        arguments: { agent: "pi", workspace: "/tmp/repo" },
-      }),
-    );
-    const id = start.live_session_id as string;
+      // The prompt turn parks on the scripted permission request; cancel settles it.
+      const promptCall = command(h, id, { action: "prompt", text: "ask me first" });
+      const cancel = documentFrom(
+        await command(h, id, { action: "cancel", reason: "changed my mind" }),
+      );
+      expect(cancel.result).toMatchObject({ kind: "cancel", outcome: "succeeded" });
 
-    // The prompt turn parks on the scripted permission request; cancel settles it.
-    const promptCall = client.callTool({
-      name: "live_session_command",
-      arguments: { live_session_id: id, action: "prompt", text: "ask me first" },
-    });
-    const cancel = await client.callTool({
-      name: "live_session_command",
-      arguments: { live_session_id: id, action: "cancel", reason: "changed my mind" },
-    });
-    expect(cancel.isError ?? false).toBe(false);
-    const prompt = documentFrom(await promptCall);
-    expect(prompt.result).toMatchObject({ kind: "prompt", outcome: "cancelled" });
-  });
+      const prompt = documentFrom(await promptCall);
+      expect(prompt.result).toMatchObject({
+        kind: "prompt",
+        outcome: "cancelled",
+        checkpoint: null,
+        error: null,
+      });
+      await h.cleanup();
+    },
+    HEAVY,
+  );
 
-  it("reports an unknown permission request as a failed tool result", async () => {
-    const factory = new ScriptedFactory("pi-rpc");
-    const client = await connectClient(createHubServer({ live: managerWith([factory]) }));
+  it(
+    "answers permission requests with allow_once or deny only — unknown ids and widened verdicts are honest errors",
+    async () => {
+      const h = await harness();
+      const start = await startLive(h);
+      const id = start.live_session_id as string;
 
-    const start = documentFrom(
-      await client.callTool({
-        name: "live_session_start",
-        arguments: { agent: "pi", workspace: "/tmp/repo" },
-      }),
-    );
-    const promptCall = client.callTool({
-      name: "live_session_command",
-      arguments: { live_session_id: start.live_session_id, action: "prompt", text: "ask me first" },
-    });
-    const answer = await client.callTool({
-      name: "live_session_command",
-      arguments: {
-        live_session_id: start.live_session_id,
+      const promptCall = command(h, id, { action: "prompt", text: "ask me first" });
+      await waitForPermissionRequests(h.manager, id, 1);
+
+      const unknown = await command(h, id, {
         action: "permission_response",
         request_id: "not-observed",
         decision: "deny",
-      },
-    });
+      });
+      expect(unknown.isError).toBe(true);
+      expect(documentFrom(unknown).error).toMatchObject({
+        code: "LIVE_PERMISSION_REQUEST_UNKNOWN",
+      });
 
-    expect(answer.isError).toBe(true);
-    expect(documentFrom(answer).result.error).toMatchObject({
-      code: "LIVE_PERMISSION_REQUEST_UNKNOWN",
-    });
-    await client.callTool({
-      name: "live_session_close",
-      arguments: { live_session_id: start.live_session_id, terminate: true },
-    });
-    const prompt = documentFrom(await promptCall);
-    expect(prompt.result.outcome).toBe("cancelled");
-    // The tool passed `terminate: true` straight to the transport.
-    expect(factory.created[0]?.stopCalls).toEqual(["terminate"]);
-  });
+      const allow = documentFrom(
+        await command(h, id, {
+          action: "permission_response",
+          request_id: "req-9",
+          decision: "allow_once",
+          note: "ship it",
+        }),
+      );
+      expect(allow.result).toMatchObject({ kind: "permission_response", outcome: "succeeded" });
+      const turn1 = documentFrom(await promptCall);
+      expect(turn1.result).toMatchObject({
+        kind: "prompt",
+        outcome: "succeeded",
+        final_text: { text: "permitted: allow_once" },
+      });
 
-  it("closes honestly and refuses later commands while events stay readable", async () => {
-    const factory = new ScriptedFactory("pi-rpc");
-    const client = await connectClient(createHubServer({ live: managerWith([factory]) }));
+      const askAgain = command(h, id, { action: "follow_up", text: "ask again" });
+      await waitForPermissionRequests(h.manager, id, 2);
+      const deny = await command(h, id, {
+        action: "permission_response",
+        request_id: "req-9",
+        decision: "deny",
+      });
+      expect(deny.isError ?? false).toBe(false);
+      const turn2 = documentFrom(await askAgain);
+      expect(turn2.result).toMatchObject({
+        kind: "follow_up",
+        outcome: "succeeded",
+        final_text: { text: "permitted: deny" },
+      });
 
-    const start = documentFrom(
-      await client.callTool({
-        name: "live_session_start",
-        arguments: { agent: "pi", workspace: "/tmp/repo" },
-      }),
-    );
-    const id = start.live_session_id as string;
-    await client.callTool({
-      name: "live_session_command",
-      arguments: { live_session_id: id, action: "prompt", text: "work" },
-    });
+      // A widened verdict never reaches the manager: the tool schema refuses it.
+      const widened = await command(h, id, {
+        action: "permission_response",
+        request_id: "req-9",
+        decision: "allow_session",
+      });
+      expect(widened.isError).toBe(true);
+      expect(textOf(widened)).toContain('one of "allow_once"|"deny"');
 
-    const close = await client.callTool({
-      name: "live_session_close",
-      arguments: { live_session_id: id },
-    });
-    expect(close.isError ?? false).toBe(false);
-    expect(documentFrom(close)).toMatchObject({
-      status: "closed",
-      stop: { status: "closed", exit_code: 0 },
-    });
+      // Only the two legal verdicts ever crossed the transport boundary.
+      const answered = h.factories[0]!.created
+        .flatMap((transport) => transport.sent)
+        .filter((sent): sent is Extract<LiveCommand, { kind: "permission_response" }> =>
+          sent.kind === "permission_response",
+        );
+      expect(answered.map((sent) => sent.decision)).toEqual(["allow_once", "deny"]);
+      await h.cleanup();
+    },
+    HEAVY,
+  );
 
-    const after = await client.callTool({
-      name: "live_session_command",
-      arguments: { live_session_id: id, action: "follow_up", text: "more" },
-    });
-    expect(after.isError).toBe(true);
-    expect(documentFrom(after).result.error).toMatchObject({ code: "LIVE_SESSION_CLOSED" });
+  it(
+    "closes honestly, pins the close checkpoint, and refuses later commands",
+    async () => {
+      const h = await harness();
+      const start = await startLive(h);
+      const id = start.live_session_id as string;
 
-    const events = documentFrom(
-      await client.callTool({ name: "live_session_events", arguments: { live_session_id: id } }),
-    );
-    expect(events.events.some((body: { seq: number }) => body.seq > 0)).toBe(true);
-  });
+      // Uncommitted work in the hub worktree must be pinned by the close.
+      await writeFile(join(start.workspace as string, "close-me.txt"), "pin me\n");
+      const closeResult = await h.client.callTool({
+        name: "live_session_close",
+        arguments: { live_session_id: id, terminate: true },
+      });
+      expect(closeResult.isError ?? false).toBe(false);
+      const close = documentFrom(closeResult);
+      expect(close.stop).toMatchObject({ status: "closed", exit_code: 0, exit_signal: null });
+      expect(close.checkpoint_taken).toBe(true);
+      expect(close.cleanup_errors).toEqual([]);
+      expect(close.state).toMatchObject({
+        schema: "agent-hub-live/v1",
+        status: "closed",
+        checkpoint_seq: 1,
+        last_checkpoint_reason: "close",
+        base_commit: h.identity.head,
+        worktree_path: start.workspace,
+        worktree_parent: start.state.worktree_parent,
+      });
+      expect(close.state.current_commit).not.toBe(h.identity.head);
+      await expect(resolveRef(h.repository, liveRefFor(id))).resolves.toBe(
+        close.state.current_commit,
+      );
 
-  it("resumes through the durable seam and reports missing sessions honestly", async () => {
-    const factory = new ScriptedFactory("pi-rpc");
-    const state = liveStateFixture();
-    const resumeSource: LiveResumeSource = {
-      async load(_workspace: string, liveSessionId: string): Promise<LiveSessionState> {
-        if (liveSessionId !== state.live_session_id) {
-          throw new AgentHubError("LIVE_SESSION_NOT_FOUND", `no durable live session "${liveSessionId}"`);
-        }
-        return state;
-      },
-    };
-    const client = await connectClient(
-      createHubServer({ live: managerWith([factory]), liveResumeSource: resumeSource }),
-    );
+      // The tool passed `terminate: true` straight through as the stop mode,
+      // and teardown took the worktree with it.
+      expect(h.factories[0]!.created[0]!.stopCalls).toEqual(["terminate"]);
+      await expect(stat(start.workspace as string)).rejects.toThrow();
 
-    const resumed = await client.callTool({
-      name: "live_session_resume",
-      arguments: { live_session_id: state.live_session_id, workspace: "/tmp/repo" },
-    });
-    expect(resumed.isError ?? false).toBe(false);
-    const document = documentFrom(resumed);
-    expect(document).toMatchObject({ live_session_id: state.live_session_id, provider: "pi" });
-    expect(factory.created[0]?.launchRequests[0]?.resume).toEqual(state.resume);
+      // Teardown dropped the session and its ring: later traffic is a hard
+      // not-found, never a fake continuation.
+      const after = await command(h, id, { action: "follow_up", text: "more" });
+      expect(after.isError).toBe(true);
+      expect(documentFrom(after).error).toMatchObject({ code: "LIVE_SESSION_NOT_FOUND" });
+      const events = await h.client.callTool({
+        name: "live_session_events",
+        arguments: { live_session_id: id },
+      });
+      expect(events.isError).toBe(true);
+      expect(documentFrom(events).error).toMatchObject({ code: "LIVE_SESSION_NOT_FOUND" });
 
-    const missing = await client.callTool({
-      name: "live_session_resume",
-      arguments: { live_session_id: "live-unknown", workspace: "/tmp/repo" },
-    });
-    expect(missing.isError).toBe(true);
-    expect(documentFrom(missing).error).toMatchObject({ code: "LIVE_SESSION_NOT_FOUND" });
-  });
+      await h.cleanup();
+    },
+    HEAVY,
+  );
 
-  it("answers unknown sessions with structured tool errors, never a throw", async () => {
-    const client = await connectClient(createHubServer({ live: managerWith([]) }));
+  it(
+    "resumes a terminal durable record under the same live session id",
+    async () => {
+      const h = await harness();
+      const factory = h.factories[0]!;
+      const start = await startLive(h);
+      const id = start.live_session_id as string;
 
-    for (const name of ["live_session_command", "live_session_events", "live_session_close"]) {
-      const result = await client.callTool({
-        name,
-        arguments: {
-          live_session_id: "live-ghost",
-          ...(name === "live_session_command" ? { action: "status" as const } : {}),
+      await writeFile(join(start.workspace as string, "work.txt"), "durable\n");
+      const closed = documentFrom(
+        await h.client.callTool({
+          name: "live_session_close",
+          arguments: { live_session_id: id },
+        }),
+      );
+      expect(closed.state.status).toBe("closed");
+      expect(closed.checkpoint_taken).toBe(true);
+
+      const resumed = await h.client.callTool({
+        name: "live_session_resume",
+        arguments: { live_session_id: id, workspace: h.repository },
+      });
+      expect(resumed.isError ?? false).toBe(false);
+      const document = documentFrom(resumed);
+      expect(document.live_session_id).toBe(id); // same ref, never a new one
+      expect(document.state).toMatchObject({
+        schema: "agent-hub-live/v1",
+        live_session_id: id,
+        status: "idle",
+        provider: "pi",
+        transport: "pi-rpc",
+        revision: (closed.state.revision as number) + 1,
+        current_commit: closed.state.current_commit,
+        resume: {
+          provider: "pi",
+          provider_session_id: "psess-1",
+          verified: true,
+          verified_via: "fake-stream-echo:psess-1",
         },
       });
+      expect(document.workspace).not.toBe(start.workspace); // a FRESH worktree
+      expect(document.state.worktree_path).toBe(document.workspace);
+      // Materialized at the chain head: the pinned work is on disk again.
+      expect(await readFile(join(document.workspace as string, "work.txt"), "utf8")).toBe(
+        "durable\n",
+      );
+
+      // The transport received the durable resume hint on the restart launch.
+      expect(factory.created).toHaveLength(2);
+      const resumeLaunch = factory.created[1]!.launchRequests[0]!;
+      expect(resumeLaunch.resume).toEqual(closed.state.resume);
+      expect(resumeLaunch.workspace).toBe(document.workspace);
+
+      // A malformed id is refused by the id-shape gate; a well-formed unknown
+      // id reports the absence honestly.
+      const malformed = await h.client.callTool({
+        name: "live_session_resume",
+        arguments: { live_session_id: "live-unknown", workspace: h.repository },
+      });
+      expect(malformed.isError).toBe(true);
+      expect(documentFrom(malformed).error).toMatchObject({ code: "LIVE_SESSION_ID_INVALID" });
+      const missing = await h.client.callTool({
+        name: "live_session_resume",
+        arguments: { live_session_id: randomUUID(), workspace: h.repository },
+      });
+      expect(missing.isError).toBe(true);
+      expect(documentFrom(missing).error).toMatchObject({ code: "LIVE_SESSION_NOT_FOUND" });
+
+      await h.cleanup();
+    },
+    HEAVY,
+  );
+
+  it("answers unknown sessions with structured tool errors, never a throw", async () => {
+    const h = await harness();
+
+    for (const name of ["live_session_command", "live_session_events", "live_session_close"]) {
+      const result =
+        name === "live_session_command"
+          ? await command(h, "live-ghost", { action: "status" })
+          : await h.client.callTool({
+              name,
+              arguments: { live_session_id: "live-ghost" },
+            });
       expect(result.isError).toBe(true);
       expect(documentFrom(result).error).toMatchObject({ code: "LIVE_SESSION_NOT_FOUND" });
     }
+    await h.cleanup();
   });
 });

@@ -206,7 +206,7 @@ describe("classifyLiveLease", () => {
     ).toBe("uncertain");
   });
 
-  it("probes a dead provider pid as dead, none as none", async () => {
+  it("probes a dead provider pid as dead; a null pid proves nothing about the provider", async () => {
     const commonDir = await tempCommonDir();
     const lease = await seedLease(commonDir);
     const gone = fakeProbes({ alive: [] });
@@ -215,13 +215,17 @@ describe("classifyLiveLease", () => {
       provider: { state: "dead" },
     });
 
-
+    // A null provider pid only proves recorded ownership never landed —
+    // provider death may never be inferred from it. The classification must
+    // stay conservative: uncertain, non-reapable, with a stated reason.
     const otherDir = await tempCommonDir();
     const noProcess = await seedLease(otherDir, { provider_pid: null, provider_pgid: null });
-    expect(await classifyLiveLease(noProcess, gone)).toEqual({
-      state: "hub-gone",
-      provider: { state: "none" },
-    });
+    const verdict = await classifyLiveLease(noProcess, gone);
+    if (verdict.state !== "hub-gone" || verdict.provider.state !== "uncertain") {
+      expect.unreachable("a null provider pid must classify as hub-gone with an uncertain provider");
+    }
+    expect(verdict.provider.reapable).toBe(false);
+    expect(verdict.provider.reason).toContain("no provider pid");
   });
 });
 

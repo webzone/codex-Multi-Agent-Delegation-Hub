@@ -9,6 +9,7 @@ import { AgentHubError } from "../src/errors.js";
 import { resolveRepositoryIdentity } from "../src/git.js";
 import { encodeJsonlFrame, LiveJsonlFramer } from "../src/live/jsonl.js";
 import { launchLiveChild } from "../src/live/child-process.js";
+import { liveStatePath } from "../src/live/state.js";
 import {
   LiveSessionManager,
   LIVE_COMMON_DIR_SESSION_QUOTA,
@@ -27,6 +28,7 @@ import type {
   LiveEventBody,
   LiveLaunchRequest,
   LiveLaunchReport,
+  LivePermissionDecision,
   LiveProbeResult,
   LiveProviderFactory,
   LiveStopMode,
@@ -76,7 +78,10 @@ class FakeTransport implements LiveTransport {
     private readonly caps: LiveCapabilities = fullCapabilities(),
     private readonly opts: {
       pid?: number | null;
+      pgid?: number;
       providerSessionId?: string | null;
+      /** Echo the launch resume hint back as a transport-verified resume state. */
+      resumeState?: "echo";
       onSend?: (command: LiveCommand, transport: FakeTransport) => void;
     } = {},
   ) {}
@@ -87,10 +92,22 @@ class FakeTransport implements LiveTransport {
 
   async open(request: LiveLaunchRequest): Promise<LiveLaunchReport> {
     this.launch = request;
+    const pid = this.opts.pid === undefined ? 424_242 : this.opts.pid;
+    if (pid !== null) {
+      // Real transports hand the spawn facts to the hub the moment the
+      // process exists; the lease's provider evidence — and every recovery
+      // verdict built on it — depends on this call landing.
+      await request.report_process?.({ pid, pgid: this.opts.pgid ?? pid });
+    }
+    const resumed =
+      this.opts.resumeState === "echo" && request.resume
+        ? { ...request.resume, verified: true as const, verified_via: "transport-verified:open-echo" }
+        : null;
     return {
-      pid: this.opts.pid === undefined ? 424_242 : this.opts.pid,
+      pid,
       provider_session_id: this.opts.providerSessionId ?? "prov-1",
       launched_at: "2026-09-05T00:00:00.000Z",
+      ...(resumed !== null ? { resume_state: resumed } : {}),
     };
   }
 
@@ -274,9 +291,7 @@ async function leasesOf(commonDir: string): Promise<string[]> {
 }
 
 async function durableState(commonDir: string, liveSessionId: string): Promise<Record<string, never>> {
-  return JSON.parse(
-    await readFile(join(commonDir, "agent-hub", "live", `${liveSessionId}.json`), "utf8"),
-  ) as Record<string, never>;
+  return JSON.parse(await readFile(liveStatePath(commonDir, liveSessionId), "utf8")) as Record<string, never>;
 }
 
 async function startSession(manager: LiveSessionManager): Promise<{ live_session_id: string; workspace: string }> {
@@ -320,12 +335,17 @@ describe("live manager lifecycle", () => {
     expect(closed.checkpoint_taken).toBe(false); // nothing changed to pin
     expect(scope.manager.activeCount).toBe(0);
     expect(await leasesOf(scope.commonDir)).toHaveLength(0);
-    expect((await durableState(scope.commonDir, live_session_id)).status).toBe("closed");
+    const durable = await durableState(scope.commonDir, live_session_id);
+    expect(durable.status).toBe("closed");
+    // No checkpoint was ever taken: the reason stays null, and the record
+    // names the hub-owned worktree it owns.
+    expect(durable.last_checkpoint_reason).toBeNull();
+    expect(String(durable.worktree_path).startsWith(`${String(durable.worktree_parent)}/`)).toBe(true);
 
     // reap → checkpoint → state ordering, and no sidecars left behind.
     expect(phases).toEqual(["transport-stopped", "checkpoint-captured", "state-advanced"]);
-    const liveDir = await readdir(join(scope.commonDir, "agent-hub", "live"));
-    expect(liveDir.filter((name) => name.endsWith(".pending.json"))).toEqual([]);
+    const sessionsDir = await readdir(join(scope.commonDir, "agent-hub", "live", "sessions"));
+    expect(sessionsDir.filter((name) => name.endsWith(".pending.json"))).toEqual([]);
 
     await settle(scope);
   });
@@ -365,7 +385,10 @@ describe("live manager lifecycle", () => {
     // The omp resume cursor rode the durable write.
     expect(state.resume?.provider === "omp" && state.resume.last_event_seq).toBe(5);
     // The task text reached the worktree and the wire — never durable state.
-    expect(JSON.stringify(await durableState(scope.commonDir, live_session_id))).not.toContain("build the thing");
+    // The new durable fields carry only hub-owned paths and enum reasons.
+    const durable = await durableState(scope.commonDir, live_session_id);
+    expect(JSON.stringify(durable)).not.toContain("build the thing");
+    expect(durable.last_checkpoint_reason).toBe("turn_end");
 
     await settle(scope);
   });
@@ -484,6 +507,17 @@ describe("capability gate and command surface", () => {
       summary: { text: "overwrite README", truncated: false },
     });
     await tick();
+    // The v3 vocabulary is exactly {allow_once, deny}: anything else is a
+    // caller error, and refusing it must not consume the open request.
+    await expectCode(
+      scope.manager.respondPermission(
+        live_session_id,
+        "req-1",
+        "allow_session" as unknown as LivePermissionDecision,
+        null,
+      ),
+      "LIVE_COMMAND_INVALID",
+    );
 
     const answered = await scope.manager.respondPermission(live_session_id, "req-1", "allow_once", "ok");
     expect(answered.outcome).toBe("succeeded");
@@ -526,9 +560,16 @@ describe("capability gate and command surface", () => {
   });
 });
 
+// Queue bounds live on the hub queue. A `native` follow_up claim must go
+// straight to the provider mid-run, so the bound tests pin the claim to
+// `hub-queued` explicitly instead of inheriting the fake's native default.
+const hubQueuedFollowUps = fullCapabilities({
+  follow_up: { support: "hub-queued", evidence: "hub queues next-turn input" },
+});
+
 describe("follow-up queue", () => {
-  it("queues while running, drains in order, and enforces every bound", async () => {
-    const scope = await harness({ transportOptions: writingTransportOptions });
+  it("hub-queues while running, drains in order, and enforces every bound", async () => {
+    const scope = await harness({ caps: hubQueuedFollowUps, transportOptions: writingTransportOptions });
     const { live_session_id } = await startSession(scope.manager);
     const t = scope.factory.created[0];
 
@@ -581,8 +622,49 @@ describe("follow-up queue", () => {
     await settle(scope);
   });
 
-  it("bounds the queue by total bytes", async () => {
+  it("delivers native follow-ups immediately and settles them at the next terminal boundary", async () => {
     const scope = await harness();
+    const { live_session_id } = await startSession(scope.manager);
+    const t = scope.factory.created[0];
+
+    const first = scope.manager.prompt(live_session_id, "one");
+    t.push({ kind: "status", status: "running", note: null });
+
+    const second = scope.manager.followUp(live_session_id, "two");
+    await tick();
+    // A `native` claim promises provider-side queueing: delivery is now.
+    expect(t.commands.filter((c) => c.kind === "follow_up")).toHaveLength(1);
+
+    const third = scope.manager.followUp(live_session_id, "three");
+    await tick();
+    expect(t.commands.filter((c) => c.kind === "follow_up")).toHaveLength(2);
+
+    // The per-message bound guards the native path too.
+    const oversized = await captureRejection(
+      scope.manager.followUp(live_session_id, "x".repeat(LIVE_FOLLOW_UP_MAX_MESSAGE_BYTES + 1)),
+    );
+    expect(oversized?.code).toBe("LIVE_QUEUE_FULL");
+
+    // The terminal boundary adopts the already-delivered follow-up as the
+    // tracked next turn — capability honesty forbids any re-send.
+    t.push({ kind: "status", status: "idle", note: null });
+    expect((await first).outcome).toBe("succeeded");
+    expect(t.commands.filter((c) => c.kind === "follow_up")).toHaveLength(2);
+
+    t.push({ kind: "status", status: "idle", note: null });
+    expect((await second).kind).toBe("follow_up");
+
+    t.push({ kind: "status", status: "idle", note: null });
+    expect((await third).outcome).toBe("succeeded");
+    expect(t.commands.filter((c) => c.kind === "follow_up")).toHaveLength(2);
+
+    const closed = await scope.manager.close(live_session_id);
+    expect(closed.state.status).toBe("closed");
+    await settle(scope);
+  });
+
+  it("bounds the queue by total bytes", async () => {
+    const scope = await harness({ caps: hubQueuedFollowUps });
     const { live_session_id } = await startSession(scope.manager);
     const t = scope.factory.created[0];
 
@@ -832,6 +914,50 @@ describe("resume state honesty", () => {
     const unverified = await fresh.manager.start({ provider: "omp" });
     expect(unverified.state.resume).toMatchObject({ verified: false, verified_via: null });
     await settle(fresh);
+  });
+
+  it("resumeFromState refuses a live record and continues a closed one on the same ref", async () => {
+    const scope = await harness();
+    const started = await startSession(scope.manager);
+    const resumable = new LiveSessionManager({
+      commonDir: scope.commonDir,
+      repositoryCwd: scope.repository,
+      transportFactories: [
+        new FakeTransportFactory(() => new FakeTransport(fullCapabilities(), { resumeState: "echo" })),
+      ],
+      providerFactories: [ompProviderFactory],
+      tmpRoot: scope.tmpRoot,
+      leaseProbes: fakeProbes(),
+    });
+
+    // A non-terminal record may not be resumed anywhere, in any hub.
+    await expectCode(
+      resumable.resumeFromState({ live_session_id: started.live_session_id }),
+      "LIVE_SESSION_NOT_RESUMABLE",
+    );
+
+    const closed = await scope.manager.close(started.live_session_id);
+    expect(closed.state.status).toBe("closed");
+
+    const resumed = await resumable.resumeFromState({ live_session_id: started.live_session_id });
+    expect(resumed.state.status).toBe("idle");
+    // The existing chain advances by exactly one revision — the live ref is
+    // continued, never branched per restart.
+    expect(resumed.state.revision).toBe(closed.state.revision + 1);
+    expect(await resolveRef(scope.repository, `refs/agent-hub/live/${started.live_session_id}`)).toBe(
+      resumed.state.current_commit,
+    );
+    // The durable handle only lands verified when the transport itself
+    // shows the post-handshake identity.
+    expect(resumed.state.resume).toMatchObject({
+      provider_session_id: "prov-1",
+      verified: true,
+      verified_via: "transport-verified:open-echo",
+    });
+    expect(await leasesOf(scope.commonDir)).toHaveLength(1);
+
+    await resumable.closeAll();
+    await settle(scope);
   });
 });
 

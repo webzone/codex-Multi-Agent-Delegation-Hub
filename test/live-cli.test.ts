@@ -1,21 +1,26 @@
 import { randomUUID } from "node:crypto";
+import { mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
 import { AgentHubError } from "../src/errors.js";
+import { resolveRepositoryIdentity } from "../src/git.js";
 
 import { parseCliCommand, runCli } from "../src/cli.js";
 import {
+  createLiveManager,
   iterateLiveCommands,
-  liveTransportRegistry,
+  liveStatePath,
   LiveSessionManager,
   LiveTransportRegistry,
   probeLiveAgent,
-  registerLiveTransport,
   runLiveSession,
   supportedLiveAgents,
 } from "../src/live/index.js";
-import type { LiveIo, LiveSessionManagerOptions } from "../src/live/index.js";
+import type { LiveIo } from "../src/live/index.js";
+import type { LiveLeaseProbes } from "../src/live/lease.js";
 import type {
   LiveBoundedText,
   LiveCapabilities,
@@ -26,18 +31,19 @@ import type {
   LiveLaunchRequest,
   LiveLaunchReport,
   LiveProviderId,
-  LiveSessionState,
   LiveStopMode,
   LiveStopReport,
   LiveTransport,
   LiveTransportDescriptor,
   LiveTransportFactory,
   LiveTransportId,
+  ProviderResumeState,
 } from "../src/live/types.js";
+import { createGitRepository, removeDirectory } from "./helpers.js";
 
 // ---------------------------------------------------------------------------
 // Scripted transport harness (mirrors the live transport contract exactly;
-// every event it emits is normalized, byte-bounded, and seq-contiguous).
+// the hub re-stamps every envelope, so only event BODIES are scripted).
 // ---------------------------------------------------------------------------
 
 function native(evidence: string): LiveCapabilityClaim {
@@ -98,6 +104,8 @@ class ScriptedTransport implements LiveTransport {
   }
 
   private emit(body: LiveEventBody): void {
+    // The hub re-stamps seq/live_session_id/occurred_at; these placeholders
+    // exist only so a leak of transport-side lies would be visible.
     this.queue.push({
       live_session_id: this.sessionId,
       seq: (this.seq += 1),
@@ -115,9 +123,19 @@ class ScriptedTransport implements LiveTransport {
   async open(request: LiveLaunchRequest): Promise<LiveLaunchReport> {
     this.launchRequests.push(request);
     this.sessionId = request.live_session_id;
-    this.emit({ kind: "status", status: "starting", note: null });
-    this.emit({ kind: "status", status: "idle", note: null });
-    return { pid: 4242, provider_session_id: "psess-1", launched_at: new Date().toISOString() };
+    // A scripted resume actually round-trips the handle it was handed, so
+    // it may honestly report a transport-verified resume state. The `as`
+    // only re-unifies the provider-union spread TypeScript cannot express.
+    const resume_state =
+      request.resume !== null
+        ? ({ ...request.resume, verified: true, verified_via: "scripted-session-load" } as ProviderResumeState)
+        : undefined;
+    return {
+      pid: 4242,
+      provider_session_id: "psess-1",
+      launched_at: new Date().toISOString(),
+      ...(resume_state !== undefined ? { resume_state } : {}),
+    };
   }
 
   async send(command: LiveCommand): Promise<void> {
@@ -130,6 +148,8 @@ class ScriptedTransport implements LiveTransport {
         this.turn += 1;
         this.emit({ kind: "status", status: "running", note: null });
         if (command.text.includes("boom")) {
+          // A failed turn must settle on a terminal boundary like any other:
+          // the error event rides the stream, then the turn boundary arrives.
           this.emit({
             kind: "error",
             error: {
@@ -140,7 +160,7 @@ class ScriptedTransport implements LiveTransport {
               provider: this.provider,
             },
           });
-          this.emit({ kind: "status", status: "error", note: null });
+          this.emit({ kind: "status", status: "idle", note: "turn failed" });
           return;
         }
         if (command.text.includes("ask")) {
@@ -200,7 +220,9 @@ class ScriptedTransport implements LiveTransport {
       if (this.ended) {
         return;
       }
-      await new Promise<void>((resolve) => this.wakeups.push(resolve));
+      const { promise, resolve } = Promise.withResolvers<void>();
+      this.wakeups.push(resolve);
+      await promise;
     }
   }
 
@@ -243,26 +265,94 @@ class ScriptedFactory implements LiveTransportFactory {
   }
 }
 
-function managerWith(factories: LiveTransportFactory[], options: LiveSessionManagerOptions = {}) {
-  const registry = new LiveTransportRegistry();
-  for (const factory of factories) {
-    registry.register(factory);
-  }
-  return new LiveSessionManager({
-    registry,
-    launchSettleMs: 500,
-    turnTimeoutMs: 5_000,
-    ...options,
+function fakeProbes(): LiveLeaseProbes {
+  return {
+    probePid: (pid) => (pid === process.pid ? "live" : "dead"),
+    startToken: async (pid) => (pid === process.pid ? "hub-tok" : "prov-tok"),
+    killGroup: () => true,
+    now: () => new Date(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Wire harness: the CORE manager production-bootstrapped over a real Git
+// repository with the scripted factory registered as its only transport.
+// ---------------------------------------------------------------------------
+
+interface WireScope {
+  repository: string;
+  commonDir: string;
+  tmpRoot: string;
+  manager: LiveSessionManager;
+  factory: ScriptedFactory;
+}
+
+async function wireScope(capabilities: LiveCapabilities = capabilitySnapshot()): Promise<WireScope> {
+  const repository = await createGitRepository();
+  const identity = await resolveRepositoryIdentity(repository);
+  const tmpRoot = await mkdtemp(join(tmpdir(), "agent-hub-live-cli-"));
+  const factory = new ScriptedFactory("pi-rpc", capabilities);
+  const manager = await createLiveManager(repository, {
+    withoutProductionTransports: true,
+    extraTransportFactories: [factory],
+    tmpRoot,
+    leaseProbes: fakeProbes(),
+  });
+  return { repository, commonDir: identity.common_dir, tmpRoot, manager, factory };
+}
+
+/** A second hub process over the same durable state (the resume scenario). */
+async function secondWireHub(source: WireScope): Promise<LiveSessionManager> {
+  return await createLiveManager(source.repository, {
+    withoutProductionTransports: true,
+    extraTransportFactories: [source.factory],
+    tmpRoot: source.tmpRoot,
+    leaseProbes: fakeProbes(),
   });
 }
 
-function makeIo(commands: unknown[]) {
+async function releaseWire(scope: WireScope): Promise<void> {
+  await scope.manager.closeAll();
+  await removeDirectory(scope.repository);
+  await removeDirectory(scope.tmpRoot);
+}
+
+// A stdin entry may be a command (object/string line) or a wait gate: the
+// fake client holds the next line until the wire has actually observed
+// documents matching the predicate — exactly what a real client does before
+// answering an event. The runner's relay is timer-driven (its 25 ms poll and
+// bounded drain live inside runLiveSession), so this integration suite must
+// await the real emitted documents against the clock; fake timers would
+// freeze the runner under test and cannot replace the awaited signal.
+interface WaitGate {
+  waitFor: (documents: ReadonlyArray<Record<string, any>>) => boolean;
+}
+
+type StdinEntry = string | Record<string, unknown> | WaitGate;
+
+function isWaitGate(entry: StdinEntry): entry is WaitGate {
+  return typeof entry === "object" && entry !== null && "waitFor" in entry;
+}
+
+function makeIo(commands: StdinEntry[]) {
   const documents: Array<Record<string, any>> = [];
   const diagnostics: string[] = [];
   const io: LiveIo = {
     stdin: (async function* () {
-      for (const command of commands) {
-        yield typeof command === "string" ? command : JSON.stringify(command);
+      for (const entry of commands) {
+        if (isWaitGate(entry)) {
+          const deadline = Date.now() + 8_000;
+          while (!entry.waitFor(documents)) {
+            if (Date.now() > deadline) {
+              throw new Error("live stdin gate timed out waiting for a wire document");
+            }
+            const { promise, resolve } = Promise.withResolvers<void>();
+            setTimeout(resolve, 5);
+            await promise;
+          }
+          continue;
+        }
+        yield typeof entry === "string" ? entry : JSON.stringify(entry);
       }
     })(),
     stdout: (document) => documents.push(document),
@@ -275,39 +365,11 @@ function docsOfType(documents: Array<Record<string, any>>, type: string): Array<
   return documents.filter((document) => document.type === type);
 }
 
-function liveStateFixture(overrides: Partial<LiveSessionState> = {}): LiveSessionState {
-  const iso = new Date().toISOString();
-  return {
-    schema: 1,
-    live_session_id: randomUUID(),
-    session_id: null,
-    provider: "pi",
-    transport: "pi-rpc",
-    capabilities: capabilitySnapshot(),
-    identity: {
-      common_dir: "/repo/.git",
-      worktree_root: "/repo",
-      branch: "main",
-      head: "f".repeat(40),
-    },
-    base_commit: "f".repeat(40),
-    current_commit: "f".repeat(40),
-    checkpoint_seq: 0,
-    resume: {
-      provider: "pi",
-      provider_session_id: "psess-9",
-      resume_token: "tok-1",
-      verified: false,
-      verified_via: null,
-    },
-    status: "orphaned",
-    revision: 3,
-    last_error: null,
-    created_at: iso,
-    updated_at: iso,
-    ...overrides,
-  };
-}
+const permissionRequestSeen = (documents: ReadonlyArray<Record<string, any>>) =>
+  documents.some(
+    (document) =>
+      document.type === "event" && document.event?.body?.kind === "permission_request",
+  );
 
 // ---------------------------------------------------------------------------
 // Parsing
@@ -383,157 +445,283 @@ describe("live CLI parsing", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The long-lived wire: stdin commands → stdout documents
+// The long-lived wire: stdin commands → stdout documents, over the CORE
+// manager injected through runLiveSession's dependencies.
 // ---------------------------------------------------------------------------
 
 describe("live session wire", () => {
-  it("streams session, events, results, and close over NDJSON", async () => {
-    const factory = new ScriptedFactory("pi-rpc", capabilitySnapshot({ status: { support: "derived", evidence: "hub stream activity" } }));
-    const manager = managerWith([factory]);
-    const { io, documents, diagnostics } = makeIo([
-      { action: "prompt", text: "write tests" },
-      { action: "status" },
-      { action: "close" },
-    ]);
+  it(
+    "streams session, events, results, and close over NDJSON",
+    async () => {
+      const scope = await wireScope(
+        capabilitySnapshot({ status: { support: "derived", evidence: "hub stream activity" } }),
+      );
+      const { io, documents, diagnostics } = makeIo([
+        { action: "prompt", text: "write tests" },
+        { action: "status" },
+        { action: "close" },
+      ]);
 
-    const exitCode = await runLiveSession(
-      { provider: "pi", resumeId: null, workspace: "/tmp/repo", maxTextBytes: 4096 },
-      io,
-      { manager },
-    );
+      const exitCode = await runLiveSession(
+        { provider: "pi", resumeId: null, workspace: scope.repository, maxTextBytes: 4096 },
+        io,
+        { manager: scope.manager },
+      );
+      await releaseWire(scope);
 
-    expect(exitCode).toBe(0);
-    expect(documents[0]?.type).toBe("session");
-    expect(documents[0]?.session).toMatchObject({
-      provider: "pi",
-      transport: "pi-rpc",
-      pid: 4242,
-      capabilities: { status: { support: "derived" } },
+      expect(exitCode).toBe(0);
+      expect(documents[0]?.type).toBe("session");
+      expect(documents[0]?.session).toMatchObject({
+        provider: "pi",
+        transport: "pi-rpc",
+        session_id: null,
+        status: "idle",
+        warnings: [],
+        capabilities: { status: { support: "derived" } },
+      });
+      const liveSessionId = documents[0].session.live_session_id as string;
+      expect(liveSessionId).toBeTruthy();
+      expect(documents[0].session.base_commit).toMatch(/^[0-9a-f]{40}$/);
+      expect(documents[0].session.workspace.startsWith(scope.tmpRoot)).toBe(true);
+
+      const events = docsOfType(documents, "event").map((document) => document.event as LiveEvent);
+      const seqs = events.map((event) => event.seq);
+      expect(seqs).toEqual(seqs.map((_, index) => index + 1)); // contiguous from 1
+      expect(events.every((event) => event.live_session_id === liveSessionId)).toBe(true);
+      expect(
+        events.some(
+          (event) => event.body.kind === "text" && event.body.text.text === "Answer: write tests",
+        ),
+      ).toBe(true);
+
+      const results = docsOfType(documents, "result");
+      const prompt = results.find((document) => document.result.kind === "prompt");
+      expect(prompt?.result).toMatchObject({
+        live_session_id: liveSessionId,
+        outcome: "succeeded",
+        final_text: { text: "Answer: write tests", truncated: false },
+        checkpoint: null,
+      });
+      expect(prompt?.status).toBe("idle"); // the runner reports the session status beside the result
+      const statusResult = results.find((document) => document.result.kind === "status");
+      expect(statusResult?.result.outcome).toBe("succeeded");
+
+      const close = docsOfType(documents, "close")[0]?.close;
+      expect(close).toMatchObject({
+        live_session_id: liveSessionId,
+        status: "closed",
+        stop: { status: "closed", exit_code: 0 },
+        cleanup_errors: [],
+      });
+      // The worktree tree never changed, so the close checkpoint pinned nothing new.
+      expect(close.checkpoint_taken).toBe(false);
+
+      // The `derived` status claim must never be forwarded to the transport.
+      expect(scope.factory.created[0]?.sent.map((command) => command.kind)).toEqual(["prompt"]);
+      expect(scope.factory.created[0]?.launchRequests[0]?.max_text_bytes).toBe(4096);
+      expect(diagnostics.join("\n")).toContain("provider=pi");
+    },
+    30_000,
+  );
+
+  it(
+    "rejects malformed stdin commands without dropping the session",
+    async () => {
+      const scope = await wireScope();
+      const { io, documents } = makeIo(["{not json", { action: "teleport" }, { action: "close" }]);
+
+      const exitCode = await runLiveSession(
+        { provider: "pi", resumeId: null, workspace: scope.repository },
+        io,
+        { manager: scope.manager },
+      );
+      await releaseWire(scope);
+
+      expect(exitCode).toBe(0);
+      const errors = docsOfType(documents, "error");
+      expect(errors).toHaveLength(2);
+      for (const document of errors) {
+        expect(document.error).toMatchObject({ code: "LIVE_COMMAND_INVALID", stage: "protocol" });
+      }
+      expect(documents[documents.length - 1]?.type).toBe("close");
+      expect(docsOfType(documents, "close")[0]?.close).toMatchObject({ status: "closed" });
+    },
+    30_000,
+  );
+
+  it(
+    "refuses an unsupported steer pre-dispatch and never delivers it",
+    async () => {
+      const scope = await wireScope(capabilitySnapshot({ steer: unclaimed() }));
+      const { io, documents } = makeIo([
+        { action: "prompt", text: "work" },
+        { action: "steer", text: "left" },
+        { action: "close" },
+      ]);
+
+      const exitCode = await runLiveSession(
+        { provider: "pi", resumeId: null, workspace: scope.repository },
+        io,
+        { manager: scope.manager },
+      );
+      await releaseWire(scope);
+
+      expect(exitCode).toBe(0);
+      const steer = docsOfType(documents, "result").find((d) => d.result.kind === "steer");
+      expect(steer?.result).toMatchObject({ outcome: "unsupported" });
+      expect(steer?.result.error).toMatchObject({
+        code: "LIVE_CAPABILITY_UNSUPPORTED",
+        stage: "capability",
+        retryable: false,
+      });
+      expect(scope.factory.created[0]?.sent.map((command) => command.kind)).toEqual(["prompt"]);
+    },
+    30_000,
+  );
+
+  it(
+    "answers an observed permission request over the wire",
+    async () => {
+      const scope = await wireScope();
+      const { io, documents } = makeIo([
+        { action: "prompt", text: "ask me first" },
+        { waitFor: permissionRequestSeen },
+        { action: "permission_response", request_id: "req-9", decision: "allow_once" },
+        { action: "close" },
+      ]);
+
+      const exitCode = await runLiveSession(
+        { provider: "pi", resumeId: null, workspace: scope.repository },
+        io,
+        { manager: scope.manager },
+      );
+      await releaseWire(scope);
+
+      expect(exitCode).toBe(0);
+      const events = docsOfType(documents, "event").map(
+        (document) => document.event.body as { kind: string },
+      );
+      expect(events.some((body) => body.kind === "permission_request")).toBe(true);
+      const permission = docsOfType(documents, "result").find(
+        (d) => d.result.kind === "permission_response",
+      );
+      expect(permission?.result.outcome).toBe("succeeded");
+      const prompt = docsOfType(documents, "result").find((d) => d.result.kind === "prompt");
+      expect(prompt?.result).toMatchObject({
+        outcome: "succeeded",
+        final_text: { text: "permitted: allow_once" },
+      });
+      const delivered = scope.factory.created[0]?.sent.find(
+        (command) => command.kind === "permission_response",
+      );
+      expect(delivered).toMatchObject({ request_id: "req-9", decision: "allow_once" });
+    },
+    30_000,
+  );
+
+  it(
+    "refuses a widened permission decision before dispatch with LIVE_COMMAND_INVALID",
+    async () => {
+      const scope = await wireScope();
+      const { io, documents } = makeIo([
+        { action: "prompt", text: "ask me first" },
+        { waitFor: permissionRequestSeen },
+        { action: "permission_response", request_id: "req-9", decision: "allow_session" },
+        { action: "close" },
+      ]);
+
+      const exitCode = await runLiveSession(
+        { provider: "pi", resumeId: null, workspace: scope.repository },
+        io,
+        { manager: scope.manager },
+      );
+      await releaseWire(scope);
+
+      // The vocabulary violation is a caller error on the protocol: it rides
+      // an error document and never becomes a silently converted deny.
+      expect(exitCode).toBe(0);
+      const errors = docsOfType(documents, "error");
+      expect(errors).toHaveLength(1);
+      expect(errors[0]?.error).toMatchObject({
+        code: "LIVE_COMMAND_INVALID",
+        stage: "protocol",
+        provider: "pi",
+      });
+      expect(
+        docsOfType(documents, "result").some((d) => d.result.kind === "permission_response"),
+      ).toBe(false);
+      expect(
+        scope.factory.created[0]?.sent.some((command) => command.kind === "permission_response"),
+      ).toBe(false);
+    },
+    30_000,
+  );
+
+  it(
+    "reports an unknown permission request id and cancels the pending turn on close",
+    async () => {
+      const scope = await wireScope();
+      const { io, documents } = makeIo([
+        { action: "prompt", text: "ask me first" },
+        { waitFor: permissionRequestSeen },
+        { action: "permission_response", request_id: "nope", decision: "deny" },
+        { action: "close" },
+      ]);
+
+      const exitCode = await runLiveSession(
+        { provider: "pi", resumeId: null, workspace: scope.repository },
+        io,
+        { manager: scope.manager },
+      );
+      await releaseWire(scope);
+
+      expect(exitCode).toBe(0); // an undelivered caller error does not fail the session itself
+      const errors = docsOfType(documents, "error");
+      expect(errors).toHaveLength(1);
+      expect(errors[0]?.error).toMatchObject({
+        code: "LIVE_PERMISSION_REQUEST_UNKNOWN",
+        stage: "protocol",
+      });
+      const prompt = docsOfType(documents, "result").find((d) => d.result.kind === "prompt");
+      expect(prompt?.result.outcome).toBe("cancelled"); // close cancelled the pending turn honestly
+      expect(docsOfType(documents, "close")[0]?.close).toMatchObject({ status: "closed" });
+    },
+    30_000,
+  );
+
+  it(
+    "fails a provider-error turn and exits 1",
+    async () => {
+      const scope = await wireScope();
+      const { io, documents } = makeIo([{ action: "prompt", text: "boom now" }, { action: "close" }]);
+
+      const exitCode = await runLiveSession(
+        { provider: "pi", resumeId: null, workspace: scope.repository },
+        io,
+        { manager: scope.manager },
+      );
+      await releaseWire(scope);
+
+      expect(exitCode).toBe(1); // a failed structured result makes the run fail
+      const prompt = docsOfType(documents, "result").find((d) => d.result.kind === "prompt");
+      expect(prompt?.result).toMatchObject({ outcome: "failed" });
+      expect(prompt?.result.error).toMatchObject({ code: "PROVIDER_BOOM", stage: "provider" });
+    },
+    30_000,
+  );
+
+  it("starts nothing and fails honestly when the factory set lacks the provider", async () => {
+    // No fixture needed: the core manager refuses before touching the
+    // repository — an unpaired provider launches nothing.
+    const manager = new LiveSessionManager({
+      commonDir: join(tmpdir(), "agent-hub-live-cli-unwired-common"),
+      repositoryCwd: join(tmpdir(), "agent-hub-live-cli-unwired-repo"),
+      transportFactories: [new ScriptedFactory("pi-rpc")],
     });
-
-    const events = docsOfType(documents, "event").map((document) => document.event as LiveEvent);
-    const seqs = events.map((event) => event.seq);
-    expect(seqs).toEqual(seqs.map((_, index) => index + 1)); // contiguous from 1
-    expect(events.some((event) => event.body.kind === "text")).toBe(true);
-
-    const results = docsOfType(documents, "result");
-    const prompt = results.find((document) => document.result.kind === "prompt");
-    expect(prompt?.result).toMatchObject({
-      outcome: "succeeded",
-      final_text: { text: "Answer: write tests", truncated: false },
-      checkpoint: null,
-    });
-    const statusResult = results.find((document) => document.result.kind === "status");
-    expect(statusResult?.result.outcome).toBe("succeeded");
-
-    expect(docsOfType(documents, "close")[0]?.close).toMatchObject({
-      status: "closed",
-      stop: { status: "closed", exit_code: 0 },
-    });
-    // The `derived` status claim must never be forwarded to the transport.
-    expect(factory.created[0]?.sent.map((command) => command.kind)).toEqual(["prompt"]);
-    expect(factory.created[0]?.launchRequests[0]?.max_text_bytes).toBe(4096);
-    expect(diagnostics.join("\n")).toContain("provider=pi");
-  });
-
-  it("rejects malformed stdin commands without dropping the session", async () => {
-    const manager = managerWith([new ScriptedFactory("pi-rpc")]);
-    const { io, documents } = makeIo(["{not json", { action: "teleport" }, { action: "close" }]);
-
-    const exitCode = await runLiveSession(
-      { provider: "pi", resumeId: null, workspace: "/tmp/repo" },
-      io,
-      { manager },
-    );
-
-    expect(exitCode).toBe(0);
-    const errors = docsOfType(documents, "error");
-    expect(errors).toHaveLength(2);
-    for (const document of errors) {
-      expect(document.error).toMatchObject({ code: "LIVE_COMMAND_INVALID", stage: "protocol" });
-    }
-    expect(documents[documents.length - 1]?.type).toBe("close");
-  });
-
-  it("refuses an unsupported steer pre-dispatch and never delivers it", async () => {
-    const factory = new ScriptedFactory("pi-rpc", capabilitySnapshot({ steer: unclaimed() }));
-    const manager = managerWith([factory]);
-    const { io, documents } = makeIo([
-      { action: "prompt", text: "work" },
-      { action: "steer", text: "left" },
-      { action: "close" },
-    ]);
-
-    expect(
-      await runLiveSession({ provider: "pi", resumeId: null, workspace: "/tmp/repo" }, io, { manager }),
-    ).toBe(0);
-
-    const steer = docsOfType(documents, "result").find((d) => d.result.kind === "steer");
-    expect(steer?.result).toMatchObject({ outcome: "unsupported" });
-    expect(steer?.result.error).toMatchObject({ stage: "capability", retryable: false });
-    expect(factory.created[0]?.sent.map((command) => command.kind)).toEqual(["prompt"]);
-  });
-
-  it("answers an observed permission request over the wire", async () => {
-    const factory = new ScriptedFactory("pi-rpc");
-    const manager = managerWith([factory]);
-    const { io, documents } = makeIo([
-      { action: "prompt", text: "ask me first" },
-      { action: "permission_response", request_id: "req-9", decision: "allow_once" },
-      { action: "close" },
-    ]);
-
-    expect(
-      await runLiveSession({ provider: "pi", resumeId: null, workspace: "/tmp/repo" }, io, { manager }),
-    ).toBe(0);
-
-    const events = docsOfType(documents, "event").map((document) => document.event.body as { kind: string });
-    expect(events.some((body) => body.kind === "permission_request")).toBe(true);
-    const prompt = docsOfType(documents, "result").find((d) => d.result.kind === "prompt");
-    expect(prompt?.result).toMatchObject({
-      outcome: "succeeded",
-      final_text: { text: "permitted: allow_once" },
-    });
-  });
-
-  it("reports an unknown permission request id and cancels the pending turn on close", async () => {
-    const manager = managerWith([new ScriptedFactory("pi-rpc")]);
-    const { io, documents } = makeIo([
-      { action: "prompt", text: "ask me first" },
-      { action: "permission_response", request_id: "nope", decision: "deny" },
-      { action: "close" },
-    ]);
-
-    expect(
-      await runLiveSession({ provider: "pi", resumeId: null, workspace: "/tmp/repo" }, io, { manager }),
-    ).toBe(1); // a failed structured result makes the run fail
-
-    const results = docsOfType(documents, "result");
-    const permission = results.find((d) => d.result.kind === "permission_response");
-    expect(permission?.result.error?.code).toBe("LIVE_PERMISSION_REQUEST_UNKNOWN");
-    const prompt = results.find((d) => d.result.kind === "prompt");
-    expect(prompt?.result.outcome).toBe("cancelled");
-  });
-
-  it("fails a provider-error turn and exits 1", async () => {
-    const manager = managerWith([new ScriptedFactory("pi-rpc")]);
-    const { io, documents } = makeIo([{ action: "prompt", text: "boom now" }, { action: "close" }]);
-
-    expect(
-      await runLiveSession({ provider: "pi", resumeId: null, workspace: "/tmp/repo" }, io, { manager }),
-    ).toBe(1);
-
-    const prompt = docsOfType(documents, "result").find((d) => d.result.kind === "prompt");
-    expect(prompt?.result).toMatchObject({ outcome: "failed" });
-    expect(prompt?.result.error).toMatchObject({ code: "PROVIDER_BOOM", stage: "provider" });
-  });
-
-  it("starts nothing and fails honestly when the provider transport is unwired", async () => {
-    const manager = managerWith([]);
     const { io, documents } = makeIo([]);
 
     const exitCode = await runLiveSession(
-      { provider: "omp", resumeId: null, workspace: "/tmp/repo" },
+      { provider: "omp", resumeId: null, workspace: join(tmpdir(), "agent-hub-live-cli-unwired-repo") },
       io,
       { manager },
     );
@@ -546,54 +734,81 @@ describe("live session wire", () => {
     });
   });
 
-  it("refuses resume while the durable state store is unwired", async () => {
-    const manager = managerWith([new ScriptedFactory("pi-rpc")]);
-    const { io, documents } = makeIo([]);
+  it(
+    "refuses --resume when no durable record exists for the id",
+    async () => {
+      const scope = await wireScope();
+      const { io, documents } = makeIo([]);
 
-    const exitCode = await runLiveSession(
-      { provider: null, resumeId: "live-missing", workspace: "/tmp/repo" },
-      io,
-      { manager }, // no resumeSource → the honest unwired seam
-    );
+      const exitCode = await runLiveSession(
+        { provider: null, resumeId: randomUUID(), workspace: scope.repository },
+        io,
+        { manager: scope.manager },
+      );
+      await releaseWire(scope);
 
-    expect(exitCode).toBe(1);
-    expect(documents[0]?.error).toMatchObject({ code: "LIVE_STATE_UNAVAILABLE" });
-  });
+      expect(exitCode).toBe(1);
+      expect(documents).toHaveLength(1);
+      expect(documents[0]?.error).toMatchObject({
+        code: "LIVE_SESSION_NOT_FOUND",
+        stage: "launch",
+        provider: null,
+      });
+    },
+    30_000,
+  );
 
-  it("resumes through the seam with the stored resume state", async () => {
-    const factory = new ScriptedFactory("pi-rpc", capabilitySnapshot({ resume: native("proven") }));
-    const manager = managerWith([factory]);
-    const state = liveStateFixture();
-    const { io, documents } = makeIo([{ action: "close" }]);
+  it(
+    "resumes the same live id from its durable terminal record with the stored resume state",
+    async () => {
+      const scope = await wireScope();
+      const first = makeIo([{ action: "prompt", text: "work" }, { action: "close" }]);
+      expect(
+        await runLiveSession(
+          { provider: "pi", resumeId: null, workspace: scope.repository },
+          first.io,
+          { manager: scope.manager },
+        ),
+      ).toBe(0);
+      const liveSessionId = first.documents[0].session.live_session_id as string;
+      expect(docsOfType(first.documents, "close")[0]?.close).toMatchObject({ status: "closed" });
 
-    const exitCode = await runLiveSession(
-      { provider: null, resumeId: state.live_session_id, workspace: "/tmp/repo" },
-      io,
-      { manager, resumeSource: { load: async () => state } },
-    );
+      // A fresh hub process over the same repository finds the terminal record.
+      const resumedHub = await secondWireHub(scope);
+      const second = makeIo([{ action: "close" }]);
+      const exitCode = await runLiveSession(
+        { provider: null, resumeId: liveSessionId, workspace: scope.repository },
+        second.io,
+        { manager: resumedHub },
+      );
+      scope.manager = resumedHub;
+      await releaseWire(scope);
 
-    expect(exitCode).toBe(0);
-    expect(documents[0]?.session).toMatchObject({
-      live_session_id: state.live_session_id,
-      provider: "pi",
-    });
-    expect(factory.created[0]?.launchRequests[0]?.resume).toEqual(state.resume);
-  });
+      expect(exitCode).toBe(0);
+      expect(second.documents[0]?.session).toMatchObject({
+        live_session_id: liveSessionId, // the same live id continues, never a new session
+        provider: "pi",
+        transport: "pi-rpc",
+        status: "idle",
+      });
 
-  it("refuses a durable state record that violates the seed shape", async () => {
-    const manager = managerWith([new ScriptedFactory("pi-rpc")]);
-    const broken = { ...liveStateFixture(), schema: 2 } as unknown as LiveSessionState;
-    const { io, documents } = makeIo([]);
-
-    const exitCode = await runLiveSession(
-      { provider: null, resumeId: "x", workspace: "/tmp/repo" },
-      io,
-      { manager, resumeSource: { load: async () => broken } },
-    );
-
-    expect(exitCode).toBe(1);
-    expect(documents[0]?.error).toMatchObject({ code: "LIVE_STATE_INVALID" });
-  });
+      // The launch under resume carried exactly the durable record's handle.
+      const record = JSON.parse(
+        await readFile(liveStatePath(scope.commonDir, liveSessionId), "utf8"),
+      ) as Record<string, any>;
+      expect(record.schema).toBe("agent-hub-live/v1");
+      expect(record.status).toBe("closed");
+      const resumedTransport = scope.factory.created[1];
+      expect(resumedTransport?.launchRequests[0]?.resume).toEqual(record.resume);
+      expect(resumedTransport?.launchRequests[0]?.resume).toMatchObject({
+        provider: "pi",
+        provider_session_id: "psess-1",
+      });
+      // The transport verified the round trip, so the session continues honestly.
+      expect(docsOfType(second.documents, "close")[0]?.close).toMatchObject({ status: "closed" });
+    },
+    60_000,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -601,51 +816,35 @@ describe("live session wire", () => {
 // ---------------------------------------------------------------------------
 
 describe("live probe and the default registry", () => {
-  it("fails the probe for a provider with no registered transport", async () => {
-    const stdout: string[] = [];
-    const exitCode = await runCli(["live", "probe", "--agent", "pi"], {
-      stdout: (value) => stdout.push(value),
-      stderr: () => {},
-    });
+  it(
+    "probes through the production registry wired by runCli itself",
+    async () => {
+      const stdout: string[] = [];
+      const exitCode = await runCli(["live", "probe", "--agent", "pi"], {
+        stdout: (value) => stdout.push(value),
+        stderr: () => {},
+      });
 
-    expect(exitCode).toBe(1);
-    expect(JSON.parse(stdout.join("")).error).toMatchObject({
+      // `live probe` registers the four real transports before consulting the
+      // default registry, so the paired factory is always found; the probe
+      // answer itself stays honest — an uninstalled binary is reported, not
+      // guessed — and the exit code tracks that answer.
+      const document = JSON.parse(stdout.join("")) as Record<string, any>;
+      expect(document).toMatchObject({ provider: "pi", transport: "pi-rpc" });
+      expect(typeof document.found).toBe("boolean");
+      expect(exitCode).toBe(document.found ? 0 : 1);
+    },
+    30_000,
+  );
+
+  it("refuses to probe a provider whose transport is not wired", async () => {
+    // An unwired registry stays honest: no guessing, just refusal.
+    await expect(probeLiveAgent("hermes", new LiveTransportRegistry())).rejects.toMatchObject({
       code: "LIVE_TRANSPORT_UNAVAILABLE",
     });
   });
 
-  it("registers through the seam and probes the installed provider", async () => {
-    registerLiveTransport(new ScriptedFactory("hermes-acp"));
-
-    const stdout: string[] = [];
-    const exitCode = await runCli(["live", "probe", "--agent", "hermes"], {
-      stdout: (value) => stdout.push(value),
-      stderr: () => {},
-    });
-
-    expect(exitCode).toBe(0);
-    expect(JSON.parse(stdout.join(""))).toMatchObject({
-      provider: "hermes",
-      transport: "hermes-acp",
-      found: true,
-      version: "9.9.9-scripted",
-    });
-  });
-  it("refuses a second factory for the same provider and a mismatched pairing", () => {
-    expect(() => registerLiveTransport(new ScriptedFactory("hermes-acp"))).toThrow(
-      /already has a live transport/,
-    );
-    const lying = new ScriptedFactory("pi-rpc");
-    Object.assign(lying, { provider: "omp" });
-    let pairingCode = "";
-    try {
-      liveTransportRegistry.register(lying);
-    } catch (error) {
-      pairingCode = (error as AgentHubError).code;
-    }
-    expect(pairingCode).toBe("LIVE_TRANSPORT_PAIRING_INVALID");
-  });
-  it("reports an honest not-found probe through the registry", async () => {
+  it("reports an honest not-found probe through a registry", async () => {
     const registry = new LiveTransportRegistry();
     registry.register(
       new ScriptedFactory("omp-rpc", capabilitySnapshot(), {
@@ -664,6 +863,25 @@ describe("live probe and the default registry", () => {
     });
   });
 
+  it("refuses a second factory for the same provider and a mismatched pairing", () => {
+    const registry = new LiveTransportRegistry();
+    const hermes = new ScriptedFactory("hermes-acp");
+    registry.register(hermes);
+    registry.register(hermes); // re-registering the same factory stays idempotent
+    expect(() => registry.register(new ScriptedFactory("hermes-acp"))).toThrow(
+      /already has a live transport/,
+    );
+    const lying = new ScriptedFactory("pi-rpc");
+    Object.assign(lying, { provider: "omp" });
+    let pairingCode = "";
+    try {
+      registry.register(lying);
+    } catch (error) {
+      pairingCode = (error as AgentHubError).code;
+    }
+    expect(pairingCode).toBe("LIVE_TRANSPORT_PAIRING_INVALID");
+  });
+
   it("rejects a legacy-only provider on the live surface with exit 2", async () => {
     const stderr: string[] = [];
     const exitCode = await runCli(["live", "--agent", "bogus", "--workspace", "/tmp"], {
@@ -675,16 +893,39 @@ describe("live probe and the default registry", () => {
     expect(stderr.join("")).toContain("must be one of: omp, agy, pi, hermes");
   });
 
-  it("refuses live resume through runCli while the store seam is unwired", async () => {
+  it("refuses a live resume outside a Git repository through runCli", async () => {
+    const stray = await mkdtemp(join(tmpdir(), "agent-hub-live-cli-stray-"));
     const stdout: string[] = [];
-    const exitCode = await runCli(["live", "--resume", "live-42", "--workspace", "/tmp"], {
+    const exitCode = await runCli(["live", "--resume", randomUUID(), "--workspace", stray], {
       stdout: (value) => stdout.push(value),
       stderr: () => {},
     });
+    await removeDirectory(stray);
 
     expect(exitCode).toBe(1);
     const document = JSON.parse(stdout.join(""));
     expect(document).toMatchObject({ type: "error" });
-    expect(document.error).toMatchObject({ code: "LIVE_STATE_UNAVAILABLE" });
+    expect(document.error).toMatchObject({ code: "NOT_GIT_REPOSITORY", stage: "launch" });
   });
+
+  it(
+    "refuses a live resume with no durable record through the wired store seam",
+    async () => {
+      // runCli wires the real durable resume source itself: an unknown id in a
+      // real repository fails with the honest not-found, never a fake session.
+      const repository = await createGitRepository();
+      const stdout: string[] = [];
+      const exitCode = await runCli(
+        ["live", "--resume", randomUUID(), "--workspace", repository],
+        { stdout: (value) => stdout.push(value), stderr: () => {} },
+      );
+      await removeDirectory(repository);
+
+      expect(exitCode).toBe(1);
+      const document = JSON.parse(stdout.join(""));
+      expect(document).toMatchObject({ type: "error" });
+      expect(document.error).toMatchObject({ code: "LIVE_SESSION_NOT_FOUND", stage: "launch" });
+    },
+    30_000,
+  );
 });
