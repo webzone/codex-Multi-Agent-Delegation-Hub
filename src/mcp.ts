@@ -17,6 +17,7 @@ import {
   LiveSessionManager,
   supportedLiveAgents,
 } from "./live/index.js";
+import { processLiveSupervisor } from "./live/supervisor.js";
 import type { LivePermissionDecision } from "./live/types.js";
 import type { DelegateError, MergeOutcome } from "./types.js";
 import { realpathSync } from "node:fs";
@@ -89,12 +90,29 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
   const autoMergeFn = dependencies.autoMerge ?? autoMerge;
   const releaseRefsFn = dependencies.releaseRefs ?? releaseFanOutArtifactRefs;
   const injectedLive = dependencies.live ?? null;
-  const liveManagerFor = dependencies.liveManagerFor ?? ((workspace: string) => createLiveManager(workspace));
+  const createManager =
+    dependencies.liveManagerFor ?? ((workspace: string) => createLiveManager(workspace));
   // Which manager owns which live session (the manager holds the live
   // transport; commands must route back to the process that started it).
+  // The mapping is released ONLY once a session has truly finished: an
+  // orphaned close keeps its route so a later terminate-authorized close
+  // reaches the ORIGINAL manager that still owns the transport.
   const liveOwners = new Map<string, LiveSessionManager>();
   async function liveManagerForWorkspace(workspace: string): Promise<LiveSessionManager> {
-    return injectedLive ?? (await liveManagerFor(workspace));
+    // An injected single manager keeps the legacy one-instance routing; the
+    // production path goes through the ONE process-level supervisor, so
+    // every workspace of a repository reuses the manager for its canonical
+    // Git common dir and the live-session quota stays total for this process.
+    return injectedLive ?? (await processLiveSupervisor.managerFor(workspace, createManager));
+  }
+  async function liveLaunch<T>(manager: LiveSessionManager, run: () => Promise<T>): Promise<T> {
+    if (injectedLive !== null) {
+      // The injected manager's own process quota governs a test-owned
+      // instance; the shared supervisor never counts or caps a manager it
+      // did not build and does not route.
+      return await run();
+    }
+    return await processLiveSupervisor.launch(manager, run);
   }
   function liveOwner(liveSessionId: string): LiveSessionManager {
     const owner = injectedLive ?? liveOwners.get(liveSessionId);
@@ -332,22 +350,28 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     "live_session_start",
     {
       description:
-        "Start a long-lived interactive live session (v3) for one provider (omp, agy, pi, hermes). The provider runs in a hub-owned isolated OS-temp worktree materialized from this workspace; durable state, the lifetime lease, quotas, and the bounded event ring are all owned by the core live manager. pi/hermes stay live-only and remain rejected by the legacy tools. Fails honestly when the provider probe is not found.",
+        "Start a long-lived interactive live session (v3) for one provider (omp, agy, pi, hermes). The provider runs in a hub-owned isolated OS-temp worktree materialized from this workspace; durable state, the lifetime lease, quotas, and the bounded event ring are all owned by the core live manager. Managers are shared per repository (canonical Git common dir) and this hub process enforces the live-session quota TOTAL across every repository it serves; each Git common dir still caps at its own durable lease quota. `allow_dirty` is the caller-worktree gate (default false refuses local changes); `permission_policy` binds the launched session (omitted means deny). pi/hermes stay live-only and remain rejected by the legacy tools. Fails honestly when the provider probe is not found.",
       inputSchema: {
         agent: z.enum(supportedLiveAgents),
         workspace: z.string().min(1).default(process.cwd()),
         session_id: z.string().min(1).optional(),
         max_output_bytes: z.number().int().positive().optional(),
+        allow_dirty: z.boolean().default(false),
+        permission_policy: z.enum(["deny", "interactive"]).default("deny"),
       },
     },
-    async ({ agent, workspace, session_id, max_output_bytes }) =>
+    async ({ agent, workspace, session_id, max_output_bytes, allow_dirty, permission_policy }) =>
       guardTool(async () => {
         const manager = await liveManagerForWorkspace(workspace);
-        const started = await manager.start({
-          provider: agent,
-          session_id: session_id ?? null,
-          max_text_bytes: max_output_bytes,
-        });
+        const started = await liveLaunch(manager, () =>
+          manager.start({
+            provider: agent,
+            session_id: session_id ?? null,
+            max_text_bytes: max_output_bytes,
+            allow_dirty,
+            permission_policy,
+          }),
+        );
         liveOwners.set(started.live_session_id, manager);
         return okTool(started);
       }),
@@ -357,20 +381,26 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     "live_session_resume",
     {
       description:
-        "Resume a durable live session (hub-live-id): loads the agent-hub-live/v1 record, refuses live/leased sessions, materializes a FRESH hub worktree at current_commit, launches the provider with the recorded opaque resume state, verifies provider identity, and CAS-advances the existing live ref (never a new ref). A resume whose identity does not round-trip fails; there is no fake continuation.",
+        "Resume a durable live session (hub-live-id): loads the agent-hub-live/v1 record, refuses live/leased sessions (an orphan's lease must be finished or recovered first), materializes a FRESH hub worktree at current_commit, launches the provider with the recorded opaque resume state ON THE RECORDED TRANSPORT (a different transport is refused, never silently substituted), verifies provider identity, and CAS-advances the existing live ref (never a new ref). `allow_dirty` and `permission_policy` are re-selected explicitly for the resumed launch — a policy never silently carries over from the prior run: omitted means deny. A resume whose identity does not round-trip fails; there is no fake continuation.",
       inputSchema: {
         live_session_id: z.string().min(1),
         workspace: z.string().min(1).default(process.cwd()),
         max_output_bytes: z.number().int().positive().optional(),
+        allow_dirty: z.boolean().default(false),
+        permission_policy: z.enum(["deny", "interactive"]).default("deny"),
       },
     },
-    async ({ live_session_id, workspace, max_output_bytes }) =>
+    async ({ live_session_id, workspace, max_output_bytes, allow_dirty, permission_policy }) =>
       guardTool(async () => {
         const manager = await liveManagerForWorkspace(workspace);
-        const resumed = await manager.resumeFromState({
-          live_session_id,
-          max_text_bytes: max_output_bytes,
-        });
+        const resumed = await liveLaunch(manager, () =>
+          manager.resumeFromState({
+            live_session_id,
+            max_text_bytes: max_output_bytes,
+            allow_dirty,
+            permission_policy,
+          }),
+        );
         liveOwners.set(resumed.live_session_id, manager);
         return okTool(resumed);
       }),
@@ -469,7 +499,7 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     "live_session_close",
     {
       description:
-        "Stop a live session's provider (graceful, or terminate with bounded SIGKILL escalation authorized) and report what shutdown proved: `closed` only with leader reap plus proof the owned process group is gone, `orphaned` otherwise (the lease and worktree then stay for recovery). An orphaned close is an isError.",
+        "Stop a live session's provider (graceful, or terminate with bounded SIGKILL escalation authorized) and report what shutdown proved: `closed` only with leader reap plus proof the owned process group is gone, `orphaned` otherwise (the lease and worktree then stay for recovery). An orphaned close is an isError AND keeps the session routed inside this hub process: a later close with `terminate: true` reaches the manager that still owns the transport and finishes the shutdown there. The route is released only after the session has truly finished.",
       inputSchema: {
         live_session_id: z.string().min(1),
         terminate: z.boolean().default(false),
@@ -477,15 +507,38 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     },
     async ({ live_session_id, terminate }) =>
       guardTool(async () => {
-        const close = await liveOwner(live_session_id).close(
-          live_session_id,
-          terminate ? "terminate" : "graceful",
-        );
-        liveOwners.delete(live_session_id);
-        return okTool(
-          close,
-          close.stop === null ? close.state.status === "orphaned" : close.stop.status === "orphaned",
-        );
+        const owner = liveOwner(live_session_id);
+        const close = await owner.close(live_session_id, terminate ? "terminate" : "graceful");
+        // `orphaned` is NOT finished: the original manager still holds the
+        // transport, lease, and worktree, and only it can complete an
+        // authorized terminate. Keep the mapping on an orphan; once the
+        // shutdown is proven finished the mapping goes, and a manager that
+        // now runs nothing may leave the process-level cache.
+        const orphaned =
+          close.stop === null ? close.state.status === "orphaned" : close.stop.status === "orphaned";
+        if (!orphaned) {
+          liveOwners.delete(live_session_id);
+        }
+        processLiveSupervisor.retireIdle(owner);
+        return okTool(close, orphaned);
+      }),
+  );
+
+  server.registerTool(
+    "live_session_recover",
+    {
+      description:
+        "Conservatively reconcile one repository's durable live leases with what the OS and the repository prove: an orphaned provider is reaped before its surviving worktree is pinned and the record rewritten to orphaned, cleanup runs only on proven death, and any classification this hub cannot prove (foreign host, reused pid, corrupt record) is reported `manual` and never acted on. Sessions owned by this hub process are kept-live and untouched. The report is an isError only when at least one lease ended `manual`.",
+      inputSchema: {
+        workspace: z.string().min(1).default(process.cwd()),
+      },
+    },
+    async ({ workspace }) =>
+      guardTool(async () => {
+        const manager = await liveManagerForWorkspace(workspace);
+        const report = await manager.recover();
+        processLiveSupervisor.retireIdle(manager);
+        return okTool(report, report.sessions.some((session) => session.outcome === "manual"));
       }),
   );
 

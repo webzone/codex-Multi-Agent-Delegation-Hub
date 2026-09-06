@@ -14,6 +14,7 @@ import type {
   LiveEventBody,
   LiveFollowUpCommand,
   LivePermissionDecision,
+  LivePermissionPolicy,
   LivePromptCommand,
   LiveSteerCommand,
   LiveStatusCommand,
@@ -220,8 +221,12 @@ function permissionResponse(requestId: string, decision: LivePermissionDecision)
   return { ...commandBase(), kind: "permission_response", request_id: requestId, decision, note: null };
 }
 
-function launchRequest(workspace: string, resume: HermesResumeState | null = null) {
-  return { live_session_id: "ls-hermes", workspace, max_text_bytes: 256, resume };
+function launchRequest(
+  workspace: string,
+  resume: HermesResumeState | null = null,
+  permission_policy?: LivePermissionPolicy,
+) {
+  return { live_session_id: "ls-hermes", workspace, max_text_bytes: 256, resume, permission_policy };
 }
 
 function transport(fake: FakeHandle, options: Omit<HermesTransportOptions, "command" | "environment"> = {}): HermesAcpTransport {
@@ -418,12 +423,17 @@ describe("hermes acp transport", () => {
     }
   });
 
-  it("headless denies every permission with reject_once, never allow_always", async () => {
+  it("deny policy auto-denies every permission with reject_once and never advertises an answer path", async () => {
     const fake = await makeFakeHermes();
-    const t = transport(fake); // not interactive
+    const t = transport(fake); // policy omitted: deny is the binding default
     try {
       const recorder = new EventRecorder(t.events());
       await t.open(launchRequest(fake.dir));
+      // Deny auto-denies, so there is no answer path to advertise.
+      expect((await t.describe()).capabilities.permission_response).toEqual({
+        support: "unsupported",
+        evidence: null,
+      });
       await t.send(promptCommand("PERM now"));
       await recorder.waitUntil("turn closed", (events) => idleCount(events) >= 2);
 
@@ -443,10 +453,12 @@ describe("hermes acp transport", () => {
 
   it("interactive allow_once selects the allow_once option only", async () => {
     const fake = await makeFakeHermes();
-    const t = transport(fake, { interactive: true });
+    const t = transport(fake);
     try {
       const recorder = new EventRecorder(t.events());
-      await t.open(launchRequest(fake.dir));
+      await t.open(launchRequest(fake.dir, null, "interactive"));
+      // Interactive is the only policy that advertises the native answer path.
+      expect((await t.describe()).capabilities.permission_response.support).toBe("native");
       await t.send(promptCommand("PERM now"));
       await recorder.waitUntil("permission request", (events) => events.some((e) => e.body.kind === "permission_request"));
       const request = recorder.bodiesOf("permission_request")[0];
@@ -470,10 +482,10 @@ describe("hermes acp transport", () => {
     const widened: LivePermissionDecision = "allow_session";
 
     const fake = await makeFakeHermes();
-    const t = transport(fake, { interactive: true });
+    const t = transport(fake);
     try {
       const recorder = new EventRecorder(t.events());
-      await t.open(launchRequest(fake.dir));
+      await t.open(launchRequest(fake.dir, null, "interactive"));
 
       // Typed deny: selects the agent's own reject_once, never allow_always.
       await t.send(promptCommand("PERM first"));
@@ -509,10 +521,10 @@ describe("hermes acp transport", () => {
   it("interactive permission times out to deny", async () => {
     const fake = await makeFakeHermes();
     // Real timer: this asserts the transport's own bounded permission wait.
-    const t = transport(fake, { interactive: true, permission_timeout_ms: 200 });
+    const t = transport(fake, { permission_timeout_ms: 200 });
     try {
       const recorder = new EventRecorder(t.events());
-      await t.open(launchRequest(fake.dir));
+      await t.open(launchRequest(fake.dir, null, "interactive"));
       await t.send(promptCommand("PERM now"));
       await recorder.waitUntil("turn closed after timeout", (events) => idleCount(events) >= 2, 5000);
 
@@ -578,7 +590,9 @@ describe("hermes acp transport", () => {
       expect(caps.steer).toEqual({ support: "unsupported", evidence: null });
       expect(caps.cancel.support).toBe("native");
       expect(caps.status.support).toBe("derived");
-      expect(caps.permission_response.support).toBe("native");
+      // No permission_policy on the launch request: deny auto-denies and
+      // honestly claims no usable answer path.
+      expect(caps.permission_response).toEqual({ support: "unsupported", evidence: null });
       // loadSession was advertised in the handshake we just completed.
       expect(caps.resume.support).toBe("native");
       // ACP v1 prompt responses carry no usage counters.

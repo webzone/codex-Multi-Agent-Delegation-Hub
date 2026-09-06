@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -11,8 +12,10 @@ import { describe, expect, it } from "vitest";
 import { createHubServer } from "../src/mcp.js";
 import { resolveRepositoryIdentity } from "../src/git.js";
 import { LiveSessionManager, LIVE_DEFAULT_MAX_TEXT_BYTES } from "../src/live/manager.js";
+import { createLiveManager } from "../src/live/index.js";
 import { liveRefFor, liveStatePath } from "../src/live/state.js";
-import type { LiveLeaseProbes } from "../src/live/lease.js";
+import { processLiveSupervisor } from "../src/live/supervisor.js";
+import { liveLeasePath, type LiveLeaseProbes } from "../src/live/lease.js";
 import type { RepositoryIdentity } from "../src/types.js";
 import type {
   LiveBoundedText,
@@ -34,6 +37,7 @@ import type {
   ProviderResumeState,
 } from "../src/live/types.js";
 
+import { deferred } from "../src/deferred.js";
 import { createGitRepository, removeDirectory, resolveRef } from "./helpers.js";
 
 // ---------------------------------------------------------------------------
@@ -249,7 +253,7 @@ class ScriptedTransport implements LiveTransport {
       if (this.ended) {
         return;
       }
-      const wake = Promise.withResolvers<void>();
+      const wake = deferred<void>();
       this.wakeups.push(wake.resolve);
       await wake.promise;
     }
@@ -354,9 +358,9 @@ async function harness(
 }
 
 async function tick(): Promise<void> {
-  const deferred = Promise.withResolvers<void>();
-  setImmediate(deferred.resolve);
-  await deferred.promise;
+  const wake = deferred<void>();
+  setImmediate(wake.resolve);
+  await wake.promise;
 }
 
 /**
@@ -439,7 +443,7 @@ const HEAVY = 30_000;
 // ---------------------------------------------------------------------------
 
 describe("live MCP tools", () => {
-  it("registers the five live tools next to the unchanged legacy tools", async () => {
+  it("registers the six live tools next to the unchanged legacy tools", async () => {
     const h = await harness();
     const { tools } = await h.client.listTools();
 
@@ -455,6 +459,7 @@ describe("live MCP tools", () => {
         "live_session_command",
         "live_session_events",
         "live_session_close",
+        "live_session_recover",
       ]),
     );
     await h.cleanup();
@@ -498,6 +503,8 @@ describe("live MCP tools", () => {
     expect(launch.live_session_id).toBe(liveSessionId);
     expect(launch.max_text_bytes).toBe(LIVE_DEFAULT_MAX_TEXT_BYTES);
     expect(launch.resume).toBeNull();
+    // The MCP surface defaults the binding permission policy to deny.
+    expect(launch.permission_policy).toBe("deny");
     expect(factory.created[0]!.reportProcessCalls).toBe(1);
 
     // The durable record landed next to the repository's live state root.
@@ -943,4 +950,437 @@ describe("live MCP tools", () => {
     }
     await h.cleanup();
   });
+});
+
+// ---------------------------------------------------------------------------
+// The process-level supervisor: one MCP server wired through the production
+// `liveManagerFor` path (managers built by `createLiveManager`, routed by the
+// shared supervisor) — only the provider transport is scripted.
+// ---------------------------------------------------------------------------
+
+interface SupervisorHub {
+  client: Client;
+  factory: ScriptedFactory;
+  tmpRoot: string;
+  cleanup: () => Promise<void>;
+}
+
+async function supervisorHub(
+  options: { probes?: LiveLeaseProbes; factory?: ScriptedFactory } = {},
+): Promise<SupervisorHub> {
+  const tmpRoot = await mkdtemp(join(tmpdir(), "agent-hub-live-mcp-supervisor-"));
+  const factory = options.factory ?? new ScriptedFactory("pi-rpc");
+  const client = await connectClient(
+    createHubServer({
+      liveManagerFor: (workspace) =>
+        createLiveManager(workspace, {
+          extraTransportFactories: [factory],
+          withoutProductionTransports: true,
+          tmpRoot,
+          leaseProbes: options.probes ?? fakeProbes(),
+        }),
+    }),
+  );
+  return { client, factory, tmpRoot, cleanup: () => removeDirectory(tmpRoot) };
+}
+
+async function makeRepositories(count: number): Promise<string[]> {
+  const repositories: string[] = [];
+  for (let index = 0; index < count; index += 1) {
+    repositories.push(await createGitRepository());
+  }
+  return repositories;
+}
+
+describe("live MCP process-level supervisor", () => {
+  it(
+    "caps the MCP process at 8 live sessions across nine repositories and leaks no idle manager",
+    async () => {
+      const repositories = await makeRepositories(9);
+      const hub = await supervisorHub();
+      try {
+        expect(processLiveSupervisor.activeCount).toBe(0);
+        const ids: string[] = [];
+        for (const repository of repositories.slice(0, 8)) {
+          const result = await hub.client.callTool({
+            name: "live_session_start",
+            arguments: { agent: "pi", workspace: repository },
+          });
+          expect(result.isError ?? false).toBe(false);
+          ids.push(documentFrom(result).live_session_id as string);
+        }
+        // One manager per repository, eight live sessions, all counted once.
+        expect(processLiveSupervisor.activeCount).toBe(8);
+        expect(processLiveSupervisor.cachedManagers).toBe(8);
+
+        const ninth = await hub.client.callTool({
+          name: "live_session_start",
+          arguments: { agent: "pi", workspace: repositories[8]! },
+        });
+        expect(ninth.isError).toBe(true);
+        expect(documentFrom(ninth).error).toMatchObject({ code: "LIVE_QUOTA_EXCEEDED" });
+        // The refused start launches nothing and leaves its empty manager
+        // out of the cache.
+        expect(processLiveSupervisor.activeCount).toBe(8);
+        expect(processLiveSupervisor.cachedManagers).toBe(8);
+
+        for (const [index, id] of ids.entries()) {
+          const closed = await hub.client.callTool({
+            name: "live_session_close",
+            arguments: { live_session_id: id },
+          });
+          expect(closed.isError ?? false).toBe(false);
+          expect(documentFrom(closed).state).toMatchObject({ status: "closed" });
+          expect(processLiveSupervisor.cachedManagers).toBe(8 - index - 1);
+        }
+        expect(processLiveSupervisor.activeCount).toBe(0);
+      } finally {
+        await hub.cleanup();
+        for (const repository of repositories) {
+          await removeDirectory(repository);
+        }
+      }
+    },
+    3 * HEAVY,
+  );
+
+  it(
+    "keeps the 4-per-common-dir lease quota enforced by the manager across supervisor reuse",
+    async () => {
+      const [repository] = await makeRepositories(1);
+      const hub = await supervisorHub();
+      const ids: string[] = [];
+      try {
+        for (let index = 0; index < 4; index += 1) {
+          const result = await hub.client.callTool({
+            name: "live_session_start",
+            arguments: { agent: "pi", workspace: repository },
+          });
+          expect(result.isError ?? false).toBe(false);
+          ids.push(documentFrom(result).live_session_id as string);
+        }
+        // Every call reused the ONE manager for this common dir.
+        expect(processLiveSupervisor.cachedManagers).toBe(1);
+        const fifth = await hub.client.callTool({
+          name: "live_session_start",
+          arguments: { agent: "pi", workspace: repository },
+        });
+        expect(fifth.isError).toBe(true);
+        expect(documentFrom(fifth).error).toMatchObject({ code: "LIVE_QUOTA_EXCEEDED" });
+        expect(documentFrom(fifth).error.message).toMatch(/common dir/);
+
+        expect(
+          (
+            await hub.client.callTool({
+              name: "live_session_close",
+              arguments: { live_session_id: ids[0]! },
+            })
+          ).isError ?? false,
+        ).toBe(false);
+        const again = await hub.client.callTool({
+          name: "live_session_start",
+          arguments: { agent: "pi", workspace: repository },
+        });
+        expect(again.isError ?? false).toBe(false);
+        ids.push(documentFrom(again).live_session_id as string);
+      } finally {
+        for (const id of ids.slice(1)) {
+          await hub.client.callTool({ name: "live_session_close", arguments: { live_session_id: id } });
+        }
+        expect(processLiveSupervisor.cachedManagers).toBe(0);
+        await hub.cleanup();
+        await removeDirectory(repository);
+      }
+    },
+    HEAVY,
+  );
+
+  it(
+    "graceful orphan keeps its routing; the authorized terminate reaches the ORIGINAL manager",
+    async () => {
+      const [repositoryA, repositoryB] = await makeRepositories(2);
+      const hub = await supervisorHub();
+      try {
+        const started = documentFrom(
+          await hub.client.callTool({
+            name: "live_session_start",
+            arguments: { agent: "pi", workspace: repositoryA },
+          }),
+        );
+        const id = started.live_session_id as string;
+        const transportA = hub.factory.created[0]!;
+        transportA.stopPolicy = (mode) =>
+          mode === "graceful"
+            ? { status: "orphaned", exit_code: 0, exit_signal: null, waited_ms: 2 }
+            : undefined;
+
+        const orphaned = await hub.client.callTool({
+          name: "live_session_close",
+          arguments: { live_session_id: id },
+        });
+        expect(orphaned.isError).toBe(true);
+        expect(documentFrom(orphaned).state).toMatchObject({ status: "orphaned" });
+
+        // A second repository gets its own cached manager: the orphan's
+        // routing could now go wrong in two ways (mapping dropped, or re-
+        // solved to the wrong/new manager) and must not.
+        const other = documentFrom(
+          await hub.client.callTool({
+            name: "live_session_start",
+            arguments: { agent: "pi", workspace: repositoryB },
+          }),
+        );
+        expect(processLiveSupervisor.cachedManagers).toBe(2);
+        expect(processLiveSupervisor.activeCount).toBe(2);
+
+        // Resuming the orphan from its own workspace must not reach a new
+        // manager: the ORIGINAL one still owns it and refuses honestly.
+        const refused = await hub.client.callTool({
+          name: "live_session_resume",
+          arguments: { live_session_id: id, workspace: repositoryA },
+        });
+        expect(refused.isError).toBe(true);
+        expect(documentFrom(refused).error).toMatchObject({ code: "LIVE_SESSION_ALREADY_LIVE" });
+
+        const terminated = await hub.client.callTool({
+          name: "live_session_close",
+          arguments: { live_session_id: id, terminate: true },
+        });
+        expect(terminated.isError ?? false).toBe(false);
+        const closed = documentFrom(terminated);
+        expect(closed.stop).toMatchObject({ status: "closed" });
+        expect(closed.state).toMatchObject({ status: "closed" });
+        // Both shutdowns ran on the transport the ORIGINAL manager launched.
+        expect(transportA.stopCalls).toEqual(["graceful", "terminate"]);
+        await expect(stat(started.workspace as string)).rejects.toThrow();
+
+        // The finished session released its route; only B's live session
+        // keeps a manager cached now.
+        expect(processLiveSupervisor.cachedManagers).toBe(1);
+        expect(
+          (
+            await hub.client.callTool({
+              name: "live_session_close",
+              arguments: { live_session_id: other.live_session_id },
+            })
+          ).isError ?? false,
+        ).toBe(false);
+        expect(processLiveSupervisor.cachedManagers).toBe(0);
+      } finally {
+        await hub.cleanup();
+        await removeDirectory(repositoryA);
+        await removeDirectory(repositoryB);
+      }
+    },
+    HEAVY,
+  );
+
+  it(
+    "live_session_recover keeps the lease of a session this hub process is actively running",
+    async () => {
+      const [repository] = await makeRepositories(1);
+      const identity = await resolveRepositoryIdentity(repository);
+      const hub = await supervisorHub();
+      try {
+        const started = documentFrom(
+          await hub.client.callTool({
+            name: "live_session_start",
+            arguments: { agent: "pi", workspace: repository },
+          }),
+        );
+        const id = started.live_session_id as string;
+
+        const report = documentFrom(
+          await hub.client.callTool({
+            name: "live_session_recover",
+            arguments: { workspace: repository },
+          }),
+        );
+        expect(report).toMatchObject({
+          scanned: 1,
+          sessions: [{ live_session_id: id, outcome: "kept-live" }],
+        });
+        expect(processLiveSupervisor.activeCount).toBe(1);
+        expect(existsSync(liveLeasePath(identity.common_dir, id))).toBe(true);
+
+        expect(
+          (
+            await hub.client.callTool({
+              name: "live_session_close",
+              arguments: { live_session_id: id },
+            })
+          ).isError ?? false,
+        ).toBe(false);
+        expect(processLiveSupervisor.cachedManagers).toBe(0);
+      } finally {
+        await hub.cleanup();
+        await removeDirectory(repository);
+      }
+    },
+    HEAVY,
+  );
+
+  it(
+    "stranded orphan: resume refused until recover, then recover finishes it and resume succeeds",
+    async () => {
+      const [repository] = await makeRepositories(1);
+      const identity = await resolveRepositoryIdentity(repository);
+      const tmpRoot = await mkdtemp(join(tmpdir(), "agent-hub-live-mcp-strand-"));
+      // Every OS answer says "no process alive": the hub that recorded the
+      // lease reads as gone to any later recovery — the honest
+      // single-process simulation of a previous hub process.
+      const deadProbes: LiveLeaseProbes = {
+        probePid: () => "dead",
+        startToken: async (pid) => (pid === process.pid ? "hub-tok" : "prov-tok"),
+        killGroup: () => true,
+        probeGroup: () => "gone",
+        now: () => new Date(),
+      };
+      const previousFactory = new ScriptedFactory("pi-rpc");
+      const previousHub = new LiveSessionManager({
+        commonDir: identity.common_dir,
+        repositoryCwd: repository,
+        transportFactories: [previousFactory],
+        tmpRoot,
+        leaseProbes: deadProbes,
+      });
+      const started = await previousHub.start({ provider: "pi" });
+      previousFactory.created[0]!.stopPolicy = (mode) =>
+        mode === "graceful"
+          ? { status: "orphaned", exit_code: 0, exit_signal: null, waited_ms: 1 }
+          : undefined;
+      const stranded = await previousHub.close(started.live_session_id, "graceful");
+      expect(stranded.state.status).toBe("orphaned");
+      expect(existsSync(liveLeasePath(identity.common_dir, started.live_session_id))).toBe(true);
+
+      const hub = await supervisorHub({ probes: deadProbes });
+      try {
+        const refused = await hub.client.callTool({
+          name: "live_session_resume",
+          arguments: { live_session_id: started.live_session_id, workspace: repository },
+        });
+        expect(refused.isError).toBe(true);
+        expect(documentFrom(refused).error).toMatchObject({ code: "LIVE_LEASE_EXISTS" });
+
+        const recovered = documentFrom(
+          await hub.client.callTool({
+            name: "live_session_recover",
+            arguments: { workspace: repository },
+          }),
+        );
+        expect(recovered).toMatchObject({
+          scanned: 1,
+          sessions: [
+            { live_session_id: started.live_session_id, outcome: "cleaned" },
+          ],
+        });
+        expect(existsSync(liveLeasePath(identity.common_dir, started.live_session_id))).toBe(false);
+
+        const resumed = await hub.client.callTool({
+          name: "live_session_resume",
+          arguments: { live_session_id: started.live_session_id, workspace: repository },
+        });
+        expect(resumed.isError ?? false).toBe(false);
+        expect(documentFrom(resumed)).toMatchObject({
+          live_session_id: started.live_session_id,
+          state: { status: "idle", provider: "pi", transport: "pi-rpc" },
+        });
+        // The resumed launch rode the recorded transport with the durable
+        // resume hint of the orphaned record.
+        expect(hub.factory.created[0]!.launchRequests[0]!.resume).toEqual(stranded.state.resume);
+
+        expect(
+          (
+            await hub.client.callTool({
+              name: "live_session_close",
+              arguments: { live_session_id: started.live_session_id },
+            })
+          ).isError ?? false,
+        ).toBe(false);
+        expect(processLiveSupervisor.cachedManagers).toBe(0);
+      } finally {
+        await hub.cleanup();
+        await removeDirectory(repository);
+        await removeDirectory(tmpRoot);
+      }
+    },
+    HEAVY,
+  );
+
+  it(
+    "live_session_start gates the caller worktree unless allow_dirty is explicit",
+    async () => {
+      const h = await harness();
+      await writeFile(join(h.repository, "untracked-loose.txt"), "not committed\n");
+
+      const refused = await h.client.callTool({
+        name: "live_session_start",
+        arguments: { agent: "pi", workspace: h.repository },
+      });
+      expect(refused.isError).toBe(true);
+      expect(documentFrom(refused).error).toMatchObject({ code: "DIRTY_WORKTREE" });
+      expect(h.factories[0]!.created).toHaveLength(0); // nothing launched
+
+      const allowed = await h.client.callTool({
+        name: "live_session_start",
+        arguments: { agent: "pi", workspace: h.repository, allow_dirty: true },
+      });
+      expect(allowed.isError ?? false).toBe(false);
+      const start = documentFrom(allowed);
+      // Committed HEAD only: the caller's uncommitted state never enters
+      // the live worktree.
+      await expect(stat(join(start.workspace as string, "untracked-loose.txt"))).rejects.toThrow();
+      expect(
+        (
+          await h.client.callTool({
+            name: "live_session_close",
+            arguments: { live_session_id: start.live_session_id },
+          })
+        ).isError ?? false,
+      ).toBe(false);
+      await h.cleanup();
+    },
+    HEAVY,
+  );
+
+  it(
+    "permission_policy defaults to deny and every resume must re-select it explicitly",
+    async () => {
+      const h = await harness();
+      const factory = h.factories[0]!;
+      const start = await startLive(h);
+      const id = start.live_session_id as string;
+      expect(factory.created[0]!.launchRequests[0]!.permission_policy).toBe("deny");
+
+      const closeResumeCycle = async (policy?: string) => {
+        expect(
+          (
+            await h.client.callTool({ name: "live_session_close", arguments: { live_session_id: id } })
+          ).isError ?? false,
+        ).toBe(false);
+        const resumed = await h.client.callTool({
+          name: "live_session_resume",
+          arguments: {
+            live_session_id: id,
+            workspace: h.repository,
+            ...(policy === undefined ? {} : { permission_policy: policy }),
+          },
+        });
+        expect(resumed.isError ?? false).toBe(false);
+      };
+
+      // Omitted re-applies deny — a policy never carries over silently.
+      await closeResumeCycle();
+      expect(factory.created[1]!.launchRequests[0]!.permission_policy).toBe("deny");
+
+      // An explicit interactive is propagated verbatim, on the recorded
+      // transport, for exactly this launch.
+      await closeResumeCycle("interactive");
+      expect(factory.created[2]!.launchRequests[0]!.permission_policy).toBe("interactive");
+      await closeResumeCycle();
+      expect(factory.created[3]!.launchRequests[0]!.permission_policy).toBe("deny");
+      await h.cleanup();
+    },
+    HEAVY,
+  );
 });

@@ -24,6 +24,7 @@ import type {
   LiveLaunchReport,
   LiveLaunchRequest,
   LivePermissionDecision,
+  LivePermissionPolicy,
   LiveProbeResult,
   LiveStatus,
   LiveStopMode,
@@ -45,10 +46,15 @@ import { HERMES_ACP_ARGS, probeHermes, resolveHermesCommand } from "../probes/he
  * `session/load`, permitted only when the agent's own `initialize` response
  * advertised `loadSession` — otherwise launch fails instead of silently
  * starting fresh.
- * Permission policy (binding):
- *   - headless sessions deny every `session/request_permission`;
- *   - interactive sessions wait for the hub's answer for at most
- *     `permission_timeout_ms` (default 60s), then deny;
+ * Permission policy (binding; taken from the launch request's
+ * `permission_policy`, where omitted means `deny` — the headless MCP
+ * default; no transport option may silently override the request):
+ *   - `deny` auto-denies every `session/request_permission` (reject_once or
+ *     cancelled) and NEVER advertises a usable permission_response answer
+ *     path — the hub cannot be asked to answer what nothing will await;
+ *   - `interactive` advertises the native answer path and waits for the
+ *     hub's verdict for at most `permission_timeout_ms` (default 60s), then
+ *     denies;
  *   - v3 speaks exactly two verdicts: `allow_once` selects the agent's own
  *     `allow_once` option (never another kind), `deny` selects `reject_once`
  *     or cancels; `allow_always` is never selected, and any wider verdict is
@@ -180,9 +186,7 @@ class EventSink {
 export interface HermesTransportOptions {
   command?: string;
   environment?: NodeJS.ProcessEnv;
-  /** Interactive sessions may answer permissions; headless defaults to deny. */
-  interactive?: boolean;
-  /** Cap on how long an interactive session waits for one answer (<= 60s). */
+  /** Cap on how long an `interactive`-policy session waits for one answer (<= 60s). */
   permission_timeout_ms?: number;
 }
 
@@ -192,6 +196,8 @@ export class HermesAcpTransport implements LiveTransport {
 
   private readonly options: HermesTransportOptions;
   private readonly permissionTimeoutMs: number;
+  /** Binding policy of the CURRENT launch; omitted means deny. */
+  private permissionPolicy: LivePermissionPolicy = "deny";
   private request: LiveLaunchRequest | null = null;
   private child: LiveChildHandle | null = null;
   private conn: ClientSideConnection | null = null;
@@ -239,10 +245,18 @@ export class HermesAcpTransport implements LiveTransport {
         support: "derived",
         evidence: "status is derived from session/prompt and session/update activity; ACP v1 exposes no status request, so status commands are never forwarded",
       },
-      permission_response: {
-        support: "native",
-        evidence: `ACP v1 session/request_permission round-trip via @zed-industries/agent-client-protocol@${ACP_SDK_VERSION}; headless default deny, interactive answer capped at ${this.permissionTimeoutMs}ms, only allow_once/deny honored, timeout denies, allow_always is never selected`,
-      },
+      permission_response:
+        this.permissionPolicy === "interactive"
+          ? {
+              support: "native",
+              evidence: `ACP v1 session/request_permission round-trip via @zed-industries/agent-client-protocol@${ACP_SDK_VERSION}; interactive policy: only allow_once/deny are honored, an answer may wait at most ${this.permissionTimeoutMs}ms and timeout denies, allow_always is never selected`,
+            }
+          : {
+              // Deny policy auto-denies every request, so no hub answer is
+              // ever awaited: advertising a usable answer path would lie.
+              support: "unsupported",
+              evidence: null,
+            },
       resume: this.resumeAdvertised
         ? {
             support: "native",
@@ -260,6 +274,9 @@ export class HermesAcpTransport implements LiveTransport {
       throw new LiveTransportError(liveError("launch", "LIVE_ACP_ALREADY_OPEN", "transport is already open", false));
     }
     this.request = request;
+    // Binding policy for this launch/resume: the request decides, omitted
+    // means deny. A fresh transport never inherits a previous run's mode.
+    this.permissionPolicy = request.permission_policy ?? "deny";
     this.sink ??= new EventSink(request.live_session_id, this.id);
     this.exitDeferred = deferred<void>();
 
@@ -679,8 +696,8 @@ export class HermesAcpTransport implements LiveTransport {
       summary: this.bound(`${kind}: ${params.toolCall.title ?? "tool"}`),
     });
 
-    if (!this.options.interactive) {
-      this.emit({ kind: "log", level: "warn", text: this.bound(`headless session: permission ${requestId} denied by default`) });
+    if (this.permissionPolicy !== "interactive") {
+      this.emit({ kind: "log", level: "warn", text: this.bound(`deny policy: permission ${requestId} auto-denied`) });
       return Promise.resolve(this.denyResponse(params.options));
     }
 

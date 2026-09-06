@@ -9,6 +9,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { describe, expect, it } from "vitest";
 
+import { deferred } from "../src/deferred.js";
 import { AgentHubError } from "../src/errors.js";
 import { resolveRepositoryIdentity } from "../src/git.js";
 import { acquireRepositoryLock } from "../src/locks.js";
@@ -225,7 +226,7 @@ class ScriptedTransport implements LiveTransport {
       if (this.ended) {
         return;
       }
-      const { promise, resolve } = Promise.withResolvers<void>();
+      const { promise, resolve } = deferred<void>();
       this.wake = resolve;
       if (this.queue.length > 0 || this.ended) {
         resolve();
