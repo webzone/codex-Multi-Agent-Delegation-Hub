@@ -303,6 +303,7 @@ interface LiveSessionManagerLike {
   eventCursor(id: string): number;
   close(
     id: string,
+    mode?: LiveStopMode,
   ): Promise<{
     state: LiveSessionState;
     stop: LiveStopReport | null;
@@ -661,7 +662,7 @@ export async function runLiveSession(
   };
   let finalStatus: LiveStatus;
   try {
-    const close = await manager.close(sessionId);
+    const close = await manager.close(sessionId, terminate ? "terminate" : "graceful");
     finalStatus = close.state.status;
     closeDocument = {
       live_session_id: sessionId,

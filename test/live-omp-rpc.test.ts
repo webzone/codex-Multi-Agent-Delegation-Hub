@@ -631,4 +631,59 @@ describe("omp-rpc transport (fake wire, OMP 18.1.10 dialect)", () => {
     // The pump stays open: an orphan is never reported as reaped.
     expect(pump.got.some((event) => event.body.kind === "exit")).toBe(false);
   });
+
+  it("a terminate after an orphaned graceful escalates for real, never reusing the old report", async () => {
+    const { transport, wire } = setup(false);
+    await openStarted(transport, wire);
+    new Pump(transport);
+
+    const stopping = transport.stop("graceful");
+    await vi.advanceTimersByTimeAsync(100);
+    const first = await stopping;
+    expect(first.status).toBe("orphaned");
+    expect(wire.signals).not.toContain("SIGKILL");
+
+    // The hub now holds a terminate authorization. Cached graceful authority
+    // may not answer for it: the transport must actually run the escalation.
+    const escalating = transport.stop("terminate");
+    await vi.advanceTimersByTimeAsync(90);
+    expect(wire.signals.filter((s) => s === "SIGKILL").length).toBeGreaterThanOrEqual(1);
+    wire.exit(137);
+    const second = await escalating;
+    expect(second.status).toBe("closed");
+    expect(second.exit_code).toBe(137);
+  });
+
+  it("a second graceful never re-runs shutdown behind the caller's back", async () => {
+    const { transport, wire } = setup(false);
+    await openStarted(transport, wire);
+    new Pump(transport);
+
+    const first = transport.stop("graceful");
+    await vi.advanceTimersByTimeAsync(100);
+    expect((await first).status).toBe("orphaned");
+    const signalsAfterFirst = [...wire.signals];
+    const second = await transport.stop("graceful");
+    expect(second).toEqual({ status: "orphaned", exit_code: null, exit_signal: null, waited_ms: expect.any(Number) });
+    expect(wire.signals).toEqual(signalsAfterFirst);
+  });
+
+  it("a terminate after a settled orphaned terminate re-probes instead of replaying", async () => {
+    const { transport, wire } = setup(false);
+    await openStarted(transport, wire);
+    new Pump(transport);
+
+    const first = transport.stop("terminate");
+    await vi.advanceTimersByTimeAsync(200);
+    expect((await first).status).toBe("orphaned");
+
+    // The provider died on its own between attempts; a fresh terminate is
+    // new authorization to observe that, not a replay of the old window.
+    const retry = transport.stop("terminate");
+    await vi.advanceTimersByTimeAsync(5);
+    wire.exit(137);
+    const second = await retry;
+    expect(second.status).toBe("closed");
+    expect(second.exit_code).toBe(137);
+  });
 });

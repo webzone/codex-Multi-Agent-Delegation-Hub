@@ -115,6 +115,7 @@ function fakeProbes(os: Ownership): LiveLeaseProbes {
       os.alive.set(pgid, false);
       return true;
     },
+    probeGroup: (pgid) => (os.alive.get(pgid) ? "alive" : "gone"),
     // Recovery's bounded reap windows need a real wall clock; the *hub* clock
     // under test is injected separately and stays deterministic.
     now: () => new Date(),

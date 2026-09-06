@@ -670,31 +670,43 @@ export class LiveSessionManager {
     return new AgentHubError(failure.code, failure.message);
   }
 
-  /** Worktree removal (under the live-admin lock) then lease release. */
+  /**
+   * Worktree removal ONLY under the live-admin lock, then lease release.
+   * If the lock cannot be had, NO worktree mutation runs at all — the
+   * structured failure is returned and the lease and worktree are both
+   * retained untouched (a half-cleaned tree with a live lease is worse
+   * than an untouched one).
+   */
   private async releaseLaunchResources(
     lease: LiveLeaseRecord,
     worktree: LiveWorktree,
   ): Promise<{ code: string; message: string }[]> {
     const errors: { code: string; message: string }[] = [];
     const adminLock = await this.acquireAdminLock().catch((error) => {
-      errors.push(asDelegateError(error));
+      errors.push({
+        code: "LIVE_ADMIN_LOCK_UNAVAILABLE",
+        message:
+          `the live-admin lock could not be acquired, so no worktree mutation was attempted: ` +
+          `${asDelegateError(error).message}; the worktree at ${worktree.path} and its lease are retained`,
+      });
       return null;
     });
+    if (adminLock === null) {
+      return errors;
+    }
     try {
       const removal = await removeLiveWorktree(this.options.repositoryCwd, worktree);
       if (removal.cleanup_error) {
         errors.push(removal.cleanup_error);
       }
     } finally {
-      if (adminLock !== null) {
-        try {
-          await adminLock.release();
-        } catch (releaseError) {
-          errors.push({
-            code: "LIVE_ADMIN_LOCK_RELEASE_FAILED",
-            message: `worktree operations finished but the live-admin lock release failed: ${asDelegateError(releaseError).message}`,
-          });
-        }
+      try {
+        await adminLock.release();
+      } catch (releaseError) {
+        errors.push({
+          code: "LIVE_ADMIN_LOCK_RELEASE_FAILED",
+          message: `worktree operations finished but the live-admin lock release failed: ${asDelegateError(releaseError).message}`,
+        });
       }
     }
     if (errors.length > 0) {
@@ -1412,33 +1424,7 @@ export class LiveSessionManager {
         lastError: turn.error_seen ?? undefined,
       }),
     );
-
-    let finalText: LiveTurnResult["final_text"] = null;
-    for (const stream of turn.streams.values()) {
-      if (stream.final) {
-        const joined = stream.chunks.join("");
-        const bounded = truncateUtf8(joined, this.options.maxTextBytes);
-        finalText = { text: bounded, truncated: stream.truncated || bounded !== joined };
-      }
-    }
-
-    const finishedAt = this.now();
-    const result: LiveTurnResult = {
-      live_session_id: session.id,
-      command_id: turn.command.command_id,
-      kind: turn.command.kind,
-      outcome,
-      final_text: finalText,
-      usage: turn.usage,
-      checkpoint,
-      exit_code: exit?.exit_code ?? null,
-      exit_signal: exit?.exit_signal ?? null,
-      started_at: turn.started_at,
-      finished_at: finishedAt.toISOString(),
-      duration_ms: finishedAt.getTime() - turn.started_at_ms,
-      error: turn.error_seen,
-    };
-    turn.result.resolve(result);
+    const result = this.settleTurnResult(session, turn, outcome, exit, checkpoint);
 
     // The queue drains only toward another turn. A provider-queued follow-up
     // was ALREADY delivered (the native claim promised immediate delivery):
@@ -1465,6 +1451,47 @@ export class LiveSessionManager {
         },
       );
     }
+    return result;
+  }
+
+  /**
+   * Assembles and resolves the caller-visible turn result. `checkpoint` is
+   * null on every path that could not PROVE the work stopped mutating — a
+   * crash whose stop stayed unproven must never pin a possibly-hot tree.
+   */
+  private settleTurnResult(
+    session: ManagedSession,
+    turn: ActiveTurn,
+    outcome: LiveTurnResult["outcome"],
+    exit: { exit_code: number | null; exit_signal: string | null } | null,
+    checkpoint: LiveCheckpoint | null,
+  ): LiveTurnResult {
+    let finalText: LiveTurnResult["final_text"] = null;
+    for (const stream of turn.streams.values()) {
+      if (stream.final) {
+        const joined = stream.chunks.join("");
+        const bounded = truncateUtf8(joined, this.options.maxTextBytes);
+        finalText = { text: bounded, truncated: stream.truncated || bounded !== joined };
+      }
+    }
+
+    const finishedAt = this.now();
+    const result: LiveTurnResult = {
+      live_session_id: session.id,
+      command_id: turn.command.command_id,
+      kind: turn.command.kind,
+      outcome,
+      final_text: finalText,
+      usage: turn.usage,
+      checkpoint,
+      exit_code: exit?.exit_code ?? null,
+      exit_signal: exit?.exit_signal ?? null,
+      started_at: turn.started_at,
+      finished_at: finishedAt.toISOString(),
+      duration_ms: finishedAt.getTime() - turn.started_at_ms,
+      error: turn.error_seen,
+    };
+    turn.result.resolve(result);
     return result;
   }
 
@@ -1496,19 +1523,28 @@ export class LiveSessionManager {
   // Terminal paths: reap → checkpoint → state → teardown
   // -------------------------------------------------------------------------
 
-  /** Provider died while the hub watched it. */
+  /**
+   * Provider died while the hub watched it. Termination must be PROVEN
+   * before anything is pinned: a crash whose `stop("terminate")` throws or
+   * cannot show a closed report leaves the tree possibly still mutating, so
+   * the session is marked orphaned with no checkpoint, no capture/commit,
+   * and no teardown — the lease, worktree, and recorded ownership facts
+   * stay for recovery, and an authorized `close(id, "terminate")` may
+   * finish what this path could not prove. The in-flight turn still settles
+   * honestly, as failed with `checkpoint: null`.
+   */
   private async handleCrash(
     session: ManagedSession,
     error: { code: string; message: string },
     exit: { exit_code: number | null; exit_signal: string | null } | null = null,
   ): Promise<void> {
-    if (session.torn_down || session.closing) {
+    if (session.torn_down || session.closing || TERMINAL_STATUSES.includes(session.status)) {
       return;
     }
     session.status = "error";
 
-    if (session.turn !== null) {
-      const turn = session.turn;
+    const turn = session.turn;
+    if (turn !== null) {
       session.turn = null;
       turn.error_seen ??= {
         code: error.code,
@@ -1517,16 +1553,48 @@ export class LiveSessionManager {
         retryable: false,
         provider: session.state.provider,
       };
-      // Reap-before-checkpoint holds on this path too: prove the process is
-      // gone (stop is idempotent and cheap once dead) before pinning it.
-      await session.transport.stop("terminate").catch(() => undefined);
-      await this.options.observePhase?.("transport-stopped");
+    }
+
+    // Reap-before-checkpoint holds on this path too — but the stop REPORT
+    // is the gate, not the call: only a proven `closed` may pin or tear
+    // down. A stop that throws proves nothing and is treated as unproven.
+    let stop: LiveStopReport;
+    try {
+      stop = await session.transport.stop("terminate");
+    } catch {
+      stop = { status: "orphaned", exit_code: null, exit_signal: null, waited_ms: 0 };
+    }
+    await this.options.observePhase?.("transport-stopped");
+
+    if (stop.status !== "closed") {
+      if (turn !== null) {
+        this.settleTurnResult(session, turn, "failed", exit, null);
+      }
+      session.status = "orphaned";
+      await this.enqueueDurable(session, () =>
+        this.commitStatusWith(session, "orphaned", {
+          code: "LIVE_STOP_UNPROVEN",
+          message:
+            `${error.message}; crash handling could not prove the provider process group is gone, ` +
+            "so nothing was pinned: the lease, worktree, and ownership facts are retained for recovery",
+          stage: "shutdown",
+          retryable: false,
+          provider: session.state.provider,
+        }),
+      );
+      await this.failQueued(
+        session,
+        "LIVE_SESSION_CRASHED",
+        "the live session crashed before the queued follow-up ran",
+      );
+      return;
+    }
+
+    if (turn !== null) {
       await this.finalizeTurn(session, turn, "failed", exit);
     } else {
-      await this.enqueueDurable(session, async () => {
-        await session.transport.stop("terminate").catch(() => undefined);
-        await this.options.observePhase?.("transport-stopped");
-        await this.captureAndCommit(session, "error", {
+      await this.enqueueDurable(session, () =>
+        this.captureAndCommit(session, "error", {
           statusOverride: "error",
           lastError: {
             code: error.code,
@@ -1535,8 +1603,8 @@ export class LiveSessionManager {
             retryable: false,
             provider: session.state.provider,
           },
-        });
-      });
+        }),
+      );
     }
     await this.failQueued(
       session,
@@ -1546,14 +1614,35 @@ export class LiveSessionManager {
     await this.teardown(session);
   }
 
-  /** Orderly shutdown requested by the caller. `terminate` skips the
-   * unproven graceful attempt and goes straight to bounded escalation. */
+  /**
+   * Orderly shutdown requested by the caller. `graceful` never silently
+   * escalates: if the provider will not come down under the graceful
+   * attempt, the close honestly reports `orphaned` — bounded TERM→KILL
+   * escalation happens only when `terminate` authorizes it, either in this
+   * call or in a later `close(id, "terminate")` on a session this one
+   * orphaned. An orphan keeps its lease, worktree, and ownership evidence
+   * precisely so the later terminate can be proven and completed. A stop
+   * that THROWS is as unproven as one that reports `orphaned`.
+   */
   async close(id: string, mode: LiveStopMode = "graceful"): Promise<LiveCloseResult> {
     const session = this.sessions.get(id);
     if (!session) {
       throw new AgentHubError("LIVE_SESSION_NOT_FOUND", `no live session "${id}" in this hub process`);
     }
     if (session.torn_down) {
+      return {
+        state: structuredClone(session.state),
+        stop: null,
+        checkpoint_taken: false,
+        cleanup_errors: [],
+      };
+    }
+    if (
+      TERMINAL_STATUSES.includes(session.status) &&
+      !(session.status === "orphaned" && mode === "terminate")
+    ) {
+      // A terminal record gets its shutdown report once; only an authorized
+      // terminate may re-attempt shutdown for an orphan.
       return {
         state: structuredClone(session.state),
         stop: null,
@@ -1568,27 +1657,30 @@ export class LiveSessionManager {
       "LIVE_SESSION_CLOSING",
       "the live session was closed before the queued follow-up ran",
     );
-    let stop = await session.transport.stop(mode);
-    if (stop.status !== "closed" && mode === "graceful") {
-      stop = await session.transport.stop("terminate");
+    let stop: LiveStopReport;
+    try {
+      stop = await session.transport.stop(mode);
+    } catch {
+      stop = { status: "orphaned", exit_code: null, exit_signal: null, waited_ms: 0 };
     }
     await this.options.observePhase?.("transport-stopped");
 
     if (stop.status !== "closed") {
       // Honest orphan: no checkpoint (the tree may still be under active
-      // mutation), no teardown; lease and worktree stay for recovery.
-      await this.enqueueDurable(session, async () => {
-        await this.commitStatusWith(session, "orphaned", {
+      // mutation), no teardown. Lease, worktree, and ownership facts stay
+      // retained — and an authorized terminate close may finish the job.
+      await this.enqueueDurable(session, () =>
+        this.commitStatusWith(session, "orphaned", {
           code: "LIVE_STOP_UNPROVEN",
           message:
-            "shutdown could not prove the provider process is gone; the session is orphaned, not closed",
+            `shutdown (${mode}) could not prove the provider process group is gone; the session is orphaned, not closed; ` +
+            "the lease and worktree are retained and a terminate-authorized close may retry the shutdown",
           stage: "shutdown",
           retryable: false,
           provider: session.state.provider,
-        });
-      });
+        }),
+      );
       session.status = "orphaned";
-      session.torn_down = true;
       return { state: structuredClone(session.state), stop, checkpoint_taken: false, cleanup_errors: [] };
     }
 
@@ -1884,34 +1976,43 @@ export class LiveSessionManager {
       // Teardown strictly after the durable rewrite; the lease is released
       // last so its audit trail outlives every resource it named. The
       // worktree removal runs under the same short live-admin lock as every
-      // other worktree mutation. A cleanup that is NOT proven keeps the
-      // lease and names the surviving path — it is never reported as clean.
+      // other worktree mutation, and the lease may NEVER be released unless
+      // that removal ran, under lock, and was proven. A cleanup that is not
+      // proven — refused for lock unavailability or reporting a failure —
+      // keeps the lease, names the surviving path, and is never clean.
       let detail = action.detail;
       if (action.worktreePath !== null) {
-        const adminLock = await this.acquireAdminLock().catch((error) => {
-          detail = `${detail}; worktree cleanup refused: ${asDelegateError(error).message}; lease retained`;
-          return null;
-        });
-        if (adminLock !== null) {
+        let adminLock: RepositoryLock;
+        try {
+          adminLock = await this.acquireAdminLock();
+        } catch (error) {
+          report.sessions.push({
+            live_session_id: lease.live_session_id,
+            outcome: action.kind,
+            detail:
+              `${action.detail}; worktree cleanup refused: ${asDelegateError(error).message}; ` +
+              `lease and worktree retained (never release a lease whose worktree cleanup did not run under the admin lock)`,
+          });
+          continue;
+        }
+        try {
+          const removal = await removeLiveWorktree(repositoryCwd, {
+            path: action.worktreePath,
+            parentPath: dirname(action.worktreePath),
+            // `removeLiveWorktree` never reads `base` and recovery does not
+            // re-derive it; the empty string keeps the record honest.
+            base: "",
+          });
+          if (removal.cleanup_error) {
+            detail = `${detail}; worktree cleanup reported: ${removal.cleanup_error.message}; lease retained as the audit trail for ${action.worktreePath}`;
+            report.sessions.push({ live_session_id: lease.live_session_id, outcome: action.kind, detail });
+            continue;
+          }
+        } finally {
           try {
-            const removal = await removeLiveWorktree(repositoryCwd, {
-              path: action.worktreePath,
-              parentPath: dirname(action.worktreePath),
-              // `removeLiveWorktree` never reads `base` and recovery does not
-              // re-derive it; the empty string keeps the record honest.
-              base: "",
-            });
-            if (removal.cleanup_error) {
-              detail = `${detail}; worktree cleanup reported: ${removal.cleanup_error.message}; lease retained as the audit trail for ${action.worktreePath}`;
-              report.sessions.push({ live_session_id: lease.live_session_id, outcome: action.kind, detail });
-              continue;
-            }
-          } finally {
-            try {
-              await adminLock.release();
-            } catch (lockReleaseError) {
-              detail = `${detail}; live-admin lock release: ${asDelegateError(lockReleaseError).message}`;
-            }
+            await adminLock.release();
+          } catch (lockReleaseError) {
+            detail = `${detail}; live-admin lock release: ${asDelegateError(lockReleaseError).message}`;
           }
         }
       }

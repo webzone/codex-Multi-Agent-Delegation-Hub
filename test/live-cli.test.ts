@@ -226,13 +226,18 @@ class ScriptedTransport implements LiveTransport {
     }
   }
 
+  /** When set, decides the stop outcome per mode — the orphan-vs-closed seam. */
+  stopPolicy: ((mode: LiveStopMode) => LiveStopReport) | null = null;
+
   async stop(mode: LiveStopMode): Promise<LiveStopReport> {
     this.stopCalls.push(mode);
-    if (!this.ended) {
+    const report: LiveStopReport =
+      this.stopPolicy?.(mode) ?? { status: "closed", exit_code: 0, exit_signal: null, waited_ms: 5 };
+    if (report.status === "closed" && !this.ended) {
       this.emit({ kind: "exit", intentional: true, exit_code: 0, exit_signal: null });
       this.ended = true;
     }
-    return { status: "closed", exit_code: 0, exit_signal: null, waited_ms: 5 };
+    return report;
   }
 }
 
@@ -249,6 +254,7 @@ class ScriptedFactory implements LiveTransportFactory {
       version: "9.9.9-scripted",
       detail: "scripted provider present",
     },
+    readonly stopPolicy?: (mode: LiveStopMode) => LiveStopReport,
   ) {
     this.transport = transport;
     this.provider = PROVIDER_BY_TRANSPORT[transport];
@@ -260,6 +266,9 @@ class ScriptedFactory implements LiveTransportFactory {
 
   create(): ScriptedTransport {
     const transport = new ScriptedTransport(this.transport, this.capabilities);
+    if (this.stopPolicy) {
+      transport.stopPolicy = this.stopPolicy;
+    }
     this.created.push(transport);
     return transport;
   }
@@ -270,6 +279,7 @@ function fakeProbes(): LiveLeaseProbes {
     probePid: (pid) => (pid === process.pid ? "live" : "dead"),
     startToken: async (pid) => (pid === process.pid ? "hub-tok" : "prov-tok"),
     killGroup: () => true,
+    probeGroup: (pgid) => (pgid === process.pid ? "alive" : "gone"),
     now: () => new Date(),
   };
 }
@@ -287,11 +297,14 @@ interface WireScope {
   factory: ScriptedFactory;
 }
 
-async function wireScope(capabilities: LiveCapabilities = capabilitySnapshot()): Promise<WireScope> {
+async function wireScope(
+  capabilities: LiveCapabilities = capabilitySnapshot(),
+  stopPolicy?: (mode: LiveStopMode) => LiveStopReport,
+): Promise<WireScope> {
   const repository = await createGitRepository();
   const identity = await resolveRepositoryIdentity(repository);
   const tmpRoot = await mkdtemp(join(tmpdir(), "agent-hub-live-cli-"));
-  const factory = new ScriptedFactory("pi-rpc", capabilities);
+  const factory = new ScriptedFactory("pi-rpc", capabilities, undefined, stopPolicy);
   const manager = await createLiveManager(repository, {
     withoutProductionTransports: true,
     extraTransportFactories: [factory],
@@ -811,6 +824,99 @@ describe("live session wire", () => {
       expect(docsOfType(second.documents, "close")[0]?.close).toMatchObject({ status: "closed" });
     },
     60_000,
+  );
+
+  it(
+    "close without terminate stays graceful and never escalates",
+    async () => {
+      const scope = await wireScope();
+      const { io, documents } = makeIo([{ action: "prompt", text: "work" }, { action: "close" }]);
+      const exitCode = await runLiveSession(
+        { provider: "pi", resumeId: null, workspace: scope.repository, maxTextBytes: 4096 },
+        io,
+        { manager: scope.manager },
+      );
+      await releaseWire(scope);
+      expect(exitCode).toBe(0);
+      // The wire's close defaults to graceful with the manager.
+      expect(scope.factory.created[0]?.stopCalls).toEqual(["graceful"]);
+      expect(docsOfType(documents, "close")[0]?.close).toMatchObject({ status: "closed" });
+    },
+    30_000,
+  );
+
+  it(
+    "close with terminate skips the graceful attempt and escalates directly",
+    async () => {
+      const scope = await wireScope();
+      const { io, documents } = makeIo([
+        { action: "prompt", text: "work" },
+        { action: "close", terminate: true },
+      ]);
+      const exitCode = await runLiveSession(
+        { provider: "pi", resumeId: null, workspace: scope.repository, maxTextBytes: 4096 },
+        io,
+        { manager: scope.manager },
+      );
+      await releaseWire(scope);
+      expect(exitCode).toBe(0);
+      // terminate:true is honored: the transport never saw a graceful stop.
+      expect(scope.factory.created[0]?.stopCalls).toEqual(["terminate"]);
+      expect(docsOfType(documents, "close")[0]?.close).toMatchObject({ status: "closed" });
+    },
+    30_000,
+  );
+
+  it(
+    "graceful close against a deaf provider reports orphaned and never escalates quietly",
+    async () => {
+      const gracefulDeaf = (mode: LiveStopMode): LiveStopReport =>
+        mode === "graceful"
+          ? { status: "orphaned", exit_code: null, exit_signal: null, waited_ms: 5 }
+          : { status: "closed", exit_code: null, exit_signal: "SIGKILL", waited_ms: 9 };
+      const scope = await wireScope(undefined, gracefulDeaf);
+      const { io, documents } = makeIo([{ action: "close" }]);
+      const exitCode = await runLiveSession(
+        { provider: "pi", resumeId: null, workspace: scope.repository, maxTextBytes: 4096 },
+        io,
+        { manager: scope.manager },
+      );
+      await releaseWire(scope);
+      expect(exitCode).toBe(1); // an orphaned close is a failed exit
+      // graceful is never authorized to escalate: exactly one stop call.
+      expect(scope.factory.created[0]?.stopCalls).toEqual(["graceful"]);
+      expect(docsOfType(documents, "close")[0]?.close).toMatchObject({
+        status: "orphaned",
+        stop: { status: "orphaned" },
+        checkpoint_taken: false,
+      });
+    },
+    30_000,
+  );
+
+  it(
+    "terminate close against a provider that ignored graceful closes honestly",
+    async () => {
+      const killOnlyWorks = (mode: LiveStopMode): LiveStopReport =>
+        mode === "graceful"
+          ? { status: "orphaned", exit_code: null, exit_signal: null, waited_ms: 5 }
+          : { status: "closed", exit_code: null, exit_signal: "SIGKILL", waited_ms: 9 };
+      const scope = await wireScope(undefined, killOnlyWorks);
+      const { io, documents } = makeIo([{ action: "close", terminate: true }]);
+      const exitCode = await runLiveSession(
+        { provider: "pi", resumeId: null, workspace: scope.repository, maxTextBytes: 4096 },
+        io,
+        { manager: scope.manager },
+      );
+      await releaseWire(scope);
+      expect(exitCode).toBe(0);
+      expect(scope.factory.created[0]?.stopCalls).toEqual(["terminate"]);
+      expect(docsOfType(documents, "close")[0]?.close).toMatchObject({
+        status: "closed",
+        stop: { status: "closed", exit_signal: "SIGKILL" },
+      });
+    },
+    30_000,
   );
 });
 

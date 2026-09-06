@@ -67,6 +67,12 @@ export interface LiveLeaseProbes {
   startToken: (pid: number) => Promise<string | null>;
   /** Signal a whole process group. Returns whether the signal was delivered. */
   killGroup: (pgid: number, signal: NodeJS.Signals) => boolean;
+  /**
+   * POSIX group-existence probe: `kill(-pgid, 0)`. ONLY `ESRCH` proves the
+   * group gone; success proves it alive; `EPERM` (or any other errno) means
+   * the group may exist but is unprobeable/unownable — never death proof.
+   */
+  probeGroup: (pgid: number) => "alive" | "gone" | "uncertain";
   now: () => Date;
 }
 
@@ -189,6 +195,21 @@ export const defaultLiveLeaseProbes: LiveLeaseProbes = {
       return true;
     } catch {
       return false;
+    }
+  },
+  probeGroup(pgid: number): "alive" | "gone" | "uncertain" {
+    try {
+      process.kill(-pgid, 0);
+      return "alive";
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      // ESRCH is the only answer that proves no group member exists. EPERM
+      // proves the group exists under someone else's uid — presence without
+      // ownership, never absence; anything else is simply unprobeable.
+      if (code === "ESRCH") {
+        return "gone";
+      }
+      return "uncertain";
     }
   },
   now: () => new Date(),
@@ -379,7 +400,12 @@ export async function removeLiveLease(
  * keyed: foreign host and live-with-matching-identity are hands-off; a dead
  * hub pid (ESRCH is presence-proof) hands the provider over for reaping, and
  * a live provider pid may only be reaped when its start identity matches the
- * lease exactly.
+ * lease exactly. Leader death alone never proves the WORK is dead: a leader
+ * PID may exit while its process group (helper children) survives, so a dead
+ * leader only yields `dead` when the group probe itself answers ESRCH. Group
+ * still present, unprobeable, or an unrecorded group identity all classify
+ * `uncertain`: the tree may still be under mutation; nothing may be reaped,
+ * checkpointed, or cleaned up on this evidence.
  */
 export async function classifyLiveLease(
   lease: LiveLeaseRecord,
@@ -405,7 +431,37 @@ export async function classifyLiveLease(
         "lease records no provider pid; provider liveness can be neither proven nor disproven, so nothing is assumed",
     };
   } else if (probes.probePid(lease.provider_pid) === "dead") {
-    provider = { state: "dead" };
+    // Leader death is not group death. The group probe may only be read as
+    // the owned group's fate when the lease recorded the group identity (or
+    // the leader provably led it: pgid recorded as the leader pid itself).
+    const groupTarget = lease.provider_pgid;
+    if (groupTarget === null) {
+      provider = {
+        state: "uncertain",
+        reapable: false,
+        reason:
+          `provider leader pid ${lease.provider_pid} is gone but the lease records no process-group identity, so the fate of any helper processes cannot be probed`,
+      };
+    } else {
+      const group = probes.probeGroup(groupTarget);
+      if (group === "gone") {
+        provider = { state: "dead" };
+      } else if (group === "alive") {
+        provider = {
+          state: "uncertain",
+          reapable: false,
+          reason:
+            `provider leader pid ${lease.provider_pid} is dead but its process group ${groupTarget} still exists: helper processes may still mutate the worktree`,
+        };
+      } else {
+        provider = {
+          state: "uncertain",
+          reapable: false,
+          reason:
+            `provider leader pid ${lease.provider_pid} is dead but process group ${groupTarget} cannot be probed (only ESRCH proves a group gone): helper survival is unknown`,
+        };
+      }
+    }
   } else {
     const observedStart = await probes.startToken(lease.provider_pid);
     if (
@@ -454,6 +510,7 @@ export async function classifyLiveLease(
 export type LiveLeaseReapOutcome =
   | { status: "reaped"; waited_ms: number }
   | { status: "survived"; waited_ms: number }
+  | { status: "uncertain"; waited_ms: number; reason: string }
   | { status: "not-attempted"; reason: string };
 
 export interface ReapOptions {
@@ -466,8 +523,11 @@ export interface ReapOptions {
  * Terminate an orphaned provider group the lease provably owns. This is the
  * ONLY path that signals a pid the calling process did not spawn, and it
  * fires solely for `reapable: true` classifications. SIGTERM gets the grace
- * window; SIGKILL escalation is bounded and the final answer is still just
- * what the pid probe observed.
+ * window; SIGKILL escalation is bounded. `reaped` requires the whole owned
+ * group to answer ESRCH to a group probe — leader death alone never counts,
+ * because a helper that outlived its leader can still mutate the worktree.
+ * A group that cannot be probed at all (only ESRCH proves absence) yields
+ * `uncertain`, never a fake reap.
  */
 export async function reapOrphanedProvider(
   lease: LiveLeaseRecord,
@@ -490,11 +550,16 @@ export async function reapOrphanedProvider(
   const killWaitMs = options.killWaitMs ?? 5_000;
   const pollMs = options.pollMs ?? 25;
   const started = probes.now().getTime();
+  const leader = lease.provider_pid ?? target;
 
-  const goneWithin = async (windowMs: number): Promise<boolean> => {
+  // The last group-probe answer seen inside a wait window; decides
+  // `survived` versus `uncertain` when a window runs out.
+  let lastGroup: "alive" | "gone" | "uncertain" = "uncertain";
+  const groupGoneWithin = async (windowMs: number): Promise<boolean> => {
     const deadline = probes.now().getTime() + windowMs;
     for (;;) {
-      if (probes.probePid(target) === "dead") {
+      lastGroup = probes.probeGroup(target);
+      if (lastGroup === "gone" && probes.probePid(leader) === "dead") {
         return true;
       }
       if (probes.now().getTime() >= deadline) {
@@ -505,12 +570,19 @@ export async function reapOrphanedProvider(
   };
 
   probes.killGroup(target, "SIGTERM");
-  if (await goneWithin(graceMs)) {
+  if (await groupGoneWithin(graceMs)) {
     return { status: "reaped", waited_ms: probes.now().getTime() - started };
   }
   probes.killGroup(target, "SIGKILL");
-  if (await goneWithin(killWaitMs)) {
+  if (await groupGoneWithin(killWaitMs)) {
     return { status: "reaped", waited_ms: probes.now().getTime() - started };
+  }
+  if (lastGroup === "uncertain") {
+    return {
+      status: "uncertain",
+      waited_ms: probes.now().getTime() - started,
+      reason: `process group ${target} could not be probed after TERM/KILL (only ESRCH proves a group gone); termination cannot be certified`,
+    };
   }
   return { status: "survived", waited_ms: probes.now().getTime() - started };
 }

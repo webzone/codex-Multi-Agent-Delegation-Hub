@@ -47,6 +47,8 @@ interface FakeProbeConfig {
   starts?: Record<number, string | null>;
   kills?: Array<{ target: number; signal: string }>;
   diesOnSignal?: boolean;
+  /** Explicit group-probe answers; default derives from the pid liveness set. */
+  groups?: Record<number, "alive" | "gone" | "uncertain">;
 }
 
 function fakeProbes(config: FakeProbeConfig = {}): LiveLeaseProbes {
@@ -63,6 +65,7 @@ function fakeProbes(config: FakeProbeConfig = {}): LiveLeaseProbes {
       }
       return true;
     },
+    probeGroup: (pgid) => config.groups?.[pgid] ?? (alive.has(pgid) ? "alive" : "gone"),
     now: () => new Date(),
   };
 }
@@ -227,6 +230,38 @@ describe("classifyLiveLease", () => {
     expect(verdict.provider.reapable).toBe(false);
     expect(verdict.provider.reason).toContain("no provider pid");
   });
+
+  it("refuses to call a gone leader dead while its group survives or is unprobeable", async () => {
+    const commonDir = await tempCommonDir();
+    const lease = await seedLease(commonDir);
+
+    // Leader PID gone but kill(-pgid, 0) still answers: helpers live.
+    const helperAlive = fakeProbes({ alive: [], groups: { [PROVIDER_PID]: "alive" } });
+    const survivor = await classifyLiveLease(lease, helperAlive);
+    if (survivor.state !== "hub-gone" || survivor.provider.state !== "uncertain") {
+      expect.unreachable("a surviving group must never classify the provider as dead");
+    }
+    expect(survivor.provider.reapable).toBe(false);
+    expect(survivor.provider.reason).toContain("still exists");
+
+    // EPERM/unknown from the group probe is never death proof either.
+    const unprobeable = fakeProbes({ alive: [], groups: { [PROVIDER_PID]: "uncertain" } });
+    const unknown = await classifyLiveLease(lease, unprobeable);
+    if (unknown.state !== "hub-gone" || unknown.provider.state !== "uncertain") {
+      expect.unreachable("an unprobeable group must classify as uncertain, not dead");
+    }
+    expect(unknown.provider.reason).toContain("cannot be probed");
+
+    // No recorded group identity: the group probe could not even name the
+    // right group, so leader death proves nothing about helpers.
+    const otherDir = await tempCommonDir();
+    const noPgid = await seedLease(otherDir, { provider_pgid: null });
+    const noIdentity = await classifyLiveLease(noPgid, fakeProbes({ alive: [] }));
+    if (noIdentity.state !== "hub-gone" || noIdentity.provider.state !== "uncertain") {
+      expect.unreachable("leader death without a recorded pgid must stay uncertain");
+    }
+    expect(noIdentity.provider.reason).toContain("no process-group identity");
+  });
 });
 
 describe("reapOrphanedProvider", () => {
@@ -246,6 +281,7 @@ describe("reapOrphanedProvider", () => {
         }
         return true;
       },
+      probeGroup: (pgid) => (alive.has(pgid) ? "alive" : "gone"),
       now: () => new Date(),
     };
     const outcome = await reapOrphanedProvider(
@@ -270,6 +306,61 @@ describe("reapOrphanedProvider", () => {
       { graceMs: 30, killWaitMs: 30, pollMs: 5 },
     );
     expect(outcome.status).toBe("survived");
+  });
+
+  it("only reports reaped when the whole group answers gone, not on leader death", async () => {
+    const commonDir = await tempCommonDir();
+    const lease = await seedLease(commonDir);
+    const kills: Array<{ target: number; signal: string }> = [];
+    // The leader dies to SIGTERM; a helper keeps the group alive until KILL.
+    const alive = new Set<number>([PROVIDER_PID]);
+    let groupGone = false;
+    const probes: LiveLeaseProbes = {
+      probePid: (pid) => (alive.has(pid) ? "live" : "dead"),
+      startToken: async () => "prov-start",
+      killGroup: (pgid, signal) => {
+        kills.push({ target: pgid, signal });
+        if (signal === "SIGTERM") {
+          alive.delete(pgid);
+        }
+        if (signal === "SIGKILL") {
+          groupGone = true;
+        }
+        return true;
+      },
+      probeGroup: () => (groupGone ? "gone" : "alive"),
+      now: () => new Date(),
+    };
+    const outcome = await reapOrphanedProvider(
+      lease,
+      { state: "alive", reapable: true },
+      probes,
+      { graceMs: 60, killWaitMs: 60, pollMs: 5 },
+    );
+    // Leader-only death would have "reaped" inside the TERM window; the
+    // group probe must force the KILL escalation and only then certify.
+    expect(outcome.status).toBe("reaped");
+    expect(kills.map((k) => k.signal)).toEqual(["SIGTERM", "SIGKILL"]);
+  });
+
+  it("reports uncertain, never a fake reap, when the group cannot be probed", async () => {
+    const commonDir = await tempCommonDir();
+    const lease = await seedLease(commonDir);
+    const probes = fakeProbes({
+      alive: [],
+      groups: { [PROVIDER_PID]: "uncertain" },
+      starts: { [PROVIDER_PID]: "prov-start" },
+    });
+    const outcome = await reapOrphanedProvider(
+      lease,
+      { state: "alive", reapable: true },
+      probes,
+      { graceMs: 20, killWaitMs: 20, pollMs: 5 },
+    );
+    expect(outcome.status).toBe("uncertain");
+    if (outcome.status === "uncertain") {
+      expect(outcome.reason).toContain("could not be probed");
+    }
   });
 
   it("never signals an uncertain classification", async () => {

@@ -250,6 +250,10 @@ export abstract class RpcSessionBase implements LiveTransport {
   private pumpConsumed = false;
   private opened = false;
   private stopPromise: Promise<LiveStopReport> | null = null;
+  /** Which mode the cached `stopPromise` actually ran (or is running); the
+   * cache may only be reused within that mode's authority. */
+  private stopMode: LiveStopMode | null = null;
+  private stopSettled = false;
 
   private liveSessionId = "";
   private maxTextBytes = 0;
@@ -581,10 +585,35 @@ export abstract class RpcSessionBase implements LiveTransport {
 
   stop(mode: LiveStopMode): Promise<LiveStopReport> {
     this.requireOpen();
-    if (!this.stopPromise) {
-      this.stopPromise = this.shutdown(mode);
+    const prior = this.stopPromise;
+    if (prior === null) {
+      this.stopMode = mode;
+      return (this.stopPromise = this.trackStopSettled(this.shutdown(mode)));
     }
-    return this.stopPromise;
+    // A graceful arriving later never re-runs or escalates signals; it
+    // takes whatever the earlier attempt established.
+    if (mode !== "terminate") {
+      return prior;
+    }
+    // A terminate while another is still in flight shares that attempt;
+    // once one has settled without closing, the next terminate is fresh
+    // authorization to re-probe and re-run the bounded escalation — the
+    // process may well have died since the last window.
+    if (this.stopMode === "terminate" && !this.stopSettled) {
+      return prior;
+    }
+    this.stopMode = "terminate";
+    return (this.stopPromise = this.trackStopSettled(
+      prior.then((first) => (first.status === "closed" ? first : this.shutdown("terminate"))),
+    ));
+  }
+
+  private trackStopSettled(promise: Promise<LiveStopReport>): Promise<LiveStopReport> {
+    const settle = (): void => {
+      this.stopSettled = true;
+    };
+    void promise.then(settle, settle);
+    return promise;
   }
 
   private async shutdown(mode: LiveStopMode): Promise<LiveStopReport> {

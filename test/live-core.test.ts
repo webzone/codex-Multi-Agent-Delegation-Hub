@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,9 +19,12 @@ import {
   LIVE_FOLLOW_UP_QUEUE_MAX_BYTES,
   LIVE_FOLLOW_UP_QUEUE_MAX_MESSAGES,
   LIVE_PROCESS_SESSION_QUOTA,
+  type LiveManagerOptions,
   type LiveManagerPhase,
 } from "../src/live/manager.js";
 import type { LiveLeaseProbes } from "../src/live/lease.js";
+import { acquireRepositoryLock } from "../src/locks.js";
+import { LIVE_ADMIN_LOCK_NAME } from "../src/live/state.js";
 import type {
   LiveCapabilities,
   LiveCommand,
@@ -191,20 +194,26 @@ const ompProviderFactory: LiveProviderFactory = {
   selectTransport: (factories) => factories[0] ?? null,
 };
 
-function fakeProbes(config: {
-  alive?: (pid: number) => boolean;
-  startToken?: (pid: number) => string;
-  kills?: KillRecord[];
-} = {}): LiveLeaseProbes {
+function fakeProbes(
+  config: {
+    alive?: (pid: number) => boolean;
+    startToken?: (pid: number) => string;
+    kills?: KillRecord[];
+    /** Override the group probe; default derives from the pid liveness model. */
+    groupState?: (pgid: number) => "alive" | "gone" | "uncertain";
+  } = {},
+): LiveLeaseProbes {
   const kills = config.kills ?? [];
+  const alive = config.alive ?? ((p: number) => p === process.pid);
   return {
-    probePid: (pid) => ((config.alive ?? ((p: number) => p === process.pid))(pid) ? "live" : "dead"),
+    probePid: (pid) => (alive(pid) ? "live" : "dead"),
     startToken: async (pid) =>
       (config.startToken ?? ((p) => (p === process.pid ? "hub-tok" : "prov-tok")))(pid),
     killGroup: (pgid, signal) => {
       kills.push({ target: pgid, signal });
       return true;
     },
+    probeGroup: config.groupState ?? ((pgid) => (alive(pgid) ? "alive" : "gone")),
     now: () => new Date(),
   };
 }
@@ -215,6 +224,7 @@ interface HarnessConfig {
   processQuota?: number;
   commonDirQuota?: number;
   leaseProbes?: LiveLeaseProbes;
+  acquireLock?: LiveManagerOptions["acquireLock"];
   phases?: LiveManagerPhase[];
 }
 
@@ -243,6 +253,7 @@ async function harness(config: HarnessConfig = {}): Promise<Harness> {
     commonDirQuota: config.commonDirQuota,
     tmpRoot,
     leaseProbes: config.leaseProbes ?? fakeProbes(),
+    acquireLock: config.acquireLock,
     observePhase: phases
       ? async (phase) => {
           phases.push(phase);
@@ -256,6 +267,7 @@ function secondHub(
   source: Harness,
   probes: LiveLeaseProbes,
   phases?: LiveManagerPhase[],
+  acquireLock?: LiveManagerOptions["acquireLock"],
 ): LiveSessionManager {
   return new LiveSessionManager({
     commonDir: source.commonDir,
@@ -263,6 +275,7 @@ function secondHub(
     transportFactories: [new FakeTransportFactory(() => new FakeTransport())],
     providerFactories: [ompProviderFactory],
     leaseProbes: probes,
+    acquireLock,
     observePhase: phases
       ? async (phase) => {
           phases.push(phase);
@@ -432,22 +445,72 @@ describe("live manager lifecycle", () => {
     await settle(scope);
   });
 
-  it("pins nothing and reports orphaned when shutdown cannot prove the exit", async () => {
+  it("crash whose stop cannot prove death: failed turn, no checkpoint, resources retained", async () => {
+    const phases: LiveManagerPhase[] = [];
+    const scope = await harness({ phases, transportOptions: writingTransportOptions });
+    const { live_session_id } = await startSession(scope.manager);
+    const t = scope.factory.created[0];
+    // The provider crashed AND the terminate stop cannot prove it gone.
+    t.stopResults = [{ status: "orphaned", exit_code: null, exit_signal: null, waited_ms: 7 }];
+
+    const turn = scope.manager.prompt(live_session_id, "hot work");
+    t.push({ kind: "status", status: "running", note: null });
+    t.push({ kind: "exit", intentional: false, exit_code: 137, exit_signal: null });
+
+    const result = await turn;
+    expect(result.outcome).toBe("failed");
+    // The honest settlement: failed with NO checkpoint — the tree may still
+    // be mutating, so nothing may be pinned on an unproven stop.
+    expect(result.checkpoint).toBeNull();
+    expect(result.error?.code).toBe("LIVE_PROVIDER_EXITED");
+
+    // The turn resolves before the (git-backed) orphan rewrite lands; pump
+    // the event loop until the durable path signals its final phase — the
+    // awaited condition, not a guessed delay.
+    for (let spin = 0; !phases.includes("state-advanced"); spin += 1) {
+      if (spin > 50_000) {
+        throw new Error("the crash-orphan rewrite never reached the durable record");
+      }
+      await tick();
+    }
+    const state = await scope.manager.view(live_session_id);
+    expect(state.status).toBe("orphaned");
+    expect(state.last_error?.code).toBe("LIVE_STOP_UNPROVEN");
+    // Work exists in the worktree, yet the chain stayed untouched.
+    expect(state.current_commit).toBe(state.base_commit);
+    expect(state.checkpoint_seq).toBe(0);
+    await access(state.worktree_path);
+    expect(await leasesOf(scope.commonDir)).toHaveLength(1);
+    // No `checkpoint-captured` phase may ever fire on this path.
+    expect(phases).toEqual(["transport-stopped", "state-advanced"]);
+
+    await settle(scope);
+  });
+
+  it("graceful close reports orphaned without silent escalation; terminate close then completes", async () => {
     const scope = await harness();
     const { live_session_id } = await startSession(scope.manager);
     const t = scope.factory.created[0];
-    t.stopResults = [
-      { status: "orphaned", exit_code: null, exit_signal: null, waited_ms: 5 },
-      { status: "orphaned", exit_code: null, exit_signal: null, waited_ms: 10 },
-    ];
+    t.stopResults = [{ status: "orphaned", exit_code: null, exit_signal: null, waited_ms: 5 }];
 
-    const closed = await scope.manager.close(live_session_id);
-    expect(closed.state.status).toBe("orphaned");
-    expect(closed.state.last_error?.code).toBe("LIVE_STOP_UNPROVEN");
-    expect(closed.checkpoint_taken).toBe(false);
-    expect(t.stopCalls).toEqual(["graceful", "terminate"]);
+    const orphaned = await scope.manager.close(live_session_id);
+    expect(orphaned.state.status).toBe("orphaned");
+    expect(orphaned.state.last_error?.code).toBe("LIVE_STOP_UNPROVEN");
+    expect(orphaned.checkpoint_taken).toBe(false);
+    // graceful never quietly escalates: exactly one stop, no terminate call.
+    expect(t.stopCalls).toEqual(["graceful"]);
     // Lease and worktree stay for recovery; the durable record says orphaned.
     expect(await leasesOf(scope.commonDir)).toHaveLength(1);
+
+    // An authorized terminate re-attempts shutdown with fresh authority —
+    // not the old graceful report — and completes checkpoint + teardown.
+    const closed = await scope.manager.close(live_session_id, "terminate");
+    expect(closed.state.status).toBe("closed");
+    expect(closed.stop?.status).toBe("closed");
+    expect(t.stopCalls).toEqual(["graceful", "terminate"]);
+    const durable = await durableState(scope.commonDir, live_session_id);
+    expect(durable.status).toBe("closed");
+    expect(await leasesOf(scope.commonDir)).toHaveLength(0);
 
     await settle(scope);
   });
@@ -756,12 +819,20 @@ describe("recovery", () => {
     second: LiveSessionManager;
   }
 
-  async function stranded(probes: LiveLeaseProbes, phases?: LiveManagerPhase[]): Promise<Stranded> {
+  async function stranded(
+    probes: LiveLeaseProbes,
+    phases?: LiveManagerPhase[],
+    acquireLock?: LiveManagerOptions["acquireLock"],
+  ): Promise<Stranded> {
     const scope = await harness();
     const started = await startSession(scope.manager);
     // Provider-side work exists in the worktree after "hub death".
     await writeFile(join(started.workspace, "provider-work.txt"), "survived\n");
-    return { ...scope, liveSessionId: started.live_session_id, second: secondHub(scope, probes, phases) };
+    return {
+      ...scope,
+      liveSessionId: started.live_session_id,
+      second: secondHub(scope, probes, phases, acquireLock),
+    };
   }
 
   it("reaps a provably-owned orphan before pinning and rewriting status", async () => {
@@ -776,6 +847,7 @@ describe("recovery", () => {
         providerAlive = false;
         return true;
       },
+      probeGroup: (pgid) => (pgid === 424_242 && providerAlive ? "alive" : "gone"),
       now: () => new Date(),
     };
     const scope = await stranded(probes, phases);
@@ -868,6 +940,66 @@ describe("recovery", () => {
     await removeDirectory(scope.tmpRoot);
   });
 
+  it("treats leader death with a surviving process group as manual and retains everything", async () => {
+    const kills: KillRecord[] = [];
+    // Leader PID gone, but kill(-pgid, 0) still answers: helpers live.
+    const probes = fakeProbes({
+      kills,
+      alive: () => false,
+      groupState: (pgid) => (pgid === 424_242 ? "alive" : "gone"),
+    });
+    const scope = await stranded(probes);
+    const report = await scope.second.recover();
+    expect(report.sessions.map((s) => s.outcome)).toEqual(["manual"]);
+    expect(kills).toEqual([]);
+    const durable = await durableState(scope.commonDir, scope.liveSessionId);
+    // No checkpoint, no rewrite: the tree may still be under mutation.
+    expect(durable.status).toBe("idle");
+    expect(durable.checkpoint_seq).toBe(0);
+    expect(await leasesOf(scope.commonDir)).toHaveLength(1);
+    const worktreePath = String(durable.worktree_path);
+    await access(worktreePath);
+    await removeDirectory(scope.repository);
+    await removeDirectory(scope.tmpRoot);
+  });
+
+  it("escalates recovery to KILL and certifies only when the group answers gone", async () => {
+    const phases: LiveManagerPhase[] = [];
+    const kills: KillRecord[] = [];
+    let leaderAlive = true;
+    // A helper keeps the group alive through the SIGTERM window; only the
+    // bounded SIGKILL sweep empties it. Recovery must not "reap" on leader
+    // death alone.
+    let groupGone = false;
+    const probes: LiveLeaseProbes = {
+      probePid: (pid) => (pid === 424_242 && leaderAlive ? "live" : "dead"),
+      startToken: async (pid) => (pid === process.pid ? "hub-tok" : "prov-tok"),
+      killGroup: (pgid, signal) => {
+        kills.push({ target: pgid, signal });
+        if (signal === "SIGTERM") {
+          leaderAlive = false;
+        }
+        if (signal === "SIGKILL") {
+          groupGone = true;
+        }
+        return true;
+      },
+      probeGroup: (pgid) => (pgid === 424_242 && !groupGone ? "alive" : "gone"),
+      now: () => new Date(),
+    };
+    const scope = await stranded(probes, phases);
+    const report = await scope.second.recover();
+    expect(report.sessions.map((s) => s.outcome)).toEqual(["recovered"]);
+    expect(kills.map((k) => k.signal)).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(phases).toEqual(["provider-reaped", "checkpoint-captured", "state-advanced"]);
+    const durable = await durableState(scope.commonDir, scope.liveSessionId);
+    expect(durable.status).toBe("orphaned");
+    expect(durable.checkpoint_seq).toBe(1);
+    expect(await leasesOf(scope.commonDir)).toHaveLength(0);
+    await removeDirectory(scope.repository);
+    await removeDirectory(scope.tmpRoot);
+  }, 30_000);
+
   it("reports foreign-host leases without touching them", async () => {
     const scope = await stranded(fakeProbes());
     const leaseDir = join(scope.commonDir, "agent-hub", "live", "leases");
@@ -880,6 +1012,77 @@ describe("recovery", () => {
     const report = await scope.second.recover();
     expect(report.sessions.map((s) => s.outcome)).toEqual(["foreign"]);
     expect(await leasesOf(scope.commonDir)).toHaveLength(1);
+    await removeDirectory(scope.repository);
+    await removeDirectory(scope.tmpRoot);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Live-admin lock discipline
+// ---------------------------------------------------------------------------
+
+describe("live-admin lock discipline", () => {
+  /** Hands out real locks until poisoned; then only `live-admin` refuses. */
+  function adminLockPoison(state: { poisoned: boolean }): LiveManagerOptions["acquireLock"] {
+    return async (options) => {
+      if (state.poisoned && options.name === LIVE_ADMIN_LOCK_NAME) {
+        throw new AgentHubError("LOCK_BUSY", "the live-admin lock is held by a stuck peer");
+      }
+      return await acquireRepositoryLock(options);
+    };
+  }
+
+  it("launch is refused while the live-admin lock is unavailable, claiming nothing", async () => {
+    const state = { poisoned: true };
+    const scope = await harness({ acquireLock: adminLockPoison(state) });
+    await expectCode(scope.manager.start({ provider: "omp" }), "LOCK_BUSY");
+    expect(await leasesOf(scope.commonDir)).toEqual([]);
+    expect(await readdir(scope.tmpRoot)).toEqual([]);
+    await settle(scope);
+  });
+
+  it("teardown without the admin lock changes nothing and retains lease plus worktree", async () => {
+    const state = { poisoned: false };
+    const scope = await harness({ acquireLock: adminLockPoison(state) });
+    const { live_session_id } = await startSession(scope.manager);
+    const worktreePath = scope.manager.view(live_session_id).worktree_path;
+    state.poisoned = true;
+
+    const closed = await scope.manager.close(live_session_id);
+    // The provider really is gone, so the close checkpoint is honest…
+    expect(closed.state.status).toBe("closed");
+    // …but no worktree mutation may run without the lock: structured
+    // failure out, lease and worktree retained untouched.
+    expect(closed.cleanup_errors.map((error) => error.code)).toContain("LIVE_ADMIN_LOCK_UNAVAILABLE");
+    expect(await leasesOf(scope.commonDir)).toHaveLength(1);
+    await access(worktreePath);
+
+    state.poisoned = false;
+    await settle(scope);
+  });
+
+  it("recovery without the admin lock continues, retaining lease and worktree", async () => {
+    const state = { poisoned: false };
+    const scope = await harness();
+    const started = await startSession(scope.manager);
+    await writeFile(join(started.workspace, "provider-work.txt"), "survived\n");
+    const worktreePath = scope.manager.view(started.live_session_id).worktree_path;
+    const second = secondHub(scope, fakeProbes({ alive: () => false }), undefined, adminLockPoison(state));
+    state.poisoned = true;
+
+    const report = await second.recover();
+    const session = report.sessions[0];
+    expect(session?.outcome).toBe("recovered");
+    expect(session?.detail).toContain("worktree cleanup refused");
+    expect(session?.detail).toContain("lease and worktree retained");
+    // The durable rewrite happened; cleanup was refused, so the lease that
+    // audits the surviving worktree must still exist.
+    const durable = await durableState(scope.commonDir, started.live_session_id);
+    expect(durable.status).toBe("orphaned");
+    expect(await leasesOf(scope.commonDir)).toHaveLength(1);
+    await access(worktreePath);
+
+    state.poisoned = false;
     await removeDirectory(scope.repository);
     await removeDirectory(scope.tmpRoot);
   });

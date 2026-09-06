@@ -202,6 +202,9 @@ export class HermesAcpTransport implements LiveTransport {
   private hubSignalSent = false;
   private stopMode: LiveStopMode | null = null;
   private stopCall: Promise<LiveStopReport> | null = null;
+  /** Which mode the cached `stopCall` actually ran; reuse is bounded by it. */
+  private stopCallMode: LiveStopMode | null = null;
+  private stopCallSettled = false;
   private exitInfo: { code: number | null; signal: string | null } | null = null;
   private exitDeferred: Deferred<void> = deferred<void>();
   private fatal = false;
@@ -464,10 +467,34 @@ export class HermesAcpTransport implements LiveTransport {
   }
 
   stop(mode: LiveStopMode): Promise<LiveStopReport> {
-    if (!this.stopCall) {
-      this.stopCall = this.shutdown(mode);
+    const prior = this.stopCall;
+    if (prior === null) {
+      this.stopCallMode = mode;
+      return (this.stopCall = this.trackStopSettled(this.shutdown(mode)));
     }
-    return this.stopCall;
+    // A graceful arriving later never re-runs or escalates signals; it
+    // takes whatever the earlier attempt established.
+    if (mode !== "terminate") {
+      return prior;
+    }
+    // A terminate while another is still in flight shares that attempt;
+    // once one has settled without closing, the next terminate is fresh
+    // authorization to re-probe and re-run the bounded escalation.
+    if (this.stopCallMode === "terminate" && !this.stopCallSettled) {
+      return prior;
+    }
+    this.stopCallMode = "terminate";
+    return (this.stopCall = this.trackStopSettled(
+      prior.then((first) => (first.status === "closed" ? first : this.shutdown("terminate"))),
+    ));
+  }
+
+  private trackStopSettled(promise: Promise<LiveStopReport>): Promise<LiveStopReport> {
+    const settle = (): void => {
+      this.stopCallSettled = true;
+    };
+    void promise.then(settle, settle);
+    return promise;
   }
 
   /** Resume state for the hub's durable record; null until the transport opened. */

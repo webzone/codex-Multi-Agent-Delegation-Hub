@@ -290,6 +290,7 @@ function fakeProbes(): LiveLeaseProbes {
     probePid: (pid) => (pid === process.pid ? "live" : "dead"),
     startToken: async (pid) => (pid === process.pid ? "hub-tok" : "prov-tok"),
     killGroup: () => true,
+    probeGroup: (pgid) => (pgid === process.pid ? "alive" : "gone"),
     now: () => new Date(),
   };
 }
