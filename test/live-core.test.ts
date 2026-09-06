@@ -1113,6 +1113,46 @@ describe("recovery", () => {
     await removeDirectory(scope.tmpRoot);
   });
 
+  it("routes a dead leader with a mismatched nonexistent group to manual, never probing it", async () => {
+    const kills: KillRecord[] = [];
+    const probedGroups: number[] = [];
+    // Hub gone, leader gone; every group probe — were one made — answers ESRCH.
+    const probes = fakeProbes({
+      kills,
+      alive: () => false,
+      groupState: (pgid) => {
+        probedGroups.push(pgid);
+        return "gone";
+      },
+    });
+    const scope = await stranded(probes);
+    // The lease's group identity no longer names the group its leader
+    // provably leads: it names a group that does not exist.
+    const lease = await readLiveLease(scope.commonDir, scope.liveSessionId);
+    expect(lease).toBeDefined();
+    await writeFile(
+      liveLeasePath(scope.commonDir, scope.liveSessionId),
+      JSON.stringify({ ...lease, provider_pgid: 999_333 }),
+      "utf8",
+    );
+
+    const report = await scope.second.recover();
+    expect(report.sessions.map((s) => s.outcome)).toEqual(["manual"]);
+    expect(report.sessions[0]?.detail).toContain("not the group");
+    // A phantom group's ESRCH could fake provider death and license cleanup,
+    // so it may not even be probed, let alone signalled.
+    expect(probedGroups).toEqual([]);
+    expect(kills).toEqual([]);
+    // No cleanup: no checkpoint, no status rewrite; lease and worktree stay.
+    const durable = await durableState(scope.commonDir, scope.liveSessionId);
+    expect(durable.status).toBe("idle");
+    expect(durable.checkpoint_seq).toBe(0);
+    expect(await leasesOf(scope.commonDir)).toHaveLength(1);
+    await access(String(durable.worktree_path));
+    await removeDirectory(scope.repository);
+    await removeDirectory(scope.tmpRoot);
+  });
+
   it("escalates recovery to KILL and certifies only when the group answers gone", async () => {
     const phases: LiveManagerPhase[] = [];
     const kills: KillRecord[] = [];

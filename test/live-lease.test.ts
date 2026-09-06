@@ -263,6 +263,41 @@ describe("classifyLiveLease", () => {
     expect(noIdentity.provider.reason).toContain("no process-group identity");
   });
 
+  it("never probes a mismatched group as authoritative when the leader is dead", async () => {
+    const commonDir = await tempCommonDir();
+    // Dead leader, and a recorded pgid that is NOT the leader pid: it names
+    // a group this hub cannot prove it created — and that group does not
+    // exist, so any probe of it would answer ESRCH ("gone").
+    const lease = await seedLease(commonDir, { provider_pgid: PROVIDER_PID + 1 });
+    const probedGroups: number[] = [];
+    const probes: LiveLeaseProbes = {
+      probePid: () => "dead",
+      startToken: async () => "prov-start",
+      killGroup: () => true,
+      probeGroup: (pgid) => {
+        probedGroups.push(pgid);
+        return "gone";
+      },
+      now: () => new Date(),
+    };
+    const verdict = await classifyLiveLease(lease, probes);
+    if (verdict.state !== "hub-gone" || verdict.provider.state !== "uncertain") {
+      expect.unreachable("a dead leader with a mismatched pgid must classify uncertain, never dead");
+    }
+    expect(verdict.provider.reapable).toBe(false);
+    expect(verdict.provider.reason).toContain("not the group");
+    // The invariant gates BEFORE the group: the mismatched PGID's ESRCH may
+    // never be read as provider death, so recovery routes to manual.
+    expect(probedGroups).toEqual([]);
+
+    const outcome = await reapOrphanedProvider(lease, verdict.provider, probes, {
+      graceMs: 10,
+      killWaitMs: 10,
+    });
+    expect(outcome.status).toBe("not-attempted");
+    expect(probedGroups).toEqual([]);
+  });
+
   it("classifies a live pid with an unrecorded or foreign group as uncertain, never reapable", async () => {
     const commonDir = await tempCommonDir();
     // Start identity matches perfectly — yet without a recorded PGID the
@@ -422,6 +457,30 @@ describe("reapOrphanedProvider", () => {
     expect(outcome.status).toBe("not-attempted");
     if (outcome.status === "not-attempted") {
       expect(outcome.reason).toContain("refusing to signal a pid as a group");
+    }
+    expect(kills).toEqual([]);
+  });
+
+  it("refuses to signal a mismatched group even under an asserted reapable status", async () => {
+    const commonDir = await tempCommonDir();
+    const mismatched = await seedLease(commonDir, { provider_pgid: PROVIDER_PID + 1 });
+    const kills: Array<{ target: number; signal: string }> = [];
+    const probes = fakeProbes({
+      kills,
+      alive: [PROVIDER_PID],
+      starts: { [PROVIDER_PID]: "prov-start" },
+    });
+    // Same discipline as the missing-pgid refusal: a recorded group that is
+    // not the leader pid may name an innocent stranger, so no signal — ever.
+    const outcome = await reapOrphanedProvider(
+      mismatched,
+      { state: "alive", reapable: true },
+      probes,
+      { graceMs: 10, killWaitMs: 10 },
+    );
+    expect(outcome.status).toBe("not-attempted");
+    if (outcome.status === "not-attempted") {
+      expect(outcome.reason).toContain("refusing to signal a group");
     }
     expect(kills).toEqual([]);
   });

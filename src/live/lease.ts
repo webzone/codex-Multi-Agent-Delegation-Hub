@@ -401,12 +401,18 @@ export async function removeLiveLease(
  * hub pid (ESRCH is presence-proof) hands the provider over for reaping, and
  * a live provider pid may only be reaped when its start identity matches the
  * lease exactly AND the lease recorded the group it leads (pgid == pid, the
- * detached-launch invariant). Leader death alone never proves the WORK is
- * dead: a leader PID may exit while its process group (helper children)
- * survives, so a dead leader only yields `dead` when the group probe itself
- * answers ESRCH. Group still present, unprobeable, or an unrecorded group
- * identity all classify `uncertain`: the tree may still be under mutation;
- * nothing may be reaped, checkpointed, or cleaned up on this evidence.
+ * detached-launch invariant). The same invariant gates the dead-leader path
+ * BEFORE any group is probed or used: with a provider pid recorded but no
+ * group identity — or a group identity other than the leader pid — the
+ * provider classifies `uncertain` for manual review. A mismatched pgid may
+ * name a stranger's group; probing it could read that group's absence as
+ * provider death and license cleanup of work this lease cannot prove dead.
+ * Leader death alone never proves the WORK is dead: a leader PID may exit
+ * while its process group (helper children) survives, so a dead leader only
+ * yields `dead` when the group the leader provably leads answers ESRCH.
+ * A group still present or unprobeable also classifies `uncertain`: the tree
+ * may still be under mutation; nothing may be reaped, checkpointed, or
+ * cleaned up on this evidence.
  */
 export async function classifyLiveLease(
   lease: LiveLeaseRecord,
@@ -432,9 +438,13 @@ export async function classifyLiveLease(
         "lease records no provider pid; provider liveness can be neither proven nor disproven, so nothing is assumed",
     };
   } else if (probes.probePid(lease.provider_pid) === "dead") {
-    // Leader death is not group death. The group probe may only be read as
-    // the owned group's fate when the lease recorded the group identity (or
-    // the leader provably led it: pgid recorded as the leader pid itself).
+    // Leader death is not group death. The group probe is authoritative for
+    // the owned group's fate ONLY when the lease records the group the
+    // detached launch provably created: the leader pid itself (pgid == pid).
+    // A missing or mismatched group identity classifies uncertain BEFORE any
+    // group is probed or used — a mismatched pgid may name a stranger's
+    // group, and its ESRCH must never masquerade as provider death nor
+    // license cleanup on that evidence.
     const groupTarget = lease.provider_pgid;
     if (groupTarget === null) {
       provider = {
@@ -442,6 +452,15 @@ export async function classifyLiveLease(
         reapable: false,
         reason:
           `provider leader pid ${lease.provider_pid} is gone but the lease records no process-group identity, so the fate of any helper processes cannot be probed`,
+      };
+    } else if (groupTarget !== lease.provider_pid) {
+      provider = {
+        state: "uncertain",
+        reapable: false,
+        reason:
+          `provider leader pid ${lease.provider_pid} is gone and the lease records process group ${groupTarget}, ` +
+          "which is not the group the detached leader provably leads; that group is not probed as authoritative, " +
+          "so provider death is not proven and nothing may be cleaned up on this evidence",
       };
     } else {
       const group = probes.probeGroup(groupTarget);
@@ -547,9 +566,11 @@ export interface ReapOptions {
  * because a helper that outlived its leader can still mutate the worktree.
  * A group that cannot be probed at all (only ESRCH proves absence) yields
  * `uncertain`, never a fake reap. The signalled target is ONLY ever the
- * group identity the lease itself recorded: a provider pid is never signalled
- * as a group, because PGID == PID is a hub-launch invariant, not a fact an
- * unrecorded lease may be guessed from.
+ * group identity the lease itself recorded AND equal to the recorded provider
+ * pid: a provider pid is never signalled as a group on an unrecorded group
+ * identity — PGID == PID is a hub-launch invariant, not a fact that may be
+ * guessed — and a recorded group that differs from the leader pid is a group
+ * this launch cannot prove it owns, so it is never signalled either.
  */
 export async function reapOrphanedProvider(
   lease: LiveLeaseRecord,
@@ -574,6 +595,18 @@ export async function reapOrphanedProvider(
         lease.provider_pid === null
           ? "lease records neither a provider pid nor a process-group identity; nothing provable to signal"
           : `lease records provider pid ${lease.provider_pid} but no process-group identity; refusing to signal a pid as a group`,
+    };
+  }
+  if (lease.provider_pid !== null && target !== lease.provider_pid) {
+    // A recorded group that is not the leader pid breaks the detached-launch
+    // invariant: this hub cannot prove its launch created that group, so not
+    // even an asserted `alive, reapable` yields a signal — a mismatched pgid
+    // may belong to an innocent stranger.
+    return {
+      status: "not-attempted",
+      reason:
+        `lease records process group ${target} but the provider leader pid is ${lease.provider_pid}; ` +
+        "refusing to signal a group the detached launch cannot be proven to own",
     };
   }
 
