@@ -773,6 +773,14 @@ describe("live session wire", () => {
       const liveSessionId = first.documents[0].session.live_session_id as string;
       expect(docsOfType(first.documents, "close")[0]?.close).toMatchObject({ status: "closed" });
 
+      // The terminal record the next hub must continue from, straight off
+      // the common dir the start wrote through (before any cleanup).
+      const record = JSON.parse(
+        await readFile(liveStatePath(scope.commonDir, liveSessionId), "utf8"),
+      ) as Record<string, any>;
+      expect(record.schema).toBe("agent-hub-live/v1");
+      expect(record.status).toBe("closed");
+
       // A fresh hub process over the same repository finds the terminal record.
       const resumedHub = await secondWireHub(scope);
       const second = makeIo([{ action: "close" }]);
@@ -793,11 +801,6 @@ describe("live session wire", () => {
       });
 
       // The launch under resume carried exactly the durable record's handle.
-      const record = JSON.parse(
-        await readFile(liveStatePath(scope.commonDir, liveSessionId), "utf8"),
-      ) as Record<string, any>;
-      expect(record.schema).toBe("agent-hub-live/v1");
-      expect(record.status).toBe("closed");
       const resumedTransport = scope.factory.created[1];
       expect(resumedTransport?.launchRequests[0]?.resume).toEqual(record.resume);
       expect(resumedTransport?.launchRequests[0]?.resume).toMatchObject({

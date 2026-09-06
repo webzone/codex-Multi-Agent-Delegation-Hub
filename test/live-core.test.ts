@@ -8,7 +8,8 @@ import { describe, expect, it } from "vitest";
 import { AgentHubError } from "../src/errors.js";
 import { resolveRepositoryIdentity } from "../src/git.js";
 import { encodeJsonlFrame, LiveJsonlFramer } from "../src/live/jsonl.js";
-import { launchLiveChild } from "../src/live/child-process.js";
+import { launchLiveChild, SUPPORTS_GROUP_SIGNALS } from "../src/live/child-process.js";
+import { AgyStreamJsonTransport } from "../src/live/transports/agy-stream-json.js";
 import { liveStatePath } from "../src/live/state.js";
 import {
   LiveSessionManager,
@@ -1112,6 +1113,52 @@ describe("process-group child ownership", () => {
     const forced = await ignoring.stop("terminate", { graceMs: 0, killWaitMs: 5_000 });
     expect(forced.status).toBe("closed");
     expect(forced.exit_signal).toBe("SIGKILL");
+  });
+
+  it("kills a helper that outlives its leader: closed proves the whole group is gone", async () => {
+    // The leader forks a `sleep` helper into the same group and exits FIRST,
+    // leaving the helper behind. `closed` may only be reported after the
+    // hub proves the group is gone — which requires the helper to die too.
+    const child = await launchLiveChild({
+      command: "/bin/sh",
+      args: ["-c", "sleep 120 & echo helper:$!; exit 0"],
+      cwd: "/",
+      maxStderrBytes: 64,
+    });
+    const helperPid = await new Promise<number>((resolve, reject) => {
+      let seen = "";
+      const fallback = setTimeout(() => reject(new Error(`no helper pid line (${seen})`)), 5_000);
+      child.onStdout((chunk) => {
+        seen += chunk.toString("utf8");
+        const match = /helper:(\d+)/.exec(seen);
+        if (match) {
+          clearTimeout(fallback);
+          resolve(Number(match[1]));
+        }
+      });
+      void child.exited().then(() => reject(new Error("leader exited before naming its helper")));
+    });
+    // The helper is alive and the group still exists with the leader gone.
+    expect(() => process.kill(helperPid, 0)).not.toThrow();
+    await child.exited();
+
+    const stop = await child.stop("terminate", { graceMs: 200, killWaitMs: 5_000 });
+    expect(stop.status).toBe("closed");
+    expect(child.groupAlive()).toBe(false);
+    // The helper the hub never spawned directly is dead because the whole
+    // group was signaled — a leader-only kill would leave it behind.
+    expect(() => process.kill(helperPid, 0)).toThrow();
+  });
+
+  it("capability-gates signal-only cancel to platforms with reliable group signals", async () => {
+    const transport = new AgyStreamJsonTransport({ command: "definitely-not-a-real-binary-xyzzy" });
+    const descriptor = await transport.describe();
+    expect(descriptor.capabilities.cancel.support).toBe(
+      SUPPORTS_GROUP_SIGNALS ? "signal" : "unsupported",
+    );
+    if (!SUPPORTS_GROUP_SIGNALS) {
+      expect(descriptor.capabilities.cancel.evidence).toBeNull();
+    }
   });
 
   it("bounds stderr observation without losing truncation honesty", async () => {
