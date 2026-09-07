@@ -85,6 +85,8 @@ function fakeHermesSource(): string {
     "      journal({ m: 'prompt', params });",
     "      const text = params.prompt.map((b) => b.text || '').join('');",
     "      if (text.includes('DIE')) process.exit(3);",
+    "      if (text.includes('GARBAGE')) { process.stdout.write('not-json-at-all\\n'); return; }",
+    "      if (text.includes('HUGE')) { process.stdout.write('z'.repeat(1100000) + '\\n'); return; }",
     "      if (text.includes('PERM')) {",
     "        const answer = await conn.requestPermission({",
     "          sessionId: params.sessionId,",
@@ -437,7 +439,15 @@ describe("hermes acp transport", () => {
       await t.send(promptCommand("PERM now"));
       await recorder.waitUntil("turn closed", (events) => idleCount(events) >= 2);
 
-      expect(recorder.bodiesOf("permission_request").length).toBe(1);
+      // Under deny the verdict is decided in-transport, so nothing the hub
+      // could ever answer is surfaced as a permission_request: the auto-deny
+      // is a bounded log line, and no open-permission bookkeeping strands.
+      expect(recorder.bodiesOf("permission_request")).toEqual([]);
+      expect(
+        recorder
+          .bodiesOf("log")
+          .some((l) => l.level === "warn" && l.text.text.includes("auto-denied") && l.text.text.includes("delete files")),
+      ).toBe(true);
       const journal = await readJournal(fake);
       const answer = journal.find((e) => e.m === "permission")?.response as {
         outcome: { outcome: string; optionId?: string };
@@ -632,4 +642,83 @@ describe("hermes acp transport", () => {
     },
     30_000,
   );
+
+  it("a malformed stdout record is protocol-fatal: rule-only error, child kill, pump end", async () => {
+    const fake = await makeFakeHermes("garbage");
+    const t = transport(fake);
+    try {
+      const recorder = new EventRecorder(t.events());
+      await t.open(launchRequest(fake.dir));
+      await t.send(promptCommand("GARBAGE now"));
+      await recorder.waitUntil("frame-invalid error", (events) =>
+        events.some((e) => e.body.kind === "error" && e.body.error.code === "LIVE_ACP_FRAME_INVALID"),
+      );
+      // Fail-closed with the violated rule only — the raw line never crosses.
+      expect(JSON.stringify(recorder.events)).not.toContain("not-json-at-all");
+      await recorder.waitDone();
+      const journal = await readJournal(fake);
+      expect(journal.some((e) => e.m === "prompt")).toBe(true);
+    } finally {
+      const report = await t.stop("terminate");
+      expect(report.status).toBe("closed");
+      await removeDirectory(fake.dir);
+    }
+  });
+
+  it("an oversized stdout record crosses the frame cap and terminates the session", async () => {
+    const fake = await makeFakeHermes("huge");
+    const t = transport(fake);
+    try {
+      const recorder = new EventRecorder(t.events());
+      await t.open(launchRequest(fake.dir));
+      await t.send(promptCommand("HUGE now"));
+      await recorder.waitUntil("byte-cap error", (events) =>
+        events.some(
+          (e) =>
+            e.body.kind === "error" &&
+            e.body.error.code === "LIVE_ACP_FRAME_INVALID" &&
+            e.body.error.message.includes("byte cap"),
+        ),
+      );
+      await recorder.waitDone();
+    } finally {
+      const report = await t.stop("terminate");
+      expect(report.status).toBe("closed");
+      await removeDirectory(fake.dir);
+    }
+  });
+
+  it("refuses launch when ownership cannot be recorded, and the exit observer still ends the pump", async () => {
+    const fake = await makeFakeHermes();
+    const t = transport(fake);
+    try {
+      const opened = t.open({
+        live_session_id: "ls-hermes",
+        workspace: fake.dir,
+        max_text_bytes: 256,
+        resume: null,
+        report_process: async () => {
+          throw new Error("lease recording unavailable");
+        },
+      });
+      await expect(opened).rejects.toMatchObject({
+        live_error: { code: "LIVE_OWNERSHIP_RECORDING_FAILED", stage: "launch", retryable: false },
+      });
+      // The exit observation is attached before the ownership path can fail:
+      // the mandated kill is observed, the pump ends, and `stop` sees proof.
+      const recorder = new EventRecorder(t.events());
+      await recorder.waitUntil(
+        "error + exit recorded",
+        (events) =>
+          events.some((e) => e.body.kind === "error" && e.body.error.code === "LIVE_OWNERSHIP_RECORDING_FAILED") &&
+          events.some((e) => e.body.kind === "exit" && e.body.intentional),
+      );
+      await recorder.waitDone();
+      const report = await t.stop("terminate");
+      expect(report.status).toBe("closed");
+    } finally {
+      await t.stop("terminate");
+      await removeDirectory(fake.dir);
+    }
+  });
 });

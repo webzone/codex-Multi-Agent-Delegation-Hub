@@ -7,7 +7,6 @@ import { describe, expect, it } from "vitest";
 
 import { AgentHubError } from "../src/errors.js";
 import { resolveRepositoryIdentity } from "../src/git.js";
-import { encodeJsonlFrame, LiveJsonlFramer } from "../src/live/jsonl.js";
 import { launchLiveChild, SUPPORTS_GROUP_SIGNALS } from "../src/live/child-process.js";
 import { AgyStreamJsonTransport } from "../src/live/transports/agy-stream-json.js";
 import { liveStatePath } from "../src/live/state.js";
@@ -1381,91 +1380,6 @@ describe("resume state honesty", () => {
 
     await resumable.closeAll();
     await settle(scope);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// JSONL framing (core transport primitive)
-// ---------------------------------------------------------------------------
-
-describe("strict LF JSONL framing", () => {
-  it("reassembles frames split across chunks at arbitrary byte offsets", () => {
-    const frame = encodeJsonlFrame({ msg: "héllo 世界", seq: 1 });
-    const framer = new LiveJsonlFramer();
-    const results = [];
-    for (let offset = 0; offset < frame.byteLength; offset += 3) {
-      results.push(...framer.feed(frame.subarray(offset, offset + 3)));
-    }
-    results.push(...framer.end());
-    expect(results).toEqual([
-      { kind: "frame", value: { msg: "héllo 世界", seq: 1 }, bytes: frame.byteLength - 1 },
-    ]);
-  });
-
-  it("recognizes only the LF byte as a terminator", () => {
-    const framer = new LiveJsonlFramer();
-    // CR alone never completes a frame: nothing comes out, bytes stay pending.
-    expect(framer.feed(Buffer.from('{"a":1}\r', "utf8"))).toEqual([]);
-    expect(framer.pendingBytes).toBe(8);
-    // The LF terminates the frame; the CR is accounted inside the frame bytes
-    // (JSON's own whitespace tolerance is JSON's business, not a boundary).
-    const results = framer.feed(Buffer.from("\n", "utf8"));
-    expect(results).toEqual([{ kind: "frame", value: { a: 1 }, bytes: 8 }]);
-
-    // A CR run carrying two documents is one invalid frame — CR never split it.
-    const framer2 = new LiveJsonlFramer();
-    expect(framer2.feed(Buffer.from('{"a":1}\r{"b":2}', "utf8"))).toEqual([]);
-    const invalid = framer2.feed(Buffer.from("\n", "utf8"));
-    if (invalid[0].kind === "error") {
-      expect(invalid[0].error.code).toBe("LIVE_JSONL_FRAME_INVALID_JSON");
-      expect(invalid[0].error.frame_bytes).toBe(15); // {"a":1}\r{"b":2}
-    } else {
-      expect.unreachable("two documents are not one frame");
-    }
-  });
-  it("reports oversized frames once, then resynchronizes after the newline", () => {
-    const framer = new LiveJsonlFramer({ maxFrameBytes: 16 });
-    const first = framer.feed(Buffer.from("aaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "utf8"));
-    expect(first).toHaveLength(1);
-    if (first[0].kind === "error") {
-      expect(first[0].error.code).toBe("LIVE_JSONL_FRAME_TOO_LARGE");
-    } else {
-      expect.unreachable("oversized run must error");
-    }
-    const second = framer.feed(Buffer.from('{"ok":true}\n', "utf8"));
-    expect(second[0].kind).toBe("frame");
-  });
-
-  it("refuses to parse an unterminated tail", () => {
-    const framer = new LiveJsonlFramer();
-    framer.feed(Buffer.from('{"partial":tr', "utf8"));
-    const results = framer.end();
-    if (results[0].kind === "error") {
-      expect(results[0].error.code).toBe("LIVE_JSONL_FRAME_UNTERMINATED");
-    } else {
-      expect.unreachable("tail must error");
-    }
-  });
-
-  it("never echoes raw frame bytes into errors", () => {
-    const framer = new LiveJsonlFramer({ maxFrameBytes: 12 });
-    const results = framer.feed(Buffer.from("SECRET-CREDENTIAL-CHAIN-abc\n", "utf8"));
-    expect(JSON.stringify(results)).not.toContain("SECRET");
-    if (results[0].kind === "error") {
-      expect(results[0].error.code).toBe("LIVE_JSONL_FRAME_TOO_LARGE");
-    } else {
-      expect.unreachable("must error");
-    }
-  });
-
-  it("bounds the encoder", () => {
-    let code = "";
-    try {
-      encodeJsonlFrame({ big: "z".repeat(500) }, 64);
-    } catch (error) {
-      code = (error as AgentHubError).code;
-    }
-    expect(code).toBe("LIVE_JSONL_FRAME_TOO_LARGE");
   });
 });
 

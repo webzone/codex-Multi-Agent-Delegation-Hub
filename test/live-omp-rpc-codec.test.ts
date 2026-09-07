@@ -68,4 +68,25 @@ describe("OMP RPC v2 codec", () => {
     const lengthDecoder = new OmpRpcFrameDecoder(LIMITS.maxFrameBytes, LIMITS.maxReassembledBytes, LIMITS.chunkBytes);
     expect(() => badLength.forEach((chunk) => lengthDecoder.push(chunk))).toThrowError(OmpRpcCodecError);
   });
+
+  it("refuses reassembly of a message declared beyond the reassembly limit", () => {
+    const physical = parse(encodeOmpRpcFrames({ type: "message_update", text: "x".repeat(900) }, 256, 65536, 32));
+    expect(physical.length).toBeGreaterThan(2);
+    const decoder = new OmpRpcFrameDecoder(256, 640, 32);
+    // The declaration itself crosses the session's reassembly bound: the
+    // sequence dies at its first chunk, not after the bytes accumulate.
+    expect(() => decoder.push(physical[0]!)).toThrowError(OmpRpcCodecError);
+  });
+
+  it("shrinks chunks so an oversized message stays sendable under a small frame cap", () => {
+    const lines = encodeOmpRpcFrames({ type: "prompt", message: "y".repeat(1500) }, 512, 65536);
+    expect(lines.length).toBeGreaterThan(2);
+    for (const line of lines) {
+      expect(Buffer.byteLength(line, "utf8")).toBeLessThanOrEqual(512);
+    }
+    const chunks = parse(lines);
+    expect(chunks.map((c) => c.index)).toEqual(chunks.map((_, i) => i));
+    const joined = Buffer.concat(chunks.map((c) => Buffer.from(c.data as string, "base64")));
+    expect(JSON.parse(joined.toString("utf8"))).toEqual({ type: "prompt", message: "y".repeat(1500) });
+  });
 });

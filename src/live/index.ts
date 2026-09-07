@@ -2,7 +2,6 @@ import { AgentHubError, asDelegateError } from "../errors.js";
 import { isLiveRecord } from "./provider-registry.js";
 import { createLiveManager } from "./bootstrap.js";
 import type {
-  LiveCapabilities,
   LiveCommandKind,
   LiveError,
   LiveErrorStage,
@@ -68,6 +67,7 @@ export {
   setLiveResumeSource,
   supportedLiveAgents,
   unwiredLiveResumeSource,
+  validateLiveCapabilities,
 } from "./provider-registry.js";
 export type { LiveProbeDocument, LiveResumeSource } from "./provider-registry.js";
 export {
@@ -176,62 +176,6 @@ export function toLiveError(
   }
   const { code, message } = asDelegateError(error);
   return liveError(code, message, context.stage, false, context.provider);
-}
-
-/**
- * Runtime gate on a transport's capability snapshot. The seed's `Record` type
- * makes a missing claim a compile error; this gate enforces the honesty rule
- * at the boundary: every non-`unsupported` claim must carry evidence, and
- * only the nine contract names may carry claims at all.
- */
-export function validateLiveCapabilities(value: unknown): LiveCapabilities {
-  if (!isLiveRecord(value)) {
-    throw new AgentHubError(
-      "LIVE_CAPABILITY_EVIDENCE_INVALID",
-      "capability snapshot must be an object",
-    );
-  }
-  const names: readonly string[] = [
-    "prompt",
-    "follow_up",
-    "steer",
-    "cancel",
-    "status",
-    "permission_response",
-    "resume",
-    "checkpoint",
-    "usage_reporting",
-  ];
-  const supports: readonly string[] = ["native", "hub-queued", "derived", "signal", "unsupported"];
-  for (const name of names) {
-    const claim = value[name];
-    if (
-      !isLiveRecord(claim) ||
-      typeof claim.support !== "string" ||
-      !supports.includes(claim.support)
-    ) {
-      throw new AgentHubError(
-        "LIVE_CAPABILITY_EVIDENCE_INVALID",
-        `capability claim "${name}" is missing or malformed`,
-      );
-    }
-    if (claim.support === "unsupported") {
-      if (claim.evidence !== null) {
-        throw new AgentHubError(
-          "LIVE_CAPABILITY_EVIDENCE_INVALID",
-          `capability claim "${name}" must carry null evidence when unsupported`,
-        );
-      }
-      continue;
-    }
-    if (typeof claim.evidence !== "string" || claim.evidence.trim().length === 0) {
-      throw new AgentHubError(
-        "LIVE_CAPABILITY_EVIDENCE_INVALID",
-        `capability claim "${name}" (${claim.support}) must carry non-empty evidence`,
-      );
-    }
-  }
-  return value as unknown as LiveCapabilities;
 }
 
 // ---------------------------------------------------------------------------

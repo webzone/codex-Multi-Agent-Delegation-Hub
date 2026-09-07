@@ -20,6 +20,7 @@ import {
   type LiveLeaseRecord,
 } from "./lease.js";
 import { LiveEventRing, truncateUtf8 } from "./events.js";
+import { validateLiveCapabilities } from "./provider-registry.js";
 import {
   applyLiveTransition,
   liveRefFor,
@@ -477,7 +478,7 @@ export class LiveSessionManager {
 
       const next: LiveSessionState = {
         ...prior,
-        capabilities: descriptor.capabilities,
+        capabilities: validateLiveCapabilities(descriptor.capabilities),
         resume:
           report.resume_state ??
           this.initialResume(prior.provider, prior.resume, report.provider_session_id, prior.transport),
@@ -623,7 +624,7 @@ export class LiveSessionManager {
         session_id: input.sessionId,
         provider,
         transport: descriptor.transport,
-        capabilities: descriptor.capabilities,
+        capabilities: validateLiveCapabilities(descriptor.capabilities),
         identity: input.identity,
         base_commit: input.base,
         current_commit: input.base,

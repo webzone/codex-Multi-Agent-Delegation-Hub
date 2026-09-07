@@ -25,6 +25,15 @@
  *     end. A known-shape frame carrying a semantically unknown `type` is
  *     tolerated as a `provider_notice` log event (kind + label only, never
  *     raw content).
+ *   - Responses are correlated by the request id AND the dialect's echoed
+ *     `command` field: a response carrying a live id but answering a
+ *     different command is a misdelivery and terminal, never a resolution.
+ *     A response with no `command` field correlates by id alone (the
+ *     verified dialects echo it on every response).
+ *   - A blank record (nothing between two consecutive LFs) is tolerated as
+ *     whitespace between records: it carries zero bytes, so no payload,
+ *     status, or correlation decision can hide in it. Every other deviation
+ *     from one JSON object per line is fatal per the rule above.
  */
 import { StringDecoder } from "node:string_decoder";
 import { AgentHubError } from "../../errors.js";
@@ -179,6 +188,8 @@ const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
 interface Pending {
   kind: string;
+  /** The wire command this request wrote (`fields.type`); "" when unproven. */
+  command: string;
   resolve: (frame: RpcFrame) => void;
   reject: (error: LiveTransportError) => void;
 }
@@ -827,6 +838,19 @@ export abstract class RpcSessionBase implements LiveTransport {
       }
       return;
     }
+    const wireCommand = readString(frame, "command");
+    if (wireCommand !== null && pending.command !== "" && wireCommand !== pending.command) {
+      // A response answering a different command than the one owning this
+      // live id is a misdelivery: resolving it would advance the session
+      // state machine on a reply meant for something else. Structural
+      // violation → terminal; only the sanitized command label crosses.
+      const label = /^[a-z_]{1,32}$/.test(wireCommand) ? wireCommand : "malformed";
+      this.failProtocol(
+        `a response echoed command "${label}" against a live ${pending.command} request`,
+        "PROVIDER_RESPONSE_MISCORRELATED",
+      );
+      return;
+    }
     this.pending.delete(id);
 
     if (frame.success === true) {
@@ -859,6 +883,7 @@ export abstract class RpcSessionBase implements LiveTransport {
     }
     const id = `hub-${++this.requestId}`;
     const frame = { id, ...fields };
+    const wireCommand = readString(fields, "type") ?? "";
     return new Promise<RpcFrame>((resolve, reject) => {
       const timer = setTimeout(() => {
         if (this.pending.delete(id)) {
@@ -877,6 +902,7 @@ export abstract class RpcSessionBase implements LiveTransport {
       }, clampMs(timeoutMs ?? this.commandTimeoutMs));
       this.pending.set(id, {
         kind,
+        command: wireCommand,
         resolve: (response) => {
           clearTimeout(timer);
           resolve(response);

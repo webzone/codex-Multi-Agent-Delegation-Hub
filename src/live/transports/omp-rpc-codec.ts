@@ -5,7 +5,6 @@ import type { RpcFrame } from "./rpc-base.js";
 export const OMP_RPC_MAX_FRAME_BYTES = 1024 * 1024;
 export const OMP_RPC_MAX_REASSEMBLED_BYTES = 64 * 1024 * 1024;
 export const OMP_RPC_CHUNK_BYTES = 256 * 1024;
-const MAX_CHUNK_COUNT = Math.ceil(OMP_RPC_MAX_REASSEMBLED_BYTES / OMP_RPC_CHUNK_BYTES);
 
 export type OmpRpcCodecErrorCode = "OMP_RPC_FRAME_INVALID" | "OMP_RPC_MESSAGE_INVALID";
 
@@ -53,10 +52,19 @@ export function encodeOmpRpcFrames(
   if (byteLength > maxReassembledBytes) {
     throw new OmpRpcCodecError("OMP_RPC_MESSAGE_INVALID", "the logical RPC message exceeded the reassembly limit");
   }
-
+  // A chunk must fit one PHYSICAL frame together with its envelope: base64
+  // inflates 4/3 and the envelope overhead is bounded (~200 bytes). When the
+  // advertised frame limit is below the default transport chunk size, chunks
+  // shrink so an oversized logical message stays sendable at any bounds the
+  // provider honestly advertised instead of becoming unsplittable.
+  const envelopeHeadroomBytes = 200;
+  const effectiveChunkBytes = Math.max(
+    1,
+    Math.min(chunkBytes, Math.floor(((maxFrameBytes - envelopeHeadroomBytes) * 3) / 4)),
+  );
   const bytes = Buffer.from(json, "utf8");
-  const count = Math.ceil(bytes.byteLength / chunkBytes);
-  if (count < 2 || count > Math.ceil(maxReassembledBytes / chunkBytes)) {
+  const count = Math.ceil(byteLength / effectiveChunkBytes);
+  if (count < 2 || count > Math.ceil(maxReassembledBytes / effectiveChunkBytes)) {
     throw new OmpRpcCodecError("OMP_RPC_MESSAGE_INVALID", "the logical RPC message has an invalid chunk count");
   }
   const chunkId = `hub-${crypto.randomUUID()}`;
@@ -68,7 +76,7 @@ export function encodeOmpRpcFrames(
       index,
       count,
       byteLength,
-      data: bytes.subarray(index * chunkBytes, (index + 1) * chunkBytes).toString("base64"),
+      data: bytes.subarray(index * effectiveChunkBytes, (index + 1) * effectiveChunkBytes).toString("base64"),
     } satisfies RpcFrame;
     const line = `${JSON.stringify(chunk)}\n`;
     if (jsonLineBytes(line.slice(0, -1)) > maxFrameBytes) {

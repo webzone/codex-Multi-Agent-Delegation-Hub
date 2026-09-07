@@ -1,5 +1,6 @@
 import { AgentHubError } from "../errors.js";
 import type {
+  LiveCapabilities,
   LiveProbeResult,
   LiveProviderId,
   LiveSessionState,
@@ -165,7 +166,11 @@ export function getLiveResumeSource(): LiveResumeSource {
  * Runtime check on a state document crossing the `LiveResumeSource` seam.
  * The compile-time type fixes the shape; this gate refuses records that do
  * not actually honor it, so a Package 2 bug can never smuggle extra state
- * into a live launch.
+ * into a live launch. Joint invariants are checked too, not just field-wise
+ * validity: `transport` must be the seed-paired transport of `provider`, and
+ * `capabilities` must satisfy the full evidence gate — two individually legal
+ * enum values that contradict each other are exactly what this guard exists
+ * to catch.
  */
 export function assertLiveSessionState(value: unknown): asserts value is LiveSessionState {
   if (typeof value !== "object" || value === null) {
@@ -193,6 +198,25 @@ export function assertLiveSessionState(value: unknown): asserts value is LiveSes
       "live session state does not match the frozen agent-hub-live/v1 durable record shape",
     );
   }
+  // Joint invariant: the transport must be the one the seed pairs with the
+  // provider. Both values can be individually legal and still be cross-wired.
+  if (LIVE_TRANSPORT_PAIRINGS[record.transport as LiveTransportId] !== record.provider) {
+    throw new AgentHubError(
+      "LIVE_STATE_INVALID",
+      `live session transport "${String(record.transport)}" does not pair with provider "${record.provider}"`,
+    );
+  }
+  // Capability documents must satisfy the same evidence gate a fresh
+  // descriptor is checked against — a durable record cannot grandfather a
+  // claim the transport would not be allowed to declare today.
+  try {
+    validateLiveCapabilities(record.capabilities);
+  } catch {
+    throw new AgentHubError(
+      "LIVE_STATE_INVALID",
+      "live session capability snapshot violates the claim/evidence rules",
+    );
+  }
   // Provider-specific resume handles may never disagree with the record's own
   // provider: a mismatched handle is exactly the cross-wiring the seed forbids.
   if (record.resume !== null) {
@@ -215,4 +239,60 @@ export function assertLiveSessionState(value: unknown): asserts value is LiveSes
  */
 export function isLiveRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Runtime gate on a transport's capability snapshot. The seed's `Record` type
+ * makes a missing claim a compile error; this gate enforces the honesty rule
+ * at the boundary: every non-`unsupported` claim must carry evidence, and
+ * only the nine contract names may carry claims at all.
+ */
+export function validateLiveCapabilities(value: unknown): LiveCapabilities {
+  if (!isLiveRecord(value)) {
+    throw new AgentHubError(
+      "LIVE_CAPABILITY_EVIDENCE_INVALID",
+      "capability snapshot must be an object",
+    );
+  }
+  const names: readonly string[] = [
+    "prompt",
+    "follow_up",
+    "steer",
+    "cancel",
+    "status",
+    "permission_response",
+    "resume",
+    "checkpoint",
+    "usage_reporting",
+  ];
+  const supports: readonly string[] = ["native", "hub-queued", "derived", "signal", "unsupported"];
+  for (const name of names) {
+    const claim = value[name];
+    if (
+      !isLiveRecord(claim) ||
+      typeof claim.support !== "string" ||
+      !supports.includes(claim.support)
+    ) {
+      throw new AgentHubError(
+        "LIVE_CAPABILITY_EVIDENCE_INVALID",
+        `capability claim "${name}" is missing or malformed`,
+      );
+    }
+    if (claim.support === "unsupported") {
+      if (claim.evidence !== null) {
+        throw new AgentHubError(
+          "LIVE_CAPABILITY_EVIDENCE_INVALID",
+          `capability claim "${name}" must carry null evidence when unsupported`,
+        );
+      }
+      continue;
+    }
+    if (typeof claim.evidence !== "string" || claim.evidence.trim().length === 0) {
+      throw new AgentHubError(
+        "LIVE_CAPABILITY_EVIDENCE_INVALID",
+        `capability claim "${name}" (${claim.support}) must carry non-empty evidence`,
+      );
+    }
+  }
+  return value as unknown as LiveCapabilities;
 }

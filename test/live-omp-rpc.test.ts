@@ -1,11 +1,19 @@
 /**
  * Deterministic fake-wire tests for the OMP live RPC transport (verified
- * 18.1.13 RPC v2 dialect). No real processes and no wall-clock sleeps: vitest fake
- * timers drive every timeout, scripted frames arrive synchronously, and
- * assertions wait on observed conditions via `until`, never guessed delays.
+ * 18.1.13 RPC v2 dialect). The transport suites spawn no real provider
+ * processes and use no wall-clock sleeps: vitest fake timers drive every
+ * timeout, scripted frames arrive synchronously, and assertions wait on
+ * observed conditions via `until`, never guessed delays. The probe suite at
+ * the end runs only an injected fake version-reporting script through the
+ * command seam — never a binary looked up from PATH.
  */
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OmpRpcTransport } from "../src/live/transports/omp-rpc.js";
+import { probeOmp } from "../src/live/probes/omp.js";
+import { validateLiveCapabilities } from "../src/live/provider-registry.js";
 import type { RpcWireExit, RpcWireHandle } from "../src/live/transports/rpc-base.js";
 import type { LiveCommand, LiveEvent, LiveLaunchRequest } from "../src/live/types.js";
 import { runLeaderFirstSurvivorScenario } from "./live-stop-authority.js";
@@ -786,5 +794,222 @@ describe("omp-rpc transport (fake wire, OMP 18.1.13 RPC v2 dialect)", () => {
       survivorAlive: () => wire.groupAlive,
       signals: () => wire.signals,
     });
+  });
+
+  it("kills the session when a live response id answers a different command", async () => {
+    const { transport, wire } = setup();
+    await openStarted(transport, wire);
+    const pump = new Pump(transport);
+    await pump.have(2);
+
+    const asking = transport.send(command("status"));
+    const askingFate = expect(asking).rejects.toMatchObject({ liveError: { code: "LIVE_SESSION_CLOSED" } });
+    await until(() => {
+      if (!wire.written.some((line) => line.includes('"type":"get_state"'))) {
+        throw new Error("get_state frame not written yet");
+      }
+    });
+    const askingFrame = lastCommand(wire, "get_state");
+    wire.pushFrame({ id: askingFrame.id, type: "response", command: "prompt", success: true });
+
+    await pump.have(3);
+    expect(pump.got[2]?.body).toMatchObject({
+      kind: "error",
+      error: { code: "PROVIDER_RESPONSE_MISCORRELATED", stage: "protocol" },
+    });
+    // The misdelivery resolves nothing: the status command fails closed when
+    // the mandated shutdown takes the provider — never on the fake success.
+    await vi.advanceTimersByTimeAsync(10);
+    await askingFate;
+    expect(wire.signals).toContain("SIGTERM");
+    await pump.closed();
+  });
+
+  it("tolerates blank LF records as whitespace and fails closed on stray bytes", async () => {
+    const { transport, wire } = setup();
+    await openStarted(transport, wire);
+    const pump = new Pump(transport);
+    await pump.have(2);
+
+    wire.pushBytes(Buffer.from("\n\n\r\n", "utf8"));
+    await pump.quiet();
+
+    // A whitespace-only record carries bytes claiming content: not JSON.
+    wire.pushBytes(Buffer.from(" \n", "utf8"));
+    await pump.have(3);
+    expect(pump.got[2]?.body).toMatchObject({
+      kind: "error",
+      error: { code: "PROVIDER_PROTOCOL_UNSUPPORTED", stage: "protocol" },
+    });
+    await pump.closed();
+  });
+
+  it("refuses a ready frame advertising out-of-range v2 frame bounds", async () => {
+    for (const bad of [
+      { ...READY_FRAME, maxFrameBytes: 2097152 },
+      { ...READY_FRAME, maxReassembledFrameBytes: 524288 },
+      { ...READY_FRAME, maxFrameBytes: "1048576" },
+    ]) {
+      const { transport, wire } = setup();
+      const opening = transport.open(launch());
+      const rejected = expect(opening).rejects.toMatchObject({
+        liveError: { code: "OMP_RPC_FRAME_INVALID", stage: "protocol" },
+      });
+      await flush();
+      wire.pushFrame(bad);
+      await rejected;
+      // No negotiation may be attempted with an unproven bounds envelope.
+      expect(wire.written.some((line) => line.includes("negotiate_protocol"))).toBe(false);
+    }
+  });
+
+  it("enforces the advertised physical cap on provider records, partial or framed", async () => {
+    const smallReady = { ...READY_FRAME, maxFrameBytes: 512, maxReassembledFrameBytes: 65536 };
+    const { transport, wire } = setup();
+    const opening = transport.open(launch());
+    await flush();
+    wire.pushFrame(smallReady);
+    await completeV2(wire, { sessionFile: "/sessions/a.jsonl", sessionId: "s-a" });
+    await opening;
+    const pump = new Pump(transport);
+    await pump.have(1);
+
+    wire.pushBytes(Buffer.from(`${"x".repeat(600)}\n`, "utf8"));
+    await pump.have(2);
+    expect(pump.got[1]?.body).toMatchObject({
+      kind: "error",
+      error: { code: "PROVIDER_PROTOCOL_UNSUPPORTED", message: expect.stringContaining("frame size guard") },
+    });
+    await pump.closed();
+  });
+
+  it("splits an oversized outgoing command into ordered bounded rpc_chunks under the advertised cap", async () => {
+    const smallReady = { ...READY_FRAME, maxFrameBytes: 512, maxReassembledFrameBytes: 65536 };
+    const { transport, wire } = setup();
+    const opening = transport.open(launch());
+    await flush();
+    wire.pushFrame(smallReady);
+    await completeV2(wire, { sessionFile: "/sessions/a.jsonl", sessionId: "s-a" });
+    await opening;
+
+    const sending = transport.send(command("follow_up", { text: "x".repeat(2000) }));
+    await until(() => {
+      if (!wire.written.some((line) => line.includes('"type":"rpc_chunk"'))) {
+        throw new Error("no rpc_chunk frames written yet");
+      }
+    });
+    const chunkLines = wire.written.filter((line) => line.includes("rpc_chunk"));
+    expect(chunkLines.length).toBeGreaterThan(2);
+    for (const line of chunkLines) {
+      expect(Buffer.byteLength(line, "utf8")).toBeLessThanOrEqual(512);
+    }
+    const chunks = chunkLines.map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(chunks.map((c) => c.index)).toEqual(chunks.map((_, i) => i));
+    expect(new Set(chunks.map((c) => c.chunkId)).size).toBe(1);
+    const joined = Buffer.concat(chunks.map((c) => Buffer.from(c.data as string, "base64")));
+    const reassembled = JSON.parse(joined.toString("utf8")) as Record<string, unknown>;
+    expect(reassembled).toMatchObject({ type: "follow_up", message: "x".repeat(2000) });
+
+    // The provider answers the LOGICAL frame; the hub correlates it by id.
+    answer(wire, { id: reassembled.id, type: "follow_up" });
+    await sending;
+  });
+
+  it("records process ownership before the handshake and refuses launch when recording fails", async () => {
+    const facts: { pid: number; pgid: number }[] = [];
+    const { transport, wire } = setup();
+    const opening = transport.open(
+      launch({
+        report_process: async (f) => {
+          facts.push(f);
+        },
+      }),
+    );
+    await flush();
+    // Recorded after spawn, before any ready frame was even offered: an
+    // ownership record can never be raced by a handshake failure.
+    expect(facts).toEqual([{ pid: 4242, pgid: 4242 }]);
+    wire.pushFrame(READY_FRAME);
+    await completeV2(wire, { sessionFile: "/sessions/a.jsonl", sessionId: "s-a" });
+    await opening;
+
+    const failing = setup();
+    const rejected = expect(
+      failing.transport.open(
+        launch({
+          report_process: async () => {
+            throw new Error("lease recording unavailable");
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({
+      liveError: { code: "LIVE_OWNERSHIP_RECORDING_FAILED", stage: "launch", retryable: false },
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    await rejected;
+    // The spawn happened, so a rejected launch must prove the child dead.
+    expect(failing.wire.stdinEnded).toBe(true);
+    expect(failing.wire.signals).toContain("SIGTERM");
+  });
+
+  it("describes the full RPC v2 capability snapshot under the evidence rules", async () => {
+    const { transport } = setup();
+    const descriptor = await transport.describe();
+    expect(descriptor.transport).toBe("omp-rpc");
+    expect(descriptor.provider).toBe("omp");
+    expect(Object.keys(descriptor.capabilities).sort()).toEqual([
+      "cancel",
+      "checkpoint",
+      "follow_up",
+      "permission_response",
+      "prompt",
+      "resume",
+      "status",
+      "steer",
+      "usage_reporting",
+    ]);
+    for (const claim of Object.values(descriptor.capabilities)) {
+      if (claim.support === "unsupported") {
+        expect(claim.evidence).toBeNull();
+      } else {
+        expect(claim.evidence.trim().length).toBeGreaterThan(0);
+        expect(claim.evidence).toContain("18.1.13");
+      }
+    }
+    expect(descriptor.capabilities.permission_response).toEqual({ support: "unsupported", evidence: null });
+    expect(descriptor.capabilities.checkpoint).toEqual({ support: "unsupported", evidence: null });
+    expect(descriptor.capabilities.usage_reporting).toEqual({ support: "unsupported", evidence: null });
+    expect(() => validateLiveCapabilities(descriptor.capabilities)).not.toThrow();
+  });
+});
+
+describe("omp probe (hermetic command seam)", () => {
+  it("reads the version from an injected command and reports absence honestly", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agent-hub-omp-probe-"));
+    try {
+      const bin = join(dir, "omp");
+      await writeFile(
+        bin,
+        '#!/usr/bin/env node\nif (process.argv.includes("--version")) { console.log("omp/18.1.13"); process.exit(0); }\nprocess.exit(1);\n',
+      );
+      await chmod(bin, 0o755);
+      const found = await probeOmp({ command: bin, environment: process.env });
+      expect(found).toEqual({
+        found: true,
+        version: "18.1.13",
+        detail: "live RPC dialect verified against omp 18.1.13",
+      });
+
+      const missing = await probeOmp({ command: "definitely-not-installed-omp-xyz", environment: process.env });
+      expect(missing.found).toBe(false);
+      expect(missing.version).toBeNull();
+
+      // The env knob resolves the same way the production factory sees it.
+      const viaEnv = await probeOmp({ environment: { ...process.env, AGENT_HUB_OMP_BIN: bin } });
+      expect(viaEnv.found).toBe(true);
+      expect(viaEnv.version).toBe("18.1.13");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

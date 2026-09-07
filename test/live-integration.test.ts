@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 
@@ -24,8 +24,9 @@ import {
   liveStatePath,
   LiveSessionManager,
   LiveTransportRegistry,
-  probeLiveAgent,
+  productionProviderFactories,
   productionTransportFactories,
+  probeLiveAgent,
   registerProductionLiveTransports,
   supportedLiveAgents,
   type LiveManagerPhase,
@@ -457,18 +458,48 @@ describe("production transport registration", () => {
     expect(() => registerProductionLiveTransports(registry)).not.toThrow();
     expect(registry.list()).toHaveLength(4);
 
-    // The build-wide registry the CLI/MCP surfaces probe by default carries the
-    // same four. Probing runs each provider's own detection only; whether a
-    // provider happens to be installed here is nobody's business, so only the
-    // pairing and the answer's shape are asserted.
+    // The build-wide registry the CLI/MCP surfaces probe by default carries
+    // the same four. Detection runs fully hermetically: the four command
+    // knobs point at one fake version-reporting script, so whatever is (or
+    // is not) installed on this machine is never consulted.
     registerProductionLiveTransports();
-    const documents = await Promise.all(supportedLiveAgents.map((provider) => probeLiveAgent(provider)));
-    expect(documents.map((document) => document.transport).sort()).toEqual(expected);
-    for (const document of documents) {
-      const paired = document.transport === null ? null : LIVE_TRANSPORT_PAIRINGS[document.transport];
-      expect(paired).toBe(document.provider);
-      expect(typeof document.found).toBe("boolean");
-      expect(document.version === null || typeof document.version === "string").toBe(true);
+    const probeDir = await mkdtemp(join(tmpdir(), "agent-hub-probe-all-"));
+    const probeBin = join(probeDir, "provider");
+    await writeFile(
+      probeBin,
+      "#!/usr/bin/env node\n" +
+        'if (process.argv.includes("--version")) { console.log("9.9.9"); process.exit(0); }\n' +
+        'if (process.argv.includes("--help")) { console.log("usage: --input-format fmt --conversation <id>"); process.exit(0); }\n' +
+        "process.exit(1);\n",
+    );
+    await chmod(probeBin, 0o755);
+    const envOverrides: [string, string | undefined][] = [];
+    const setEnv = (key: string, value: string): void => {
+      envOverrides.push([key, process.env[key]]);
+      process.env[key] = value;
+    };
+    try {
+      setEnv("AGENT_HUB_OMP_BIN", probeBin);
+      setEnv("AGENT_HUB_PI_BIN", probeBin);
+      setEnv("AGENT_HUB_AGY_BIN", probeBin);
+      setEnv("AGENT_HUB_HERMES_BIN", probeBin);
+      const documents = await Promise.all(supportedLiveAgents.map((provider) => probeLiveAgent(provider)));
+      expect(documents.map((document) => document.transport).sort()).toEqual(expected);
+      for (const document of documents) {
+        const paired = document.transport === null ? null : LIVE_TRANSPORT_PAIRINGS[document.transport];
+        expect(paired).toBe(document.provider);
+        expect(document.found).toBe(true);
+        expect(document.version).toBe("9.9.9");
+      }
+    } finally {
+      for (const [key, value] of envOverrides) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+      await rm(probeDir, { recursive: true, force: true });
     }
 
     // A production manager build cannot be shadowed by an injected fake for a
@@ -486,6 +517,29 @@ describe("production transport registration", () => {
     expect(shadow.created).toHaveLength(0);
     await destroyWorld(world);
   }, 90_000);
+});
+
+describe("production provider factories", () => {
+  it("prefers each provider's exact transport and returns null rather than a fallback guess", () => {
+    expect(productionProviderFactories.map((factory) => factory.provider).sort()).toEqual([
+      "agy",
+      "hermes",
+      "omp",
+      "pi",
+    ]);
+    for (const factory of productionProviderFactories) {
+      expect(factory.transports).toHaveLength(1);
+      expect(LIVE_TRANSPORT_PAIRINGS[factory.transports[0]!]).toBe(factory.provider);
+      // No registered candidates: an honest null, never an invented transport.
+      expect(factory.selectTransport([])).toBeNull();
+      // The provider's own registered factory is found by exact pairing …
+      const own = productionTransportFactories().filter((candidate) => candidate.provider === factory.provider);
+      expect(factory.selectTransport(own)?.transport).toBe(factory.transports[0]);
+      // … and foreign-provider factories are never borrowed as a fallback.
+      const foreign = productionTransportFactories().filter((candidate) => candidate.provider !== factory.provider);
+      expect(factory.selectTransport(foreign)).toBeNull();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

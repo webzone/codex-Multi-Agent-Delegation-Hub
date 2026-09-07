@@ -50,8 +50,10 @@ import { HERMES_ACP_ARGS, probeHermes, resolveHermesCommand } from "../probes/he
  * `permission_policy`, where omitted means `deny` — the headless MCP
  * default; no transport option may silently override the request):
  *   - `deny` auto-denies every `session/request_permission` (reject_once or
- *     cancelled) and NEVER advertises a usable permission_response answer
- *     path — the hub cannot be asked to answer what nothing will await;
+ *     cancelled), never advertises a permission_response answer path, and
+ *     never emits a `permission_request` event the hub could not answer —
+ *     the auto-deny surfaces as a bounded log line instead, so no
+ *     open-permission bookkeeping can ever strand;
  *   - `interactive` advertises the native answer path and waits for the
  *     hub's verdict for at most `permission_timeout_ms` (default 60s), then
  *     denies;
@@ -105,6 +107,85 @@ function boundText(text: string, maxBytes: number): LiveBoundedText {
     cut = cut.slice(0, -1);
   }
   return { text: cut, truncated: true };
+}
+
+/** Byte cap for one LF-delimited ACP stdout record; oversized = protocol-fatal. */
+const ACP_MAX_LINE_BYTES = 1 << 20;
+
+/**
+ * Transport-boundary guard over ACP stdout: every LF-delimited record must
+ * be a JSON object within `maxLineBytes`. The pinned SDK tolerates garbage
+ * lines by silently skipping them (stream.js swallows the parse error) —
+ * that is NOT a hub-adoptable contract: a provider emitting malformed or
+ * oversized traffic has already broken the stream's framing intent, so the
+ * guard reports once, errors the stream, and the transport terminates the
+ * child. Well-formed bytes pass through untouched; blank records are
+ * tolerated as whitespace (zero payload, nothing to parse); the failure
+ * carries the rule violated, never the raw content.
+ */
+function guardedAcpInput(
+  source: ReadableStream<Uint8Array>,
+  onFatal: (message: string) => void,
+  maxLineBytes = ACP_MAX_LINE_BYTES,
+): ReadableStream<Uint8Array> {
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  let pending: Uint8Array = new Uint8Array(0);
+  let broken = false;
+  const fail = (message: string, controller: TransformStreamDefaultController<Uint8Array>): void => {
+    broken = true;
+    pending = new Uint8Array(0);
+    onFatal(message);
+    controller.error(new Error("acp_stdout_invalid"));
+  };
+  return source.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        if (broken) {
+          return;
+        }
+        const merged = new Uint8Array(pending.length + chunk.length);
+        merged.set(pending, 0);
+        merged.set(chunk, pending.length);
+        pending = merged;
+        for (;;) {
+          const newline = pending.indexOf(0x0a);
+          if (newline === -1) {
+            if (pending.length > maxLineBytes) {
+              fail("an ACP stdout record exceeded the frame byte cap", controller);
+            }
+            return;
+          }
+          const record = pending.subarray(0, newline + 1);
+          pending = pending.subarray(newline + 1);
+          if (record.byteLength > maxLineBytes) {
+            fail("an ACP stdout record exceeded the frame byte cap", controller);
+            return;
+          }
+          let contentEnd = newline;
+          if (contentEnd > 0 && record[contentEnd - 1] === 0x0d) {
+            contentEnd -= 1;
+          }
+          if (contentEnd > 0) {
+            let valid = false;
+            try {
+              const value: unknown = JSON.parse(decoder.decode(record.subarray(0, contentEnd)));
+              valid = typeof value === "object" && value !== null && !Array.isArray(value);
+            } catch {
+              valid = false;
+            }
+            if (!valid) {
+              fail("an ACP stdout record was not a well-formed JSON object", controller);
+              return;
+            }
+          }
+          controller.enqueue(record);
+          if (pending.length === 0) {
+            return;
+          }
+        }
+      },
+    }),
+  );
 }
 
 type LivePromptOrFollowUp = Extract<LiveCommand, { kind: "prompt" | "follow_up" }>;
@@ -309,7 +390,9 @@ export class HermesAcpTransport implements LiveTransport {
 
     const stream = ndJsonStream(
       Writable.toWeb(child.stdin as Writable) as WritableStream<Uint8Array>,
-      Readable.toWeb(child.stdout as Readable) as ReadableStream<Uint8Array>,
+      guardedAcpInput(Readable.toWeb(child.stdout as Readable) as ReadableStream<Uint8Array>, (message) => {
+        this.fatalProtocolError("LIVE_ACP_FRAME_INVALID", `hermes stdout violates the ACP stdio frame rules: ${message}`);
+      }),
     );
     this.conn = new ClientSideConnection(
       (): Client => ({
@@ -328,6 +411,10 @@ export class HermesAcpTransport implements LiveTransport {
         }
       }
     });
+    // The exit observation is attached BEFORE any path that can fail
+    // (including ownership recording), so the pump always ends and `stop()`
+    // can always see exit proof once a child exists.
+    void child.exited().then((info) => this.handleExit(info.exit_code, info.exit_signal));
     // Durable ownership boundary: the hub records the group leader BEFORE
     // the ACP handshake can fail, so a rejected open() can never orphan a
     // detached process whose pid was never written down.
@@ -348,7 +435,6 @@ export class HermesAcpTransport implements LiveTransport {
         throw new LiveTransportError(structured);
       }
     }
-    void child.exited().then((info) => this.handleExit(info.exit_code, info.exit_signal));
 
     const launchedAt = new Date().toISOString();
     try {
@@ -369,6 +455,7 @@ export class HermesAcpTransport implements LiveTransport {
           ),
         );
       }
+
       this.resumeAdvertised = initResponse.agentCapabilities?.loadSession === true;
 
       if (request.resume) {
@@ -689,17 +776,23 @@ export class HermesAcpTransport implements LiveTransport {
     this.permissionSeq += 1;
     const requestId = `perm-${this.permissionSeq}`;
     const kind = params.toolCall.kind ?? "other";
+    if (this.permissionPolicy !== "interactive") {
+      // The verdict is decided in-transport; a permission_request event the
+      // hub could never answer would strand open-permission bookkeeping, so
+      // deny surfaces this as a bounded log line only.
+      this.emit({
+        kind: "log",
+        level: "warn",
+        text: this.bound(`deny policy: permission request auto-denied (${kind}: ${params.toolCall.title ?? "tool"})`),
+      });
+      return Promise.resolve(this.denyResponse(params.options));
+    }
     this.emit({
       kind: "permission_request",
       request_id: requestId,
       tool: this.bound(params.toolCall.title ?? "tool").text,
       summary: this.bound(`${kind}: ${params.toolCall.title ?? "tool"}`),
     });
-
-    if (this.permissionPolicy !== "interactive") {
-      this.emit({ kind: "log", level: "warn", text: this.bound(`deny policy: permission ${requestId} auto-denied`) });
-      return Promise.resolve(this.denyResponse(params.options));
-    }
 
     return new Promise<RequestPermissionResponse>((resolve) => {
       const entry: PendingPermission = {
@@ -779,7 +872,7 @@ export class HermesAcpTransport implements LiveTransport {
     this.exitInfo = { code, signal };
     this.exitDeferred.resolve();
 
-    const intentional = this.hubSignalSent || this.stopMode !== null;
+    const intentional = this.hubSignalSent || this.stopMode !== null || this.fatal;
     if (this.activeTurn && !this.stopMode && !this.fatal) {
       this.emit({
         kind: "error",

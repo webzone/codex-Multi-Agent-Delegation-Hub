@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1059,20 +1059,57 @@ describe("live probe and the default registry", () => {
   it(
     "probes through the production registry wired by runCli itself",
     async () => {
-      const stdout: string[] = [];
-      const exitCode = await runCli(["live", "probe", "--agent", "pi"], {
-        stdout: (value) => stdout.push(value),
-        stderr: () => {},
-      });
+      // Hermetic: all four provider-detection knobs point at one fake
+      // version-reporting script, so a real provider binary is never looked
+      // up from PATH no matter what is installed on this machine.
+      const dir = await mkdtemp(join(tmpdir(), "agent-hub-probe-"));
+      const bin = join(dir, "provider");
+      await writeFile(
+        bin,
+        "#!/usr/bin/env node\n" +
+          'if (process.argv.includes("--version")) { console.log("9.9.9"); process.exit(0); }\n' +
+          'if (process.argv.includes("--help")) { console.log("usage: --input-format fmt --conversation <id>"); process.exit(0); }\n' +
+          "process.exit(1);\n",
+      );
+      await chmod(bin, 0o755);
+      const overrides: [string, string | undefined][] = [];
+      const setEnv = (key: string, value: string): void => {
+        overrides.push([key, process.env[key]]);
+        process.env[key] = value;
+      };
+      try {
+        setEnv("AGENT_HUB_OMP_BIN", bin);
+        setEnv("AGENT_HUB_PI_BIN", bin);
+        setEnv("AGENT_HUB_AGY_BIN", bin);
+        setEnv("AGENT_HUB_HERMES_BIN", bin);
 
-      // `live probe` registers the four real transports before consulting the
-      // default registry, so the paired factory is always found; the probe
-      // answer itself stays honest — an uninstalled binary is reported, not
-      // guessed — and the exit code tracks that answer.
-      const document = JSON.parse(stdout.join("")) as Record<string, any>;
-      expect(document).toMatchObject({ provider: "pi", transport: "pi-rpc" });
-      expect(typeof document.found).toBe("boolean");
-      expect(exitCode).toBe(document.found ? 0 : 1);
+        const stdout: string[] = [];
+        const exitCode = await runCli(["live", "probe", "--agent", "pi"], {
+          stdout: (value) => stdout.push(value),
+          stderr: () => {},
+        });
+
+        // `live probe` registers the four real transports before consulting
+        // the default registry, so the paired factory is always found; the
+        // probe reports exactly what the detected command said.
+        const document = JSON.parse(stdout.join("")) as Record<string, any>;
+        expect(document).toMatchObject({
+          provider: "pi",
+          transport: "pi-rpc",
+          found: true,
+          version: "9.9.9",
+        });
+        expect(exitCode).toBe(0);
+      } finally {
+        for (const [key, value] of overrides) {
+          if (value === undefined) {
+            delete process.env[key];
+          } else {
+            process.env[key] = value;
+          }
+        }
+        await rm(dir, { recursive: true, force: true });
+      }
     },
     30_000,
   );

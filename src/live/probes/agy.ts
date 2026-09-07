@@ -55,6 +55,19 @@ function firstLine(text: string, maxBytes: number): string | null {
   return Buffer.concat([bytes.subarray(0, maxBytes), Buffer.from("…", "utf8")]).toString("utf8");
 }
 
+/**
+ * Word-boundary flag advertisement check: `--conversation-history` must not
+ * pass as `--conversation`. A substring `includes()` would verify the resume
+ * argv dishonestly whenever help text advertises only a longer flag; the
+ * token must stand alone (line edge, whitespace, comma, paren) or be
+ * directly followed by its value marker (`=`); usage brackets around the
+ * token (`[--conversation <id>]`) are token edges, not name characters.
+ */
+function advertisesFlag(helpText: string, flag: string): boolean {
+  const escaped = flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[,\\s(\\[])${escaped}([\\s=,)\\]]|$)`, "m").test(helpText);
+}
+
 export async function probeAgy(options: AgyProbeOptions = {}): Promise<AgyProbeResult> {
   const maxOutputBytes = options.maxOutputBytes ?? 64 * 1024;
   const command = resolveAgyCommand(options);
@@ -81,8 +94,8 @@ export async function probeAgy(options: AgyProbeOptions = {}): Promise<AgyProbeR
   const resumeArgvVerified =
     helpRun.error === null &&
     helpRun.exitCode === 0 &&
-    helpText.includes(AGY_RESUME_FLAG) &&
-    helpText.includes("--input-format");
+    advertisesFlag(helpText, AGY_RESUME_FLAG) &&
+    advertisesFlag(helpText, "--input-format");
 
   const version = `${versionRun.stdout}\n${versionRun.stderr}`.match(/(\d+\.\d+\.\d+)/)?.[1] ?? null;
   const detail = `agy responds to --version${version ? ` as ${version}` : " without a version string"}; resume argv ${AGY_RESUME_FLAG} ${resumeArgvVerified ? "advertised in --help" : "NOT advertised in --help"}`;

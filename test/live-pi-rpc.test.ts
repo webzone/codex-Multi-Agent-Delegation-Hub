@@ -1,11 +1,19 @@
 /**
  * Deterministic fake-wire tests for the PI live RPC transport (verified
- * 0.85.0 dialect). No real processes and no wall-clock sleeps: vitest fake
- * timers drive every timeout, scripted frames arrive synchronously, and
- * assertions wait on observed conditions via `until`, never guessed delays.
+ * 0.85.0 dialect). The transport suites spawn no real provider processes
+ * and use no wall-clock sleeps: vitest fake timers drive every timeout,
+ * scripted frames arrive synchronously, and assertions wait on observed
+ * conditions via `until`, never guessed delays. The probe suite at the end
+ * runs only an injected fake version-reporting script through the command
+ * seam — never a binary looked up from PATH.
  */
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PiRpcTransport } from "../src/live/transports/pi-rpc.js";
+import { probePi } from "../src/live/probes/pi.js";
+import { validateLiveCapabilities } from "../src/live/provider-registry.js";
 import type { RpcWireExit, RpcWireHandle } from "../src/live/transports/rpc-base.js";
 import type { LiveCommand, LiveEvent, LiveLaunchRequest } from "../src/live/types.js";
 import { runLeaderFirstSurvivorScenario } from "./live-stop-authority.js";
@@ -597,5 +605,104 @@ describe("pi-rpc transport (fake wire, pi 0.85.0 dialect)", () => {
       survivorAlive: () => wire.groupAlive,
       signals: () => wire.signals,
     });
+  });
+
+  it("records process ownership before the handshake and refuses launch when recording fails", async () => {
+    const facts: { pid: number; pgid: number }[] = [];
+    const { transport, wire } = setup();
+    const opening = transport.open(
+      launch({
+        report_process: async (f) => {
+          facts.push(f);
+        },
+      }),
+    );
+    await until(() => {
+      if (wire.written.length === 0) {
+        throw new Error("handshake get_state not written yet");
+      }
+    });
+    expect(facts).toEqual([{ pid: 5150, pgid: 5150 }]);
+    answer(wire, wire.lastFrame(), { sessionFile: "/pi/s.jsonl", sessionId: "pi-1" });
+    await opening;
+
+    const failing = setup();
+    const rejected = expect(
+      failing.transport.open(
+        launch({
+          report_process: async () => {
+            throw new Error("lease recording unavailable");
+          },
+        }),
+      ),
+    ).rejects.toMatchObject({
+      liveError: { code: "LIVE_OWNERSHIP_RECORDING_FAILED", stage: "launch", retryable: false },
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    await rejected;
+    expect(failing.wire.stdinEnded).toBe(true);
+    expect(failing.wire.signals).toContain("SIGTERM");
+  });
+
+  it("describes the full pi capability snapshot under the evidence rules", async () => {
+    const { transport } = setup();
+    const descriptor = await transport.describe();
+    expect(descriptor.transport).toBe("pi-rpc");
+    expect(descriptor.provider).toBe("pi");
+    expect(Object.keys(descriptor.capabilities).sort()).toEqual([
+      "cancel",
+      "checkpoint",
+      "follow_up",
+      "permission_response",
+      "prompt",
+      "resume",
+      "status",
+      "steer",
+      "usage_reporting",
+    ]);
+    for (const claim of Object.values(descriptor.capabilities)) {
+      if (claim.support === "unsupported") {
+        expect(claim.evidence).toBeNull();
+      } else {
+        expect(claim.evidence.trim().length).toBeGreaterThan(0);
+        expect(claim.evidence).toContain("0.85.0");
+      }
+    }
+    // Honest non-claims: the extension-UI decision semantics do not map onto
+    // hub permission verdicts, and checkpoints are not a provider concept.
+    expect(descriptor.capabilities.permission_response).toEqual({ support: "unsupported", evidence: null });
+    expect(descriptor.capabilities.checkpoint).toEqual({ support: "unsupported", evidence: null });
+    expect(descriptor.capabilities.usage_reporting.support).toBe("native");
+    expect(() => validateLiveCapabilities(descriptor.capabilities)).not.toThrow();
+  });
+});
+
+describe("pi probe (hermetic command seam)", () => {
+  it("reads the version from an injected command and reports absence honestly", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "agent-hub-pi-probe-"));
+    try {
+      const bin = join(dir, "pi");
+      await writeFile(
+        bin,
+        '#!/usr/bin/env node\nif (process.argv.includes("--version")) { console.log("0.85.0"); process.exit(0); }\nprocess.exit(1);\n',
+      );
+      await chmod(bin, 0o755);
+      const found = await probePi({ command: bin, environment: process.env });
+      expect(found).toEqual({
+        found: true,
+        version: "0.85.0",
+        detail: "live RPC dialect verified against pi 0.85.0",
+      });
+
+      const missing = await probePi({ command: "definitely-not-installed-pi-xyz", environment: process.env });
+      expect(missing.found).toBe(false);
+      expect(missing.version).toBeNull();
+
+      const viaEnv = await probePi({ environment: { ...process.env, AGENT_HUB_PI_BIN: bin } });
+      expect(viaEnv.found).toBe(true);
+      expect(viaEnv.version).toBe("0.85.0");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

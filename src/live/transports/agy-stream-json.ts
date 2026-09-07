@@ -121,9 +121,8 @@ type LivePromptOrFollowUp = Extract<LiveCommand, { kind: "prompt" | "follow_up" 
 interface TurnState {
   command: LivePromptOrFollowUp;
   startedAt: string;
-  streamId: string;
-  assistantText: string[];
-  sawAssistantText: boolean;
+  /** Streams opened this turn, arrival order, each with its single role. */
+  streams: Map<string, "assistant" | "reasoning">;
 }
 
 /**
@@ -577,6 +576,13 @@ export class AgyStreamJsonTransport implements LiveTransport {
   private attachLineReader(stream: NodeJS.ReadableStream, onLine: (line: string, bytes: number) => void): void {
     let pending = Buffer.alloc(0);
     stream.on("data", (chunk: Buffer | string) => {
+      if (this.fatal) {
+        // A dead session keeps no backlog: once the envelope cap (or any
+        // other fatality) has tripped, bytes are dropped, never buffered,
+        // so a flooding provider cannot grow memory before the kill lands.
+        pending = Buffer.alloc(0);
+        return;
+      }
       const data = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
       pending = Buffer.concat([pending, data]);
       for (;;) {
@@ -684,15 +690,14 @@ export class AgyStreamJsonTransport implements LiveTransport {
         return;
       }
       const streamId = stepId ?? `agy-${stepType}`;
-      if (this.activeTurn && stepType === "text") {
-        this.activeTurn.assistantText.push(text);
-        this.activeTurn.sawAssistantText = true;
-        this.activeTurn.streamId = streamId;
+      const role: "assistant" | "reasoning" = stepType === "text" ? "assistant" : "reasoning";
+      if (this.activeTurn && !this.activeTurn.streams.has(streamId)) {
+        this.activeTurn.streams.set(streamId, role);
       }
       this.emit({
         kind: "text",
-        role: stepType === "text" ? "assistant" : "reasoning",
-        stream_id: this.activeTurn ? this.activeTurn.streamId : streamId,
+        role,
+        stream_id: streamId,
         text: this.bound(text),
         final: false,
       });
@@ -774,11 +779,13 @@ export class AgyStreamJsonTransport implements LiveTransport {
       };
       this.emit({ kind: "usage", usage });
     }
-    if (turn.sawAssistantText) {
+    for (const [streamId, role] of turn.streams) {
+      // Every stream this turn opened gets its final marker at the result
+      // boundary — a consumer concatenating any one stream can finish.
       this.emit({
         kind: "text",
-        role: "assistant",
-        stream_id: turn.streamId,
+        role,
+        stream_id: streamId,
         text: { text: "", truncated: false },
         final: true,
       });
@@ -806,12 +813,12 @@ export class AgyStreamJsonTransport implements LiveTransport {
     this.activeTurn = {
       command,
       startedAt: new Date().toISOString(),
-      streamId: `agy-${command.command_id}`,
-      assistantText: [],
-      sawAssistantText: false,
+      streams: new Map(),
     };
-    // The only bytes ever written to agy's stdin: user envelopes.
-    void this.child!.writeStdin(`${JSON.stringify({ event: "user", message: command.text })}\n`);
+    // The only bytes ever written to agy's stdin: user envelopes. A stdin
+    // that died before the exit observation never becomes an unhandled
+    // rejection — the exit observation owns the session outcome.
+    this.child!.writeStdin(`${JSON.stringify({ event: "user", message: command.text })}\n`).catch(() => undefined);
     this.setStatus("running");
   }
 
@@ -846,7 +853,7 @@ export class AgyStreamJsonTransport implements LiveTransport {
     this.exitInfo = { code, signal };
     this.exitDeferred.resolve();
 
-    const intentional = this.hubSignalSent || this.stopMode !== null;
+    const intentional = this.hubSignalSent || this.stopMode !== null || this.fatal;
     if (this.activeTurn && !this.stopMode && !this.fatal) {
       this.emit({
         kind: "error",

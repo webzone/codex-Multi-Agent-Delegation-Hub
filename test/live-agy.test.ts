@@ -111,6 +111,33 @@ rl.on('line', (line) => {
   out({ event: 'telepathy', payload: 'control frame the hub must never invent' });
 });
 `,
+  flood: `
+const rl = require('node:readline').createInterface({ input: process.stdin });
+out({ event: 'init', conversation_id: 'conv-flood' });
+rl.on('line', (line) => {
+  journal({ m: 'stdin', line });
+  // More than the transport envelope cap, never terminated by a newline:
+  // after the fatal the hub must DROP inbound bytes, never keep buffering.
+  for (let i = 0; i < 4; i += 1) {
+    process.stdout.write('q'.repeat(400000));
+  }
+});
+process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', () => process.exit(0));
+`,
+  multistep: `
+const rl = require('node:readline').createInterface({ input: process.stdin });
+out({ event: 'init', conversation_id: 'conv-multi' });
+rl.on('line', (line) => {
+  journal({ m: 'stdin', line });
+  out({ event: 'step_update', step_id: 's-1', step_type: 'text', text: 'first ' });
+  out({ event: 'step_update', step_type: 'tool_start', tool: 'bash', call_id: 'c-1' });
+  out({ event: 'step_update', step_type: 'tool_end', tool: 'bash', call_id: 'c-1', ok: true });
+  out({ event: 'step_update', step_id: 's-2', step_type: 'text', text: 'second' });
+  out({ event: 'result', subtype: 'success' });
+});
+process.on('SIGINT', () => process.exit(0));
+`,
   orphan: `
 const { spawn } = require('node:child_process');
 out({ event: 'init', conversation_id: 'conv-orphan' });
@@ -355,9 +382,14 @@ describe("agy stream-json transport", () => {
       expect(bodies).toContainEqual(expect.objectContaining({ kind: "status", status: "running" }));
 
       const texts = recorder.bodiesOf("text");
-      expect(texts.map((t) => t.role)).toEqual(["reasoning", "assistant", "assistant", "assistant"]);
+      // Every stream the turn opened (r-1, t-1) gets its own final marker at
+      // the result boundary — a consumer concatenating either one can finish.
+      expect(texts.map((t) => t.role)).toEqual(["reasoning", "assistant", "assistant", "reasoning", "assistant"]);
       expect(texts[1].text).toEqual({ text: "partial ", truncated: false });
+      expect(texts[4].final).toBe(true);
+      expect(texts[4].stream_id).toBe(texts[1].stream_id);
       expect(texts[3].final).toBe(true);
+      expect(texts[3].role).toBe("reasoning");
       expect(texts[1].stream_id).toBe(texts[2].stream_id);
 
       const toolStarts = recorder.bodiesOf("tool_start");
@@ -671,5 +703,114 @@ describe("agy stream-json transport", () => {
     },
     30_000,
   );
+
+  it("enforces the envelope cap mid-line, drops post-fatal bytes, and dies exactly once", async () => {
+    const fake = await makeFakeAgy("flood");
+    const transport = new AgyStreamJsonTransport({ command: fake.bin, environment: fake.environment });
+    try {
+      const recorder = new EventRecorder(transport.events());
+      await transport.open(launchRequest(fake.dir));
+      await transport.send(promptCommand("flood"));
+      await recorder.waitUntil("envelope cap fatal", (events) =>
+        events.some((e) => e.body.kind === "error" && e.body.error.code === "LIVE_AGY_ENVELOPE_TOO_LARGE"),
+      );
+      await recorder.waitDone();
+      const errors = recorder.bodiesOf("error");
+      expect(errors.filter((e) => e.error.code === "LIVE_AGY_ENVELOPE_TOO_LARGE")).toHaveLength(1);
+      expect(JSON.stringify(recorder.events)).not.toContain("qqqq");
+    } finally {
+      const report = await transport.stop("terminate");
+      expect(report.status).toBe("closed");
+      await removeDirectory(fake.dir);
+    }
+  });
+
+  it("finalizes every assistant stream a turn opened, not just the last", async () => {
+    const fake = await makeFakeAgy("multistep");
+    const transport = new AgyStreamJsonTransport({ command: fake.bin, environment: fake.environment });
+    try {
+      const recorder = new EventRecorder(transport.events());
+      await transport.open(launchRequest(fake.dir));
+      await transport.send(promptCommand("narrate"));
+      await recorder.waitUntil(
+        "turn settled",
+        (events) =>
+          events.some((e) => e.body.kind === "status" && e.body.status === "running") &&
+          events.some((e, i) => i > 0 && e.body.kind === "status" && e.body.status === "idle"),
+      );
+      const texts = recorder.bodiesOf("text");
+      expect(texts[0].stream_id).toBe("s-1");
+      expect(texts[1].stream_id).toBe("s-2");
+      const finals = texts.filter((t) => t.final).map((t) => t.stream_id);
+      expect(new Set(finals)).toEqual(new Set(["s-1", "s-2"]));
+      await transport.stop("graceful");
+    } finally {
+      await transport.stop("terminate");
+      await removeDirectory(fake.dir);
+    }
+  });
+
+  it("records process ownership before the init race and refuses launch when recording fails", async () => {
+    const fake = await makeFakeAgy("echo");
+    const transport = new AgyStreamJsonTransport({ command: fake.bin, environment: fake.environment });
+    try {
+      const facts: { pid: number; pgid: number }[] = [];
+      await transport.open({
+        ...launchRequest(fake.dir),
+        report_process: async (f) => {
+          facts.push(f);
+        },
+      });
+      expect(facts).toHaveLength(1);
+      expect(facts[0]?.pid).toBeGreaterThan(1);
+      expect(facts[0]?.pgid).toBe(facts[0]?.pid);
+      await transport.stop("graceful");
+    } finally {
+      await transport.stop("terminate");
+      await removeDirectory(fake.dir);
+    }
+
+    const failing = await makeFakeAgy("echo");
+    const failingTransport = new AgyStreamJsonTransport({ command: failing.bin, environment: failing.environment });
+    try {
+      const recorder = new EventRecorder(failingTransport.events());
+      await expect(
+        failingTransport.open({
+          ...launchRequest(failing.dir),
+          report_process: async () => {
+            throw new Error("lease recording unavailable");
+          },
+        }),
+      ).rejects.toMatchObject({
+        live_error: { code: "LIVE_OWNERSHIP_RECORDING_FAILED", stage: "launch", retryable: false },
+      });
+      await recorder.waitUntil(
+        "error + exit recorded",
+        (events) =>
+          events.some((e) => e.body.kind === "error" && e.body.error.code === "LIVE_OWNERSHIP_RECORDING_FAILED") &&
+          events.some((e) => e.body.kind === "exit"),
+      );
+      await recorder.waitDone();
+      const report = await failingTransport.stop("terminate");
+      expect(report.status).toBe("closed");
+    } finally {
+      await failingTransport.stop("terminate");
+      await removeDirectory(failing.dir);
+    }
+  });
+
+  it("does not credit a longer flag: --conversation-history does not verify --conversation", async () => {
+    const fake = await makeFakeAgy(
+      "echo",
+      "usage: agy [--input-format fmt] [--conversation-history <id>] [--print]\n",
+    );
+    try {
+      const probe = await probeAgy({ command: fake.bin, environment: fake.environment });
+      expect(probe.found).toBe(true);
+      expect(probe.resume_argv_verified).toBe(false);
+    } finally {
+      await removeDirectory(fake.dir);
+    }
+  });
 });
 
