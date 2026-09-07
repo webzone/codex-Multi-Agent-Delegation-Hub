@@ -3,7 +3,7 @@
  * `omp --version` only (argv array, `shell:false`) — never `omp --mode rpc`,
  * so no session ever launches during a probe.
  *
- * The live RPC dialect this package ships was verified against OMP 18.1.10;
+ * The live RPC v2 dialect this package ships was verified against OMP 18.1.13;
  * other versions are reported honestly as an unverified dialect rather than
  * silently accepted or rejected.
  */
@@ -11,7 +11,7 @@ import { runProcess } from "../../process.js";
 import type { LiveProbeResult, LiveProviderFactory } from "../types.js";
 import { selectPreferredTransport } from "../transports/rpc-base.js";
 
-export const OMP_VERIFIED_VERSION = "18.1.10";
+export const OMP_VERIFIED_VERSION = "18.1.13";
 
 const PROBE_OUTPUT_BYTES = 4096;
 

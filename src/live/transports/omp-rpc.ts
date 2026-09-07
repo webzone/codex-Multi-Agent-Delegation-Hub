@@ -78,7 +78,7 @@ const OMP_CAPABILITIES: LiveCapabilities = {
     `${OMP_DIALECT_EVIDENCE}; resume counts only after a switch_session (success, cancelled=false) plus a get_state locator echo round-trip`,
   ),
   checkpoint: { support: "unsupported", evidence: null },
-  // The 18.1.10 reference documents message_update deltas without committing
+  // The 18.1.13 reference documents message_update deltas without committing
   // a usage payload; an unverified mapping must not become a claim.
   usage_reporting: { support: "unsupported", evidence: null },
 };
