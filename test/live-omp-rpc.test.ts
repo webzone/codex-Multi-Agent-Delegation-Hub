@@ -1,6 +1,6 @@
 /**
  * Deterministic fake-wire tests for the OMP live RPC transport (verified
- * 18.1.10 dialect). No real processes and no wall-clock sleeps: vitest fake
+ * 18.1.13 RPC v2 dialect). No real processes and no wall-clock sleeps: vitest fake
  * timers drive every timeout, scripted frames arrive synchronously, and
  * assertions wait on observed conditions via `until`, never guessed delays.
  */
@@ -171,7 +171,7 @@ async function until(condition: () => void): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Scripted startup for the verified 18.1.10 dialect
+// Scripted startup for the verified 18.1.13 RPC v2 dialect
 // ---------------------------------------------------------------------------
 
 const READY_FRAME = {
@@ -222,7 +222,7 @@ function setup(...wireArgs: ConstructorParameters<typeof FakeWire>) {
   return { transport, wire, calls };
 }
 
-/** Startup per the verified dialect: unsolicited frames, ready, then get_state. */
+/** Startup per the verified dialect: unsolicited frames, ready, v2, then get_state. */
 async function openStarted(
   transport: OmpRpcTransport,
   wire: FakeWire,
@@ -233,9 +233,23 @@ async function openStarted(
   await flush();
   wire.pushFrame({ type: "available_commands_update", commands: [{ name: "security" }] });
   wire.pushFrame(READY_FRAME);
-  await flush();
-  answer(wire, wire.lastFrame(), stateData);
+  await completeV2(wire, stateData);
   return await opening;
+}
+
+async function completeV2(wire: FakeWire, stateData: Record<string, unknown>): Promise<void> {
+  await until(() => {
+    if (!wire.written.some((line) => line.includes('"type":"negotiate_protocol"'))) {
+      throw new Error("negotiate_protocol frame not written yet");
+    }
+  });
+  answer(wire, lastCommand(wire, "negotiate_protocol"), { protocolVersion: 2 });
+  await until(() => {
+    if (!wire.written.some((line) => line.includes('"type":"get_state"'))) {
+      throw new Error("get_state frame not written yet");
+    }
+  });
+  answer(wire, lastCommand(wire, "get_state"), stateData);
 }
 
 function answer(wire: FakeWire, frame: Record<string, unknown>, data?: Record<string, unknown>): void {
@@ -272,7 +286,7 @@ async function delivered(wire: FakeWire, type: string, sending: Promise<void>, d
 
 // ---------------------------------------------------------------------------
 
-describe("omp-rpc transport (fake wire, OMP 18.1.10 dialect)", () => {
+describe("omp-rpc transport (fake wire, OMP 18.1.13 RPC v2 dialect)", () => {
   beforeEach(() => {
     vi.useFakeTimers();
   });
@@ -280,7 +294,7 @@ describe("omp-rpc transport (fake wire, OMP 18.1.10 dialect)", () => {
     vi.useRealTimers();
   });
 
-  it("launches argv-array with shell spawner, negotiates ready, and tolerates unsolicited startup frames", async () => {
+  it("launches argv-array, negotiates RPC v2, and tolerates unsolicited startup frames", async () => {
     const { transport, wire, calls } = setup();
     const report = await openStarted(transport, wire);
     const pump = new Pump(transport);
@@ -305,11 +319,11 @@ describe("omp-rpc transport (fake wire, OMP 18.1.10 dialect)", () => {
     expect(idle?.live_session_id).toBe("live-omp-1");
   });
 
-  it("treats a ready frame outside protocol v1 as PROVIDER_PROTOCOL_UNSUPPORTED", async () => {
+  it("treats a ready frame outside the v2 bootstrap envelope as OMP_RPC_FRAME_INVALID", async () => {
     const { transport, wire } = setup();
     const opening = transport.open(launch());
     const rejected = expect(opening).rejects.toMatchObject({
-      liveError: { code: "PROVIDER_PROTOCOL_UNSUPPORTED", stage: "protocol", retryable: false },
+      liveError: { code: "OMP_RPC_FRAME_INVALID", stage: "protocol", retryable: false },
     });
     await flush();
     wire.pushFrame({ type: "ready", protocolVersion: 2 });
@@ -318,11 +332,41 @@ describe("omp-rpc transport (fake wire, OMP 18.1.10 dialect)", () => {
     await pump.have(2);
     expect(pump.got[0]?.body).toMatchObject({
       kind: "error",
-      error: { code: "PROVIDER_PROTOCOL_UNSUPPORTED", stage: "protocol" },
+      error: { code: "OMP_RPC_FRAME_INVALID", stage: "protocol" },
     });
     expect(pump.got[1]?.body).toMatchObject({ kind: "exit", intentional: true });
     await pump.closed();
     expect(wire.signals).toContain("SIGTERM");
+  });
+
+  it("fails closed when the ready frame does not advertise RPC v2", async () => {
+    const { transport, wire } = setup();
+    const opening = transport.open(launch());
+    const rejected = expect(opening).rejects.toMatchObject({
+      liveError: { code: "OMP_RPC_V2_REQUIRED", stage: "protocol", retryable: false },
+    });
+    await flush();
+    wire.pushFrame({ ...READY_FRAME, supportedProtocolVersions: [1] });
+    await rejected;
+    expect(wire.frames().some((frame) => frame.type === "negotiate_protocol")).toBe(false);
+  });
+
+  it("fails closed when the provider rejects RPC v2 negotiation", async () => {
+    const { transport, wire } = setup();
+    const opening = transport.open(launch());
+    const rejected = expect(opening).rejects.toMatchObject({
+      liveError: { code: "OMP_RPC_V2_REQUIRED", stage: "protocol", retryable: false },
+    });
+    await flush();
+    wire.pushFrame(READY_FRAME);
+    await until(() => {
+      if (!wire.written.some((line) => line.includes('"type":"negotiate_protocol"'))) {
+        throw new Error("negotiate_protocol frame not written yet");
+      }
+    });
+    const negotiation = lastCommand(wire, "negotiate_protocol");
+    wire.pushFrame({ id: negotiation.id, type: "response", command: "negotiate_protocol", success: false, error: "unsupported" });
+    await rejected;
   });
 
   it("times out the ready negotiation and proves the child gone before failing launch", async () => {
@@ -543,8 +587,7 @@ describe("omp-rpc transport (fake wire, OMP 18.1.10 dialect)", () => {
     );
     await flush();
     wire.pushFrame(READY_FRAME);
-    await flush();
-    answer(wire, wire.lastFrame(), { sessionFile: "/sessions/a.jsonl", sessionId: "s-a" });
+    await completeV2(wire, { sessionFile: "/sessions/a.jsonl", sessionId: "s-a" });
     await until(() => {
       if (!wire.written.some((line) => line.includes('"type":"switch_session"'))) {
         throw new Error("switch_session not written yet");
@@ -588,8 +631,7 @@ describe("omp-rpc transport (fake wire, OMP 18.1.10 dialect)", () => {
     );
     await flush();
     wire.pushFrame(READY_FRAME);
-    await flush();
-    answer(wire, wire.lastFrame(), { sessionFile: "/sessions/a.jsonl" });
+    await completeV2(wire, { sessionFile: "/sessions/a.jsonl" });
     await flush();
     answer(wire, lastCommand(wire, "switch_session"), { cancelled: false });
     await flush();
@@ -610,8 +652,7 @@ describe("omp-rpc transport (fake wire, OMP 18.1.10 dialect)", () => {
     );
     await flush();
     wire.pushFrame(READY_FRAME);
-    await flush();
-    answer(wire, wire.lastFrame(), { sessionFile: "/sessions/a.jsonl" });
+    await completeV2(wire, { sessionFile: "/sessions/a.jsonl" });
 
     await expect(opening).rejects.toMatchObject({ liveError: { code: "LIVE_RESUME_VERIFICATION_FAILED", stage: "state" } });
   });
@@ -625,8 +666,7 @@ describe("omp-rpc transport (fake wire, OMP 18.1.10 dialect)", () => {
     );
     await flush();
     wire.pushFrame(READY_FRAME);
-    await flush();
-    answer(wire, wire.lastFrame(), { sessionFile: "/sessions/a.jsonl" });
+    await completeV2(wire, { sessionFile: "/sessions/a.jsonl" });
 
     await expect(opening).rejects.toMatchObject({ liveError: { code: "LIVE_RESUME_VERIFICATION_FAILED" } });
   });

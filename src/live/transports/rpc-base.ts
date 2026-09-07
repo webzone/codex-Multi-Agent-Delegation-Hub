@@ -17,11 +17,10 @@
  *     only, an optional trailing CR is stripped. Node `readline` is
  *     forbidden — it also splits on U+2028/U+2029, which are legal inside
  *     JSON strings.
- *   - Only the verified current dialect is used. The transports never send
- *     `negotiate_protocol`, so OMP protocol-v2 `rpc_chunk` reassembly never
- *     applies and the old bounded-chunk dialect is never guessed. A frame
- *     that is structurally outside the dialect (not JSON, not a JSON object,
- *     missing string `type`) is fatal: exactly one
+ *   - A provider-specific decoder may add a negotiated, bounded logical
+ *     message layer before dispatch. A frame that is structurally outside
+ *     the provider dialect (not JSON, not a JSON object, missing string
+ *     `type`) is fatal: exactly one
  *     `PROVIDER_PROTOCOL_UNSUPPORTED` error event, bounded shutdown, pump
  *     end. A known-shape frame carrying a semantically unknown `type` is
  *     tolerated as a `provider_notice` log event (kind + label only, never
@@ -299,6 +298,21 @@ export abstract class RpcSessionBase implements LiveTransport {
   /** Per-provider mapping of non-response frames; must not throw. */
   protected abstract handleProviderFrame(frame: RpcFrame): void;
 
+  /** Decode an already parsed physical frame into one logical frame. */
+  protected decodeIncomingFrame(frame: RpcFrame): RpcFrame | null {
+    return frame;
+  }
+
+  /** Encode one logical command into one or more newline-terminated records. */
+  protected encodeOutgoingFrames(frame: RpcFrame): readonly string[] {
+    return [`${JSON.stringify(frame)}\n`];
+  }
+
+  /** Physical record bound for the current provider dialect. */
+  protected physicalFrameLimit(): number {
+    return MAX_FRAME_BYTES;
+  }
+
   /** Side effect on every successful response (e.g. OMP `agentInvoked:false` hints). */
   protected onResponseSuccess(_response: RpcFrame): void {}
 
@@ -394,7 +408,7 @@ export abstract class RpcSessionBase implements LiveTransport {
               true,
             );
       // A protocol violation already surfaced its own error event; do not double-report.
-      throw await this.failLaunch(detail, detail.code !== "PROVIDER_PROTOCOL_UNSUPPORTED");
+      throw await this.failLaunch(detail, !this.fatal);
     }
   }
 
@@ -686,7 +700,7 @@ export abstract class RpcSessionBase implements LiveTransport {
     for (;;) {
       const newline = this.byteBuffer.indexOf("\n");
       if (newline === -1) {
-        if (Buffer.byteLength(this.byteBuffer, "utf8") > MAX_FRAME_BYTES) {
+        if (Buffer.byteLength(this.byteBuffer, "utf8") + 1 > this.physicalFrameLimit()) {
           this.failProtocol("a stdout record exceeded the frame size guard");
           return;
         }
@@ -708,6 +722,10 @@ export abstract class RpcSessionBase implements LiveTransport {
   }
 
   private dispatch(line: string): void {
+    if (Buffer.byteLength(line, "utf8") + 1 > this.physicalFrameLimit()) {
+      this.failProtocol("a stdout record exceeded the physical frame size guard");
+      return;
+    }
     let value: unknown;
     try {
       value = JSON.parse(line);
@@ -724,15 +742,34 @@ export abstract class RpcSessionBase implements LiveTransport {
       this.failProtocol("a stdout record carried no string type discriminator");
       return;
     }
-    if (frame.type === "response") {
-      this.handleResponse(frame);
+    let logical: RpcFrame | null;
+    try {
+      logical = this.decodeIncomingFrame(frame);
+    } catch (error) {
+      const code =
+        error && typeof error === "object" && "code" in error && typeof error.code === "string"
+          ? error.code
+          : "PROVIDER_PROTOCOL_UNSUPPORTED";
+      const reason = error instanceof Error ? error.message : "the provider frame decoder rejected a frame";
+      this.failProtocol(reason, code);
       return;
     }
-    this.handleProviderFrame(frame);
+    if (logical === null) {
+      return;
+    }
+    if (typeof logical.type !== "string" || logical.type.length === 0) {
+      this.failProtocol("a decoded provider frame carried no string type discriminator");
+      return;
+    }
+    if (logical.type === "response") {
+      this.handleResponse(logical);
+      return;
+    }
+    this.handleProviderFrame(logical);
   }
 
   /** Structural violations are terminal; only a bounded reason crosses, never frame content. */
-  protected failProtocol(reason: string): void {
+  protected failProtocol(reason: string, code = "PROVIDER_PROTOCOL_UNSUPPORTED"): void {
     if (this.fatal) {
       return;
     }
@@ -741,7 +778,7 @@ export abstract class RpcSessionBase implements LiveTransport {
       kind: "error",
       error: liveError(
         this.provider,
-        "PROVIDER_PROTOCOL_UNSUPPORTED",
+        code,
         `provider stdout violates the verified ${this.id} frame dialect: ${reason}`,
         "protocol",
         false,
@@ -765,7 +802,7 @@ export abstract class RpcSessionBase implements LiveTransport {
       new LiveTransportError(
         liveError(
           this.provider,
-          "PROVIDER_PROTOCOL_UNSUPPORTED",
+          code,
           `provider stdout violates the verified ${this.id} frame dialect: ${reason}`,
           "protocol",
           false,
@@ -849,7 +886,20 @@ export abstract class RpcSessionBase implements LiveTransport {
           reject(error);
         },
       });
-      this.wire?.write(`${JSON.stringify(frame)}\n`);
+      try {
+        for (const line of this.encodeOutgoingFrames(frame)) {
+          this.wire?.write(line);
+        }
+      } catch (error) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        const code =
+          error && typeof error === "object" && "code" in error && typeof error.code === "string"
+            ? error.code
+            : "PROVIDER_PROTOCOL_UNSUPPORTED";
+        const message = error instanceof Error ? error.message : "the provider frame could not be encoded";
+        reject(new LiveTransportError(liveError(this.provider, code, message, "protocol", false)));
+      }
     });
   }
 

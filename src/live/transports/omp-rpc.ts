@@ -1,6 +1,6 @@
 /**
  * Live transport for provider `omp` over `omp --mode rpc` (dialect verified
- * against the installed OMP 18.1.10).
+ * against the installed OMP 18.1.13).
  *
  * Dialect facts this implementation is allowed to rely on — nothing else is
  * guessed:
@@ -13,10 +13,13 @@
  *     every semantically unknown frame, are tolerated as `provider_notice`
  *     log events carrying only the frame type or a short provider label —
  *     never raw content.
- *   - `protocolVersion === 1` is the verified framing dialect; anything else
- *     is `PROVIDER_PROTOCOL_UNSUPPORTED`. The transports never send
- *     `negotiate_protocol`, so protocol-v2 `rpc_chunk` reassembly never
- *     applies and the old bounded-chunk dialect is never guessed.
+ *   - The startup `ready` record is a bootstrap envelope with
+ *     `protocolVersion:1` and an advertised v2 capability. The hub then
+ *     sends `negotiate_protocol` for v2 and refuses to run until the
+ *     correlated response confirms `data.protocolVersion === 2`.
+ *   - After negotiation, OMP v2 uses bounded ordered `rpc_chunk` reassembly;
+ *     malformed or out-of-order sequences are terminal. There is no v1
+ *     runtime path or fallback.
  *   - Commands used: `prompt`, `follow_up`, `steer` (mid-turn only), `abort`,
  *     `get_state`, `switch_session`. `switch_session` resolves a session
  *     *path*, so the durable locator is the `get_state` `sessionFile`.
@@ -36,8 +39,16 @@ import type {
 } from "../types.js";
 import { probeOmp } from "../probes/omp.js";
 import {
+  OMP_RPC_MAX_FRAME_BYTES,
+  OMP_RPC_MAX_REASSEMBLED_BYTES,
+  OmpRpcCodecError,
+  OmpRpcFrameDecoder,
+  encodeOmpRpcFrames,
+} from "./omp-rpc-codec.js";
+import {
   type RpcFrame,
   LiveTransportError,
+  liveError,
   RpcSessionBase,
   type RpcSessionOptions,
   objectField,
@@ -46,7 +57,7 @@ import {
 } from "./rpc-base.js";
 
 const OMP_DIALECT_EVIDENCE =
-  "omp 18.1.10: `omp --mode rpc` ready frame, unsolicited startup frames, and a correlated get_state response observed from the installed binary; command schema from the shipped OMP RPC reference";
+  "omp 18.1.13: `omp --mode rpc` bootstrap ready frame, v2 negotiation, bounded rpc_chunk framing, unsolicited startup frames, and correlated command responses observed from the installed binary";
 
 function claim(support: Exclude<LiveCapabilityClaim["support"], "unsupported">, evidence: string): LiveCapabilityClaim {
   return { support, evidence };
@@ -74,6 +85,10 @@ const OMP_CAPABILITIES: LiveCapabilities = {
 
 export class OmpRpcTransport extends RpcSessionBase {
   private readySeen = false;
+  private v2Active = false;
+  private maxFrameBytes = OMP_RPC_MAX_FRAME_BYTES;
+  private maxReassembledBytes = OMP_RPC_MAX_REASSEMBLED_BYTES;
+  private decoder = new OmpRpcFrameDecoder();
   private readonly readyGate: { promise: Promise<void>; resolve: () => void };
 
   constructor(options: RpcSessionOptions = {}) {
@@ -128,12 +143,71 @@ export class OmpRpcTransport extends RpcSessionBase {
       throw new LiveTransportError(this.handshakeTimeoutDetail());
     }
 
+    await this.negotiateV2();
+
     const state = await this.requestState(this.handshakeTimeoutMs);
     const data = objectField(state.data);
     if (!data) {
       return null;
     }
     return readString(data, "sessionFile") ?? readString(data, "sessionId");
+  }
+
+  private async negotiateV2(): Promise<void> {
+    try {
+      const response = await this.requestCommand(
+        "negotiate_protocol",
+        { type: "negotiate_protocol", protocolVersion: 2 },
+        this.handshakeTimeoutMs,
+      );
+      const data = objectField(response.data);
+      if (
+        response.success !== true ||
+        readString(response, "command") !== "negotiate_protocol" ||
+        !data ||
+        data.protocolVersion !== 2
+      ) {
+        throw new Error("the provider did not confirm RPC protocol v2");
+      }
+    } catch {
+      throw new LiveTransportError(
+        liveError(
+          "omp",
+          "OMP_RPC_V2_REQUIRED",
+          "OMP RPC v2 negotiation failed; the provider was not allowed to run",
+          "protocol",
+          false,
+        ),
+      );
+    }
+    this.v2Active = true;
+    this.decoder = new OmpRpcFrameDecoder(this.maxFrameBytes, this.maxReassembledBytes);
+  }
+
+  protected physicalFrameLimit(): number {
+    return this.maxFrameBytes;
+  }
+
+  protected decodeIncomingFrame(frame: RpcFrame): RpcFrame | null {
+    if (frame.type === "rpc_chunk" && !this.v2Active) {
+      this.failProtocol("an rpc_chunk arrived before RPC v2 negotiation completed", "OMP_RPC_V2_REQUIRED");
+      return null;
+    }
+    if (frame.type !== "rpc_chunk") {
+      return frame;
+    }
+    try {
+      return this.decoder.push(frame);
+    } catch (error) {
+      if (error instanceof OmpRpcCodecError) {
+        throw error;
+      }
+      throw new OmpRpcCodecError("OMP_RPC_MESSAGE_INVALID", "the OMP RPC v2 message could not be reassembled");
+    }
+  }
+
+  protected encodeOutgoingFrames(frame: RpcFrame): readonly string[] {
+    return encodeOmpRpcFrames(frame, this.maxFrameBytes, this.maxReassembledBytes);
   }
 
   protected handleProviderFrame(frame: RpcFrame): void {
@@ -144,14 +218,37 @@ export class OmpRpcTransport extends RpcSessionBase {
           this.emitLog("warn", "provider_notice:ready (duplicate ready frame)");
           return;
         }
-        // Only protocol v1 framing is verified; v2-default framing or a
-        // malformed ready frame is outside the supported dialect. The reason
-        // is hub-generated and fixed — frame content never crosses.
+        // `protocolVersion:1` is the bootstrap envelope, not the runtime
+        // protocol. OMP v2 must be explicitly advertised before negotiation.
         if (frame.protocolVersion !== 1) {
           this.readySeen = true;
-          this.failProtocol("the ready frame did not advertise protocol v1");
+          this.failProtocol("the OMP ready frame was not a valid v2 bootstrap envelope", "OMP_RPC_FRAME_INVALID");
           return;
         }
+        const supported = frame.supportedProtocolVersions;
+        if (!Array.isArray(supported) || !supported.includes(2)) {
+          this.readySeen = true;
+          this.failProtocol("the OMP ready frame did not advertise RPC protocol v2", "OMP_RPC_V2_REQUIRED");
+          return;
+        }
+        const advertisedFrameBytes = frame.maxFrameBytes;
+        const advertisedReassembledBytes = frame.maxReassembledFrameBytes;
+        if (
+          typeof advertisedFrameBytes !== "number" ||
+          typeof advertisedReassembledBytes !== "number" ||
+          !Number.isSafeInteger(advertisedFrameBytes) ||
+          !Number.isSafeInteger(advertisedReassembledBytes) ||
+          advertisedFrameBytes <= 0 ||
+          advertisedFrameBytes > OMP_RPC_MAX_FRAME_BYTES ||
+          advertisedReassembledBytes < advertisedFrameBytes ||
+          advertisedReassembledBytes > OMP_RPC_MAX_REASSEMBLED_BYTES
+        ) {
+          this.readySeen = true;
+          this.failProtocol("the OMP ready frame advertised invalid RPC v2 bounds", "OMP_RPC_FRAME_INVALID");
+          return;
+        }
+        this.maxFrameBytes = advertisedFrameBytes;
+        this.maxReassembledBytes = advertisedReassembledBytes;
         this.readySeen = true;
         this.readyGate.resolve();
         return;
@@ -207,12 +304,6 @@ export class OmpRpcTransport extends RpcSessionBase {
       case "extension_ui_request": {
         const method = readString(frame, "method");
         this.emitLog("info", method ? `provider_notice:extension_ui_request ${method}` : "provider_notice:extension_ui_request");
-        return;
-      }
-      case "rpc_chunk": {
-        // Protocol v2 is never negotiated, so a chunk frame means framing we
-        // cannot verify: reported, never reassembled by guess.
-        this.emitLog("warn", "provider_notice:rpc_chunk (protocol v2 was never negotiated)");
         return;
       }
       case "host_tool_call":
