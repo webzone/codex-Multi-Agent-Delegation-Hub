@@ -1,4 +1,5 @@
 import { AgentHubError, asDelegateError } from "../errors.js";
+import { StringDecoder } from "node:string_decoder";
 import { isLiveRecord } from "./provider-registry.js";
 import { createLiveManager } from "./bootstrap.js";
 import type {
@@ -70,6 +71,12 @@ export {
   validateLiveCapabilities,
 } from "./provider-registry.js";
 export type { LiveProbeDocument, LiveResumeSource } from "./provider-registry.js";
+export {
+  LiveStdinReader,
+  LIVE_STDIN_MAX_LINE_BYTES,
+  LIVE_STDIN_MAX_QUEUE_BYTES,
+  LIVE_STDIN_MAX_QUEUE_LINES,
+} from "./stdin.js";
 export {
   LIVE_ADMIN_LOCK_NAME,
   LIVE_REF_NAMESPACE,
@@ -269,13 +276,15 @@ interface LiveSessionManagerLike {
 /** Splits an arbitrary chunk stream into lines (final partial line included). */
 export async function* iterateLiveCommands(chunks: AsyncIterable<unknown>): AsyncGenerator<string> {
   let pending = "";
+  const decoder = new StringDecoder("utf8");
   for await (const chunk of chunks) {
-    pending +=
+    const bytes =
       typeof chunk === "string"
-        ? chunk
+        ? Buffer.from(chunk, "utf8")
         : Buffer.isBuffer(chunk)
-          ? chunk.toString("utf8")
-          : String(chunk);
+          ? chunk
+          : Buffer.from(String(chunk), "utf8");
+    pending += decoder.write(bytes);
     let newline = pending.indexOf("\n");
     while (newline >= 0) {
       yield pending.slice(0, newline).replace(/\r$/, "");
@@ -283,6 +292,7 @@ export async function* iterateLiveCommands(chunks: AsyncIterable<unknown>): Asyn
       newline = pending.indexOf("\n");
     }
   }
+  pending += decoder.end();
   if (pending.length > 0) {
     yield pending.replace(/\r$/, "");
   }
@@ -554,63 +564,82 @@ export async function runLiveSession(
   const pendingResults: Promise<void>[] = [];
   let failedSeen = false;
   let terminate = false;
-  for await (const line of io.stdin) {
-    const trimmed = line.trim();
-    if (trimmed.length === 0) {
-      continue;
+  let explicitClose = false;
+  let inputFailed = false;
+  try {
+    for await (const line of io.stdin) {
+      const trimmed = line.trim();
+      if (trimmed.length === 0) {
+        continue;
+      }
+      const parsed = parseLiveWireLine(trimmed);
+      if (!parsed.ok) {
+        io.stdout({
+          type: "error",
+          error: liveError(
+            "LIVE_COMMAND_INVALID",
+            parsed.message,
+            "protocol",
+            false,
+            started.state.provider,
+          ),
+        });
+        continue;
+      }
+      if (parsed.command.action === "close") {
+        explicitClose = true;
+        terminate = parsed.command.terminate;
+        break;
+      }
+      const pending = dispatchCommand(parsed.command)
+        .then(
+          (result: LiveTurnResult) => {
+            if (result.outcome === "failed") {
+              failedSeen = true;
+            }
+            let status: LiveStatus | string = result.outcome;
+            try {
+              status = manager.view(sessionId).status;
+            } catch {
+              status = "closed";
+            }
+            io.stdout({ type: "result", result, status });
+          },
+          (error: unknown) => {
+            io.stdout({
+              type: "error",
+              error: toLiveError(error, { stage: "protocol", provider: started.state.provider }),
+            });
+          },
+        );
+      pendingResults.push(pending);
     }
-    const parsed = parseLiveWireLine(trimmed);
-    if (!parsed.ok) {
-      io.stdout({
-        type: "error",
-        error: liveError(
-          "LIVE_COMMAND_INVALID",
-          parsed.message,
-          "protocol",
-          false,
-          started.state.provider,
-        ),
-      });
-      continue;
-    }
-    if (parsed.command.action === "close") {
-      terminate = parsed.command.terminate;
-      break;
-    }
-    const pending = dispatchCommand(parsed.command)
-      .then(
-        (result: LiveTurnResult) => {
-          if (result.outcome === "failed") {
-            failedSeen = true;
-          }
-          let status: LiveStatus | string = result.outcome;
-          try {
-            status = manager.view(sessionId).status;
-          } catch {
-            status = "closed";
-          }
-          io.stdout({ type: "result", result, status });
-        },
-        (error: unknown) => {
-          io.stdout({
-            type: "error",
-            error: toLiveError(error, { stage: "protocol", provider: started.state.provider }),
-          });
-        },
-      );
-    pendingResults.push(pending);
+  } catch (error) {
+    inputFailed = true;
+    io.stdout({
+      type: "error",
+      error: toLiveError(error, { stage: "protocol", provider: started.state.provider }),
+    });
   }
 
   // Terminal: stop accepting input, let in-flight commands finish (a
   // permission answer mid-grace must reach the provider before it dies),
   // then stop the provider and report the close honestly.
-  await Promise.race([
-    Promise.allSettled(pendingResults),
-    new Promise<void>((resolve) => {
-      // Ref'd: this grace is the process's only pending work while closing.
-      setTimeout(resolve, LIVE_CLOSE_DRAIN_MS);
-    }),
-  ]);
+  const settlePending = Promise.allSettled(pendingResults).then(() => undefined);
+  if (explicitClose || inputFailed) {
+    await Promise.race([
+      settlePending,
+      new Promise<void>((resolve) => {
+        // Ref'd: this grace is the process's only pending work while closing.
+        setTimeout(resolve, LIVE_CLOSE_DRAIN_MS);
+      }),
+    ]);
+  } else {
+    // EOF means no more commands, not "cancel the prompt that was already
+    // accepted". Drain every complete command before graceful close so a
+    // one-shot pipe/FIFO/TTY producer cannot kill its first turn early.
+    await settlePending;
+  }
   let closeDocument: {
     live_session_id: string;
     status: LiveStatus;
@@ -647,7 +676,7 @@ export async function runLiveSession(
   io.stdout({ type: "close", close: closeDocument });
   const stopStatus = closeDocument.stop?.status ?? "orphaned";
   io.stderr(`agent-hub live: session=${sessionId} ended status=${finalStatus} stop=${stopStatus}`);
-  return failedSeen || stopStatus === "orphaned" || finalStatus === "error" || finalStatus === "orphaned"
+  return inputFailed || failedSeen || stopStatus === "orphaned" || finalStatus === "error" || finalStatus === "orphaned"
     ? 1
     : 0;
 }

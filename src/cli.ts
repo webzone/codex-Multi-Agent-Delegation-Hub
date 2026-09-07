@@ -8,7 +8,7 @@ import { releaseFanOutArtifactRefs } from "./artifacts.js";
 import { createSession, resumeSession } from "./session.js";
 import {
   isLiveProvider,
-  iterateLiveCommands,
+  LiveStdinReader,
   probeLiveAgent,
   registerProductionLiveTransports,
   runLiveRecover,
@@ -834,21 +834,29 @@ async function execute(
     }
 
     case "live": {
-      return await runLiveSession(
-        {
-          provider: invocation.request.agent,
-          resumeId: invocation.request.resumeId,
-          workspace: invocation.request.workspace,
-          maxTextBytes: invocation.request.maxTextBytes,
-          allowDirty: invocation.request.allowDirty,
-          permissionPolicy: invocation.request.permissionPolicy,
-        },
-        {
-          stdin: iterateLiveCommands(process.stdin as AsyncIterable<unknown>),
-          stdout: (document) => output.stdout(`${JSON.stringify(document)}\n`),
-          stderr: output.stderr,
-        },
-      );
+      // Attach the stdin reader before provider provisioning.  The provider
+      // handshake can take seconds, and a TTY must not lose commands typed in
+      // that window (pipes/FIFOs happen to buffer them, which hid this race).
+      const stdin = new LiveStdinReader(process.stdin);
+      try {
+        return await runLiveSession(
+          {
+            provider: invocation.request.agent,
+            resumeId: invocation.request.resumeId,
+            workspace: invocation.request.workspace,
+            maxTextBytes: invocation.request.maxTextBytes,
+            allowDirty: invocation.request.allowDirty,
+            permissionPolicy: invocation.request.permissionPolicy,
+          },
+          {
+            stdin,
+            stdout: (document) => output.stdout(`${JSON.stringify(document)}\n`),
+            stderr: output.stderr,
+          },
+        );
+      } finally {
+        stdin.dispose();
+      }
     }
 
     case "live-recover": {
