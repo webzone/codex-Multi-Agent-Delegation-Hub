@@ -110,7 +110,8 @@ describe("result publication identity", () => {
       const stored = await fx.lc.result(s.id, 2);
       expect(stored.command_id).toBe(pub2.turn.command_id);
       expect(stored.outcome).toBe("succeeded");
-      expect(stored.final_text).toEqual({ text: "nope", truncated: false });
+      expect(pub2.turn.final_text).toEqual({ text: "nope", truncated: false });
+      expect(stored.final_text).toBeNull();
     } finally {
       await fx.cleanup();
     }

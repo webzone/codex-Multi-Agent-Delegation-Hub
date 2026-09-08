@@ -551,7 +551,9 @@ export class WorkspaceLifecycle {
       tree: capture.tree,
       ref,
       tree_changed: capture.advanced,
-      final_text: turn.final_text,
+      // Provider output is returned through the transient TurnResult only;
+      // durable custody stores identity/lineage, never assistant text.
+      final_text: null,
       usage: turn.usage,
       started_at: turn.started_at,
       finished_at: turn.finished_at,

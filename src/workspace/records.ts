@@ -165,6 +165,7 @@ export interface WorkspaceResultRecord {
   /** The custody ref holding `commit` reachable. */
   ref: string;
   tree_changed: boolean;
+  /** Always null on disk; provider output remains transient in TurnResult. */
   final_text: BoundedText | null;
   usage: Usage | null;
   started_at: string;
