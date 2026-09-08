@@ -105,6 +105,15 @@ function nextRetentionDeadline(records: readonly WorkspaceRecord[], nowMs: numbe
   return next;
 }
 
+export function earliestGcWake(
+  retentionDue: number | null,
+  retryAt: number | null,
+): number | null {
+  if (retentionDue === null) return retryAt;
+  if (retryAt === null) return retentionDue;
+  return Math.min(retentionDue, retryAt);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
@@ -208,7 +217,8 @@ async function updateAfterPass(
     const nowMs = Date.now();
     const retentionDue = nextRetentionDeadline(records, nowMs);
     const needsRetry = report?.retained.some((entry) => retryable(entry.code)) ?? true;
-    const nextDue = retentionDue ?? (needsRetry ? nowMs + RETRY_MS : null);
+    const retryAt = needsRetry ? nowMs + RETRY_MS : null;
+    const nextDue = earliestGcWake(retentionDue, retryAt);
     if (nextDue === null) {
       await removeFile(gcCoordinatorStatePath(home));
       return false;

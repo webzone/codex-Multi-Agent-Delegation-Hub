@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  earliestGcWake,
   GcCoordinator,
   gcCoordinatorStatePath,
   runGcWorker,
@@ -12,6 +13,13 @@ import {
 import { readJsonFile, removeTree, writeJsonAtomic } from "../src/workspace/home.js";
 
 describe("durable GC coordinator", () => {
+  it("does not postpone transient retries behind a later retention deadline", () => {
+    expect(earliestGcWake(120_000, 15_000)).toBe(15_000);
+    expect(earliestGcWake(120_000, null)).toBe(120_000);
+    expect(earliestGcWake(null, 15_000)).toBe(15_000);
+    expect(earliestGcWake(null, null)).toBeNull();
+  });
+
   it("keeps the earliest handoff deadline and starts an independent worker", async () => {
     const home = await mkdtemp(join(tmpdir(), "agent-hub-gc-coordinator-"));
     const started: string[] = [];
