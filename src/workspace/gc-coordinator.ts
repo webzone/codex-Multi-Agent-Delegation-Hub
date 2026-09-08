@@ -24,6 +24,7 @@ const GC_STATE_LOCK = "gc-state";
 const GC_WORKER_LOCK = "gc-worker";
 const GC_STATE_FILE = `${HUB_STATE_SUBDIR}/gc/coordinator.json`;
 const WORKER_POLL_MS = 30_000;
+const WORKER_LOCK_WAIT_MS = 5_000;
 const RETRY_MS = 15 * 60 * 1000;
 const MAX_TIMER_MS = 2_147_000_000;
 
@@ -233,7 +234,10 @@ export async function runGcWorker(home: string): Promise<void> {
     workerLock = await acquireRepositoryLock({
       commonDir: normalizedHome,
       name: GC_WORKER_LOCK,
-      waitMs: 0,
+      // A handoff can launch a replacement while the previous worker is
+      // finishing its last state update. Waiting closes that exit/wakeup race;
+      // the durable state is then re-read after the lease is acquired.
+      waitMs: WORKER_LOCK_WAIT_MS,
     });
   } catch {
     return;
