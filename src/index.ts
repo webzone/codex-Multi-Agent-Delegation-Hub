@@ -1,130 +1,150 @@
-export { delegate } from "./delegate.js";
-export { resolveAdapter, supportedAgents } from "./adapters/index.js";
+/**
+ * agent-hub — the public library surface of the rewrite.
+ *
+ * Provider-neutral by contract: one hub object (`AgentHub`) composing the
+ * Git-free interaction core (`InteractionKernel`, P1) and the durable
+ * workspace core (`WorkspaceLifecycle`). Interaction crosses ONLY the
+ * shipped provider transports, auto-selected per provider:
+ *
+ *   - omp    → omp-rpc          (RPC v2 dialect only; no v1 fallback)
+ *   - pi     → pi-rpc
+ *   - agy    → agy-stream-json
+ *   - hermes → hermes-acp
+ *
+ * There is deliberately no delegate / fanout / session / live / competition
+ * / judge / auto-merge vocabulary here, and no compatibility aliases for it.
+ */
 
-// v2 — Package 1: isolated fan-out foundation.
+export { AgentHubError, asDelegateError } from "./errors.js";
+
 export {
-  fanOut,
-  FANOUT_DEFAULT_CONCURRENCY_CAP,
-  FANOUT_MAX_CANDIDATES,
-  FANOUT_MAX_CONCURRENCY_LIMIT,
-  WORKTREE_ADMIN_LOCK_NAME,
-} from "./fanout.js";
-export type { FanOutDependencies } from "./fanout.js";
+  AgentHub,
+  AgentHubSupervisor,
+  processHubSupervisor,
+  WorkspaceLifecycle,
+  HUB_PROVIDERS,
+  HUB_TRANSPORT_BY_PROVIDER,
+  HUB_PROCESS_SESSION_QUOTA,
+  HUB_SESSION_QUOTA,
+  HUB_REF_NAMESPACE,
+  bridgeTransportFactory,
+  kernelCapabilities,
+  kernelizeResume,
+  liveResumeOf,
+  productionBridgedFactories,
+  productionBridgedProviderFactories,
+  AttachInputPump,
+  ATTACH_QUEUE_MAX_COMMANDS,
+  ATTACH_QUEUE_MAX_BYTES,
+  ATTACH_CLOSE_DRAIN_DEFAULT_MS,
+  type AttachInputEvent,
+  type AgentHubOptions,
+  type BridgedTransportFactory,
+  type HandoffDocument,
+  type HubCloseDocument,
+  type HubOpen,
+  type HubStartDocument,
+  type HubStatusDocument,
+  type LaunchFacts,
+  type LifecyclePhase,
+  type PreparedLaunch,
+  type ProviderFactoryLike,
+  type ReconcileReport,
+  type ReconcileSessionReport,
+  type ResumeOptions,
+  type StartOptions,
+  type TurnDocument,
+  type WorkspaceLifecycleOptions,
+} from "./hub/index.js";
 
-// v2 — artifact ref ownership: terminal callers release retained refs here.
-export { releaseCandidateRef, releaseFanOutArtifactRefs } from "./artifacts.js";
-
-// v2 — Package 4: opt-in auto-merge (verified fast-forward only).
-// `mergeCandidate` is internal on purpose: adoption may only follow a real
-// `runCompetition()` result through `autoMerge`, never a hand-supplied artifact.
-export { autoMerge, MERGE_LOCK_NAME } from "./merge.js";
-export type { AutoMergeInput, MergeDependencies } from "./merge.js";
-
-// v2 — competition, durable agent sessions, and the session state contracts.
-export * from "./competition.js";
-export * from "./session.js";
-export * from "./state.js";
-
-// v3 — live surfaces (CLI `agent-hub live`, MCP `live_session_*`). The live
-// vocabulary is separate: legacy `supportedAgents` stays `omp, agy, grok`;
-// `supportedLiveAgents` adds `pi`/`hermes` for live sessions only. The
-// authoritative production manager is the core `LiveSessionManager`; the
-// surfaces build it per workspace through `createLiveManager`, which registers
-// all four real transports and wires the durable live-state reader.
+// The interaction core stays directly constructible for embedders that bring
+// their own durable/lifecycle layer; its seams (DurableMirror,
+// onProviderSpawn, attached) are the supported extension points.
 export {
-  assertLiveSessionState,
-  createLiveManager,
-  durableLiveResumeSource,
-  getLiveResumeSource,
-  isLiveProvider,
-  isTerminalLiveStatus,
-  LIVE_DEFAULT_MAX_TEXT_BYTES,
-  LIVE_TRANSPORT_PAIRINGS,
-  liveTransportRegistry,
-  LiveSessionManager,
-  LiveTransportRegistry,
-  probeLiveAgent,
-  productionTransportFactories,
-  registerLiveTransport,
-  registerProductionLiveTransports,
-  runLiveSession,
-  setLiveResumeSource,
-  supportedLiveAgents,
-  validateLiveCapabilities,
-  wireDurableLiveResumeSource,
-} from "./live/index.js";
-export type {
-  CreateLiveManagerOptions,
-  LiveCloseResult,
-  LiveIo,
-  LiveLaunchInvocation,
-  LiveManagerOptions,
-  LiveProbeDocument,
-  LiveResumeFromStateRequest,
-  LiveResumeSource,
-  LiveRunnerDependencies,
-  LiveStartRequest,
-  LiveStartResult,
-} from "./live/index.js";
+  InteractionKernel,
+  DEFAULT_MAX_TEXT_BYTES,
+  DEFAULT_SESSION_QUOTA,
+  FOLLOW_UP_MAX_MESSAGE_BYTES,
+  FOLLOW_UP_QUEUE_MAX_BYTES,
+  FOLLOW_UP_QUEUE_MAX_MESSAGES,
+  SESSION_SCHEMA_VERSION,
+  asKernelError,
+  isCommandKind,
+  isPermissionDecision,
+  isTerminalStatus,
+  kernelError,
+  parseResumeState,
+  parseSessionRecord,
+  validateCapabilities,
+  CAPABILITY_NAMES,
+  COMMAND_KINDS,
+  OBSERVATION_NAMES,
+  SESSION_STATUSES,
+  TERMINAL_STATUSES,
+  boundEvent,
+  eventBytes,
+  EventRing,
+  EventSubscription,
+  truncateUtf8,
+  EVENT_MAX_BYTES,
+  RING_MAX_BYTES,
+  RING_MAX_EVENTS,
+  type BoundedText,
+  type CancelCommand,
+  type Capabilities,
+  type CapabilityClaim,
+  type CapabilityName,
+  type CapabilitySupport,
+  type CloseResult,
+  type Command,
+  type CommandKind,
+  type CommandOutcome,
+  type DurableMirror,
+  type ErrorStage,
+  type EventBody,
+  type EventKind,
+  type FollowUpCommand,
+  type KernelError,
+  type KernelOptions,
+  type KernelPhase,
+  type LaunchReport,
+  type LaunchRequest,
+  type ObservationName,
+  type PermissionDecision,
+  type PermissionPolicy,
+  type PermissionResponseCommand,
+  type ProcessFacts,
+  type ProbeResult,
+  type PromptCommand,
+  type ProviderFactory,
+  type ProviderId,
+  type ProbeDocument,
+  type ResumeState,
+  type ResumeVerification,
+  type SessionEvent,
+  type SessionId,
+  type SessionRecord,
+  type SessionStatus,
+  type StartRequest,
+  type StartResult,
+  type StatusCommand,
+  type SteerCommand,
+  type StopMode,
+  type StopReport,
+  type Transport,
+  type TransportDescriptor,
+  type TransportFactory,
+  type TransportId,
+  type TransportSelection,
+  type TurnResult,
+  type Usage,
+} from "./kernel/index.js";
 
-// v3 — the Gate 0 live contract types (identity, commands, events, durable
-// state, transport/factory interfaces).
+// Durable lifecycle vocabulary the hub documents carry (types only; the
+// underlying primitives are internal integration surface, not public API).
 export type {
-  CapabilitySupport,
-  LiveBoundedText,
-  LiveCapabilities,
-  LiveCapabilityClaim,
-  LiveCapabilityName,
-  LiveCheckpoint,
-  LiveCommand,
-  LiveCommandKind,
-  LiveCommandOutcome,
-  LiveError,
-  LiveErrorStage,
-  LiveEvent,
-  LiveEventBody,
-  LiveEventKind,
-  LiveLaunchReport,
-  LiveLaunchRequest,
-  LivePermissionDecision,
-  LiveProbeResult,
-  LiveProviderFactory,
-  LiveProviderId,
-  LiveProviderProcessFacts,
-  LiveSessionState,
   CheckpointReason,
+  LiveCheckpoint,
+  LiveSessionState,
   LiveStatus,
-  LiveStopMode,
-  LiveStopReport,
-  ProviderResumeState,
-  ResumeVerification,
-  LiveTransport,
-  LiveTransportDescriptor,
-  LiveTransportFactory,
-  LiveTransportId,
-  LiveTurnResult,
-  LiveUsage,
 } from "./live/types.js";
-
-export type {
-  AdapterExecutionResult,
-  AdapterRequest,
-  AgentAdapter,
-  CandidateArtifact,
-  CandidateJudgement,
-  CompetitionOutcome,
-  DelegateError,
-  DelegateRequest,
-  DelegateResult,
-  DelegateStatus,
-  ExecutionMode,
-  FanOutCandidateResult,
-  FanOutCandidateSpec,
-  FanOutRequest,
-  FanOutResult,
-  FanOutStatus,
-  JudgementVerdict,
-  MergeOutcome,
-  MergeStrategy,
-  RepositoryIdentity,
-} from "./types.js";

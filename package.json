@@ -1,9 +1,9 @@
 {
-  "name": "codex-multi-agent-delegation-hub",
-  "version": "0.1.0",
+  "name": "agent-hub",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "A small, safe delegation hub for local AI coding agents.",
+  "description": "Provider-neutral agent sessions with durable, checkpointed workspaces: omp (RPC v2), pi (RPC), agy (stream-json), hermes (ACP).",
   "engines": {
     "node": ">=20"
   },
@@ -15,7 +15,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
-    "delegate": "tsx src/cli.ts",
+    "hub": "tsx src/cli.ts",
     "mcp": "tsx src/mcp.ts"
   },
   "dependencies": {

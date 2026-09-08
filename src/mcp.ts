@@ -1,27 +1,35 @@
 #!/usr/bin/env node
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import { runCompetition, type CompetitionResult } from "./competition.js";
-import { delegate } from "./delegate.js";
-import { fanOut, FANOUT_MAX_CANDIDATES, FANOUT_MAX_CONCURRENCY_LIMIT } from "./fanout.js";
-import { autoMerge } from "./merge.js";
-import { releaseFanOutArtifactRefs } from "./artifacts.js";
-import { createSession, resumeSession } from "./session.js";
 import { AgentHubError, asDelegateError } from "./errors.js";
-import { supportedAgents } from "./adapters/index.js";
+import { AgentHub, HUB_PROVIDERS, type TurnDocument } from "./hub/agent-hub.js";
+import type { AgentHubOptions } from "./hub/agent-hub.js";
 import {
-  createLiveManager,
-  LiveSessionManager,
-  supportedLiveAgents,
-} from "./live/index.js";
-import { processLiveSupervisor } from "./live/supervisor.js";
-import type { LivePermissionDecision } from "./live/types.js";
-import type { DelegateError, MergeOutcome } from "./types.js";
-import { realpathSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+  AgentHubSupervisor,
+  processHubSupervisor,
+  type HubOpen,
+} from "./hub/supervisor.js";
+import { productionBridgedFactories } from "./hub/transport-adapter.js";
+import { isPermissionDecision } from "./kernel/contracts.js";
+
+/**
+ * agent-hub-mcp — the MCP surface of the rewrite.
+ *
+ * One provider-neutral session lifecycle, exposed as plain tools:
+ * start / prompt / follow_up / steer / cancel / status / permission /
+ * events / close / resume / list / handoff / gc / probe.
+ *
+ * Sessions live in the hub process that started them: every command for a
+ * session must name the same `workspace` so it routes back to the owning
+ * hub (cached per Git common dir by the process supervisor). After this
+ * process dies, `hub_gc` reconciles and `hub_resume` adopts the durable
+ * record from any host. No delegate/fanout/competition/live vocabulary.
+ */
 
 type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
@@ -46,11 +54,7 @@ function failTool(error: { code: string; message: string }): ToolResult {
   };
 }
 
-/**
- * Wrap a handler so any throw becomes a structured error tool result: callers
- * always get content + isError back and no transport-level exception escapes.
- */
-
+/** Any throw becomes a structured error tool result; nothing escapes raw. */
 async function guardTool(handler: () => Promise<ToolResult>): Promise<ToolResult> {
   try {
     return await handler();
@@ -59,486 +63,303 @@ async function guardTool(handler: () => Promise<ToolResult>): Promise<ToolResult
   }
 }
 
-function mergeFailed(merge: MergeOutcome | null): boolean {
-  return merge !== null && (merge.error !== null || !merge.clean);
+export interface HubToolDependencies {
+  /** Test seam: replaces hub construction entirely. */
+  openHub?: HubOpen;
+  /** Options merged into every hub construction (injected factories etc.). */
+  hubOptions?: AgentHubOptions;
+  /** Test seam: replace the process supervisor. */
+  supervisor?: AgentHubSupervisor;
 }
 
-/**
- * Tool-level seams mirroring the core dependency pattern (`FanOutDependencies`,
- * `MergeDependencies` …): production defaults are the real pipeline; focused
- * tests inject a throwing operation to pin the error-evidence contract.
- */
-export interface HubToolDependencies {
-  fanOut?: typeof fanOut;
-  runCompetition?: typeof runCompetition;
-  autoMerge?: typeof autoMerge;
-  releaseRefs?: typeof releaseFanOutArtifactRefs;
-  /**
-   * v3 live surfaces: the CORE manager (the one from `live/manager.ts`).
-   * Production builds one per workspace through `liveManagerFor` (which
-   * resolves the repository from the requested workspace, registers all four
-   * real transports, and wires the durable live-state reader). Focused tests
-   * inject a manager wired to scripted transports.
-   */
-  live?: LiveSessionManager;
-  liveManagerFor?: (workspace: string) => Promise<LiveSessionManager>;
+const workspaceShape = z.string().min(1).default(process.cwd());
+
+function turnIsError(turn: TurnDocument): boolean {
+  return (
+    turn.outcome === "failed" ||
+    turn.outcome === "unsupported" ||
+    turn.checkpoint_error !== undefined
+  );
 }
 
 export function createHubServer(dependencies: HubToolDependencies = {}): McpServer {
-  const fanOutFn = dependencies.fanOut ?? fanOut;
-  const runCompetitionFn = dependencies.runCompetition ?? runCompetition;
-  const autoMergeFn = dependencies.autoMerge ?? autoMerge;
-  const releaseRefsFn = dependencies.releaseRefs ?? releaseFanOutArtifactRefs;
-  const injectedLive = dependencies.live ?? null;
-  const createManager =
-    dependencies.liveManagerFor ?? ((workspace: string) => createLiveManager(workspace));
-  // Which manager owns which live session (the manager holds the live
-  // transport; commands must route back to the process that started it).
-  // The mapping is released ONLY once a session has truly finished: an
-  // orphaned close keeps its route so a later terminate-authorized close
-  // reaches the ORIGINAL manager that still owns the transport.
-  const liveOwners = new Map<string, LiveSessionManager>();
-  async function liveManagerForWorkspace(workspace: string): Promise<LiveSessionManager> {
-    // An injected single manager keeps the legacy one-instance routing; the
-    // production path goes through the ONE process-level supervisor, so
-    // every workspace of a repository reuses the manager for its canonical
-    // Git common dir and the live-session quota stays total for this process.
-    return injectedLive ?? (await processLiveSupervisor.managerFor(workspace, createManager));
+  const supervisor = dependencies.supervisor ?? processHubSupervisor;
+  const open: HubOpen =
+    dependencies.openHub ??
+    ((workspace, options) => AgentHub.open(workspace, { ...dependencies.hubOptions, ...options }));
+
+  async function hubFor(workspace: string): Promise<AgentHub> {
+    return supervisor.hubFor(workspace, dependencies.hubOptions ?? {}, open);
   }
-  async function liveLaunch<T>(manager: LiveSessionManager, run: () => Promise<T>): Promise<T> {
-    if (injectedLive !== null) {
-      // The injected manager's own process quota governs a test-owned
-      // instance; the shared supervisor never counts or caps a manager it
-      // did not build and does not route.
-      return await run();
-    }
-    return await processLiveSupervisor.launch(manager, run);
+
+  function launchGuarded(hub: AgentHub, run: () => Promise<ToolResult>): Promise<ToolResult> {
+    // The supervisor slot spans the whole launch; the tool result is the
+    // launch outcome, so the guard composes rather than nests.
+    return supervisor.launch(hub, run);
   }
-  function liveOwner(liveSessionId: string): LiveSessionManager {
-    const owner = injectedLive ?? liveOwners.get(liveSessionId);
-    if (!owner) {
-      throw new AgentHubError(
-        "LIVE_SESSION_NOT_FOUND",
-        `no live session "${liveSessionId}" is owned by this hub process; commands must route to the process that started it`,
-      );
-    }
-    return owner;
-  }
-  const server = new McpServer({
-    name: "codex-multi-agent-delegation-hub",
-    version: "0.1.0",
-  });
+
+  const server = new McpServer({ name: "agent-hub", version: "0.2.0" });
 
   server.registerTool(
-    "delegate_task",
+    "hub_start",
     {
-      description: "Delegate a coding task to a local AI coding agent.",
+      description:
+        "Start a provider-neutral agent session in a hub-owned checkpointed worktree. " +
+        "Providers: omp (RPC v2 only), pi (RPC), agy (stream-json), hermes (ACP); the transport is auto-selected. " +
+        `Shipped ids: ${HUB_PROVIDERS.join(", ")}.`,
       inputSchema: {
-        task: z.string().min(1),
-        agent: z.enum(supportedAgents),
-        mode: z.enum(["direct", "isolated"]).default("isolated"),
-        workspace: z.string().min(1).default(process.cwd()),
+        provider: z.enum(HUB_PROVIDERS),
+        transport: z.string().min(1).optional(),
+        workspace: workspaceShape,
+        permission_policy: z.enum(["deny", "interactive"]).default("deny"),
+        max_text_bytes: z.number().int().positive().optional(),
         allow_dirty: z.boolean().default(false),
-        max_output_bytes: z.number().int().positive().optional(),
       },
     },
-    async ({ task, agent, mode, workspace, allow_dirty, max_output_bytes }) => {
-      const result = await delegate({
-        task,
-        agent,
-        mode,
-        workspace,
-        allowDirty: allow_dirty,
-        maxOutputBytes: max_output_bytes,
-      });
-
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        structuredContent: { ...result } as Record<string, unknown>,
-        isError: result.status === "failure",
-      };
-    },
-  );
-
-  const fanoutShape = {
-    workspace: z.string().min(1).default(process.cwd()),
-    candidates: z
-      .array(
-        z.object({
-          label: z.string().optional(),
-          task: z.string().min(1),
-          agent: z.enum(supportedAgents),
-        }),
-      )
-      .max(FANOUT_MAX_CANDIDATES),
-    max_concurrency: z.number().int().min(1).max(FANOUT_MAX_CONCURRENCY_LIMIT).optional(),
-    allow_dirty: z.boolean().default(false),
-    max_output_bytes: z.number().int().positive().optional(),
-  };
-
-  server.registerTool(
-    "fanout_candidates",
-    {
-      description:
-        "Run isolated candidate agents over one shared base commit. Candidates never execute in the caller checkout and nothing is merged by this tool. Retained artifact refs are released (CAS-safe) before the tool returns, so review candidates from the returned diffs; a ref that could not be released is reported in `ref_cleanup_errors` and makes the tool report `isError`.",
-      inputSchema: fanoutShape,
-    },
-    async ({ workspace, candidates, max_concurrency, allow_dirty, max_output_bytes }) =>
+    async ({ provider, transport, workspace, permission_policy, max_text_bytes, allow_dirty }) =>
       guardTool(async () => {
-        const result = await fanOutFn({
-          workspace,
-          candidates,
-          maxConcurrency: max_concurrency,
-          allowDirty: allow_dirty,
-          maxOutputBytes: max_output_bytes,
-        });
-        // This tool result is the last consumer of the candidate artifact
-        // refs: release them CAS-safe (externally retargeted refs survive).
-        const cleanupErrors = await releaseRefsFn(workspace, result);
-        const document =
-          cleanupErrors.length > 0
-            ? { ...result, ref_cleanup_errors: cleanupErrors }
-            : result;
-        // A partial or fully-failed fan-out is an operation failure, and so is
-        // a ref this tool promised to release but could not.
-        return okTool(document, result.status !== "success" || cleanupErrors.length > 0);
-      }),
-  );
-
-  server.registerTool(
-    "compete_candidates",
-    {
-      description:
-        "Run isolated candidates, have a judge select among retained artifacts, and optionally adopt the internal winner by verified fast-forward. Retained artifact refs are released (CAS-safe) before the tool returns; refs this tool could not release are reported in `ref_cleanup_errors` and make the tool report `isError`.",
-      inputSchema: {
-        ...fanoutShape,
-        judge_agent: z.enum(supportedAgents),
-        auto_merge: z.boolean().default(false),
-      },
-    },
-    async ({
-      workspace,
-      candidates,
-      max_concurrency,
-      allow_dirty,
-      max_output_bytes,
-      judge_agent,
-      auto_merge,
-    }) =>
-      guardTool(async () => {
-        const fan = await fanOutFn({
-          workspace,
-          candidates,
-          maxConcurrency: max_concurrency,
-          allowDirty: allow_dirty,
-          maxOutputBytes: max_output_bytes,
-        });
-        let competition: CompetitionResult | null = null;
-        let merge: MergeOutcome | null = null;
-        let operationError: DelegateError | null = null;
-        let cleanupErrors: DelegateError[] = [];
-        try {
-          competition = await runCompetitionFn({
-            fan_out: fan,
-            strategy: "judge",
-            judge_agent,
-            workspace,
-            maxOutputBytes: max_output_bytes,
-          });
-          merge = auto_merge
-            ? await autoMergeFn({ workspace, fan_out: fan, competition })
-            : null;
-        } catch (error) {
-          // Caught *inside* the handler: like the CLI terminal path, the
-          // operation's error becomes the tool's error document, and the
-          // ref-release evidence below still rides along with it. A throw
-          // out of here would discard every cleanup fact collected after it.
-          operationError = asDelegateError(error);
-        } finally {
-          // Competition eligibility and merge ref verification have consumed
-          // the retained artifact refs by now; release them CAS-safe in all
-          // cases, including a judge or merge throw.
-          cleanupErrors = await releaseRefsFn(workspace, fan);
-        }
-        if (operationError !== null) {
-          return okTool(
-            {
-              error: operationError,
-              ...(cleanupErrors.length > 0
-                ? { ref_cleanup_errors: cleanupErrors }
-                : {}),
-            },
-            true,
-          );
-        }
-        const document = {
-          fan_out: fan,
-          competition,
-          merge,
-          ...(cleanupErrors.length > 0 ? { ref_cleanup_errors: cleanupErrors } : {}),
-        };
-        return okTool(
-          document,
-          fan.status !== "success" ||
-            competition?.error !== null ||
-            mergeFailed(merge) ||
-            cleanupErrors.length > 0,
+        const hub = await hubFor(workspace);
+        return launchGuarded(hub, async () =>
+          okTool(
+            await hub.start({
+              provider,
+              transport,
+              permission_policy,
+              max_text_bytes,
+              allow_dirty,
+            }),
+          ),
         );
       }),
   );
 
-  const sessionCreateShape = {
-    workspace: z.string().min(1).default(process.cwd()),
-    agent: z.enum(supportedAgents),
-    task: z.string().min(1),
-    allow_dirty: z.boolean().default(false),
-    max_output_bytes: z.number().int().positive().optional(),
+  const sessionShape = {
+    session_id: z.string().min(1),
+    workspace: workspaceShape,
   };
 
+  const textShape = { text: z.string().min(1) };
+
+  interface CommandArgs {
+    session_id: string;
+    workspace: string;
+    [key: string]: unknown;
+  }
+
+  const commandTool = (
+    name: string,
+    description: string,
+    extra: Record<string, z.ZodType>,
+    run: (hub: AgentHub, args: CommandArgs) => Promise<TurnDocument>,
+  ): void => {
+    server.registerTool(
+      name,
+      { description, inputSchema: { ...sessionShape, ...extra } },
+      async (args) =>
+        guardTool(async () => {
+          // zod has validated this shape before the handler runs.
+          const typed = args as unknown as CommandArgs;
+          const hub = await hubFor(typed.workspace);
+          const turn = await run(hub, typed);
+          return okTool(turn, turnIsError(turn));
+        }),
+    );
+  };
+
+  /** `text` is zod-validated (`z.string().min(1)`) on all three callers. */
+  const requireText = (args: CommandArgs): string => args.text as string;
+
+  commandTool(
+    "hub_prompt",
+    "Send the initial task to an attached session (accepted exactly once, while idle). Settles at the turn boundary; the checkpoint chain is pinned for it.",
+    textShape,
+    (hub, args) => hub.prompt(args.session_id, requireText(args)),
+  );
+  commandTool(
+    "hub_follow_up",
+    "Queue/deliver the next-turn input. Delivered immediately when idle, queued (or provider-queued on a native claim) while a turn runs.",
+    textShape,
+    (hub, args) => hub.followUp(args.session_id, requireText(args)),
+  );
+  commandTool(
+    "hub_steer",
+    "Mid-turn guidance. Refused as `unsupported` when the launch snapshot does not claim steer delivery.",
+    textShape,
+    (hub, args) => hub.steer(args.session_id, requireText(args)),
+  );
+  commandTool(
+    "hub_cancel",
+    "Abort the in-flight turn (native or signal path per the launch snapshot). No turn in flight is an honest no-op.",
+    { reason: z.string().optional() },
+    (hub, args) =>
+      hub.cancel(args.session_id, typeof args.reason === "string" ? args.reason : null),
+  );
+  commandTool(
+    "hub_command_status",
+    "Ask for authoritative progress. Forwarded when the status claim is native; answered from stream evidence when derived.",
+    {},
+    (hub, args) => hub.requestStatus(args.session_id),
+  );
+  commandTool(
+    "hub_permission",
+    "Answer an observed permission_request. Exactly two verdicts (allow_once, deny); anything else is a caller error.",
+    { request_id: z.string().min(1), decision: z.string().min(1), note: z.string().nullable().optional() },
+    (hub, args) => {
+      if (!isPermissionDecision(args.decision)) {
+        throw new AgentHubError(
+          "COMMAND_INVALID",
+          `decision "${String(args.decision)}" is outside the contract vocabulary (allow_once, deny)`,
+        );
+      }
+      return hub.respondPermission(
+        args.session_id,
+        args.request_id as string,
+        args.decision,
+        typeof args.note === "string" ? args.note : null,
+      );
+    },
+  );
+
   server.registerTool(
-    "session_create",
+    "hub_events",
     {
       description:
-        "Run one isolated agent turn and persist its artifact for filesystem continuation.",
-      inputSchema: sessionCreateShape,
+        "One-shot event replay after a cursor for an ATTACHED session (this process). Seqs are gapless; `next_cursor` is the resume point. " +
+        "An `expired` verdict names the oldest replayable cursor — resynchronize from durable state, never from a guess.",
+      inputSchema: { ...sessionShape, after: z.number().int().min(0).default(0) },
     },
-    async ({ workspace, agent, task, allow_dirty, max_output_bytes }) =>
+    async ({ session_id, workspace, after }) =>
       guardTool(async () => {
-        const session = await createSession({
-          workspace,
-          agent,
-          task,
-          allowDirty: allow_dirty,
-          maxOutputBytes: max_output_bytes,
-        });
-        return okTool(session, session.run.status !== "success" || session.cleanup_error !== null);
+        const hub = await hubFor(workspace);
+        return okTool(hub.eventsAfter(session_id, after));
       }),
   );
 
   server.registerTool(
-    "session_resume",
+    "hub_close",
     {
       description:
-        "Resume a persisted agent session from its latest artifact commit in a fresh isolated worktree.",
+        "Close an attached session. Teardown (checkpoint, worktree removal, lease release) runs only when shutdown is PROVEN; " +
+        "an unproven stop answers `orphaned` with ownership retained — a later `terminate` close or `hub_gc` finishes the job.",
+      inputSchema: {
+        ...sessionShape,
+        mode: z.enum(["graceful", "terminate"]).default("graceful"),
+      },
+    },
+    async ({ session_id, workspace, mode }) =>
+      guardTool(async () => {
+        const hub = await hubFor(workspace);
+        const document = await hub.close(session_id, mode);
+        supervisor.retireIdle(hub);
+        return okTool(document, document.cleanup_errors.length > 0);
+      }),
+  );
+
+  server.registerTool(
+    "hub_resume",
+    {
+      description:
+        "Adopt a TERMINAL durable session from this repository's store: fresh hub worktree at the checkpoint-chain head, the recorded provider resume handle replayed and identity-verified, the SAME durable line advanced. " +
+        "Unknown ids fail; leased or non-terminal records must be reconciled with hub_gc first.",
       inputSchema: {
         session_id: z.string().min(1),
-        task: z.string().min(1),
-        workspace: z.string().min(1).default(process.cwd()),
-        max_output_bytes: z.number().int().positive().optional(),
+        workspace: workspaceShape,
+        transport: z.string().min(1).optional(),
+        permission_policy: z.enum(["deny", "interactive"]).default("deny"),
+        max_text_bytes: z.number().int().positive().optional(),
+        allow_dirty: z.boolean().default(false),
       },
     },
-    async ({ session_id, task, workspace, max_output_bytes }) =>
+    async ({ session_id, workspace, transport, permission_policy, max_text_bytes, allow_dirty }) =>
       guardTool(async () => {
-        const session = await resumeSession({
-          session_id,
-          task,
-          workspace,
-          maxOutputBytes: max_output_bytes,
-        });
-        return okTool(session, session.run.status !== "success" || session.cleanup_error !== null);
+        const hub = await hubFor(workspace);
+        return launchGuarded(hub, async () =>
+          okTool(
+            await hub.resume(session_id, {
+              transport,
+              permission_policy,
+              max_text_bytes,
+              allow_dirty,
+            }),
+          ),
+        );
       }),
   );
 
-
-  // ---------------------------------------------------------------------
-  // v3 live surfaces (additive): the CORE manager behind start/resume/
-  // command/events/close, with the durable live-state reader wired by the
-  // production bootstrap.
-  // ---------------------------------------------------------------------
-
   server.registerTool(
-    "live_session_start",
+    "hub_status",
     {
       description:
-        "Start a long-lived interactive live session (v3) for one provider (omp, agy, pi, hermes). The provider runs in a hub-owned isolated OS-temp worktree materialized from this workspace; durable state, the lifetime lease, quotas, and the bounded event ring are all owned by the core live manager. Managers are shared per repository (canonical Git common dir) and this hub process enforces the live-session quota TOTAL across every repository it serves; each Git common dir still caps at its own durable lease quota. `allow_dirty` is the caller-worktree gate (default false refuses local changes); `permission_policy` binds the launched session (omitted means deny). pi/hermes stay live-only and remain rejected by the legacy tools. Fails honestly when the provider probe is not found.",
+        "One session's durable document (lifecycle state + kernel mirror record + lease facts), or every durable session in this repository when no id is given.",
       inputSchema: {
-        agent: z.enum(supportedLiveAgents),
-        workspace: z.string().min(1).default(process.cwd()),
         session_id: z.string().min(1).optional(),
-        max_output_bytes: z.number().int().positive().optional(),
-        allow_dirty: z.boolean().default(false),
-        permission_policy: z.enum(["deny", "interactive"]).default("deny"),
+        workspace: workspaceShape,
       },
     },
-    async ({ agent, workspace, session_id, max_output_bytes, allow_dirty, permission_policy }) =>
+    async ({ session_id, workspace }) =>
       guardTool(async () => {
-        const manager = await liveManagerForWorkspace(workspace);
-        const started = await liveLaunch(manager, () =>
-          manager.start({
-            provider: agent,
-            session_id: session_id ?? null,
-            max_text_bytes: max_output_bytes,
-            allow_dirty,
-            permission_policy,
-          }),
-        );
-        liveOwners.set(started.live_session_id, manager);
-        return okTool(started);
-      }),
-  );
-
-  server.registerTool(
-    "live_session_resume",
-    {
-      description:
-        "Resume a durable live session (hub-live-id): loads the agent-hub-live/v1 record, refuses live/leased sessions (an orphan's lease must be finished or recovered first), materializes a FRESH hub worktree at current_commit, launches the provider with the recorded opaque resume state ON THE RECORDED TRANSPORT (a different transport is refused, never silently substituted), verifies provider identity, and CAS-advances the existing live ref (never a new ref). `allow_dirty` and `permission_policy` are re-selected explicitly for the resumed launch — a policy never silently carries over from the prior run: omitted means deny. A resume whose identity does not round-trip fails; there is no fake continuation.",
-      inputSchema: {
-        live_session_id: z.string().min(1),
-        workspace: z.string().min(1).default(process.cwd()),
-        max_output_bytes: z.number().int().positive().optional(),
-        allow_dirty: z.boolean().default(false),
-        permission_policy: z.enum(["deny", "interactive"]).default("deny"),
-      },
-    },
-    async ({ live_session_id, workspace, max_output_bytes, allow_dirty, permission_policy }) =>
-      guardTool(async () => {
-        const manager = await liveManagerForWorkspace(workspace);
-        const resumed = await liveLaunch(manager, () =>
-          manager.resumeFromState({
-            live_session_id,
-            max_text_bytes: max_output_bytes,
-            allow_dirty,
-            permission_policy,
-          }),
-        );
-        liveOwners.set(resumed.live_session_id, manager);
-        return okTool(resumed);
-      }),
-  );
-
-  server.registerTool(
-    "live_session_command",
-    {
-      description:
-        "Inject one hub command into a live session: prompt (once, while idle), follow_up (native claims are delivered immediately and tracked provider-queued; hub-queued claims wait for the terminal boundary), steer (mid-turn, when claimed), cancel, status (answered from stream evidence when derived), or permission_response (answering an observed permission_request with allow_once or deny only — any other verdict is rejected, never converted). Returns the LiveTurnResult plus the session status; capability-refused commands come back outcome \"unsupported\" with a stage \"capability\" error and are never delivered.",
-      inputSchema: {
-        live_session_id: z.string().min(1),
-        action: z.enum(["prompt", "follow_up", "steer", "cancel", "status", "permission_response"]),
-        text: z.string().optional(),
-        reason: z.string().nullable().optional(),
-        request_id: z.string().optional(),
-        decision: z.enum(["allow_once", "deny"]).optional(),
-        note: z.string().nullable().optional(),
-      },
-    },
-    async ({ live_session_id, action, text, reason, request_id, decision, note }) =>
-      guardTool(async () => {
-        const manager = liveOwner(live_session_id);
-        const invalid = (message: string) =>
-          failTool({ code: "LIVE_COMMAND_INVALID", message });
-        let result;
-        switch (action) {
-          case "prompt":
-          case "follow_up":
-          case "steer": {
-            if (typeof text !== "string") {
-              return invalid(`command "${action}" requires a "text" string`);
-            }
-            result =
-              action === "prompt"
-                ? await manager.prompt(live_session_id, text)
-                : action === "follow_up"
-                  ? await manager.followUp(live_session_id, text)
-                  : await manager.steer(live_session_id, text);
-            break;
-          }
-          case "cancel": {
-            result = await manager.cancel(live_session_id, reason ?? null);
-            break;
-          }
-          case "status": {
-            result = await manager.requestStatus(live_session_id);
-            break;
-          }
-          case "permission_response": {
-            if (typeof request_id !== "string" || request_id.length === 0) {
-              return invalid('command "permission_response" requires "request_id"');
-            }
-            const verdict: LivePermissionDecision | null =
-              decision === "allow_once" || decision === "deny" ? decision : null;
-            if (verdict === null) {
-              return invalid('command "permission_response" requires decision allow_once or deny');
-            }
-            result = await manager.respondPermission(
-              live_session_id,
-              request_id,
-              verdict,
-              note ?? null,
-            );
-            break;
-          }
+        const hub = await hubFor(workspace);
+        if (session_id === undefined) {
+          return okTool({ sessions: await hub.list() });
         }
-        let status: string = result.outcome;
-        try {
-          status = manager.view(live_session_id).status;
-        } catch {
-          status = "closed";
-        }
-        return okTool({ result, status }, result.outcome === "failed" || result.outcome === "unsupported");
+        return okTool(await hub.status(session_id));
       }),
   );
 
   server.registerTool(
-    "live_session_events",
+    "hub_handoff",
     {
       description:
-        "Poll normalized live events after a cursor (events are per-session, 1-based, no gaps). Returns the replay page and the next cursor; when the bounded ring already evicted events behind the cursor this fails with EVENT_CURSOR_EXPIRED (resynchronize from the durable record) instead of silently dropping events.",
-      inputSchema: {
-        live_session_id: z.string().min(1),
-        cursor: z.number().int().nonnegative().default(0),
-      },
+        "Result handoff for a released terminal session: the checkpoint chain (ref, commits, reasons), changed files, diff stat, and the human review/adopt command. Never merges anything.",
+      inputSchema: { session_id: z.string().min(1), workspace: workspaceShape },
     },
-    async ({ live_session_id, cursor }) =>
-      guardTool(async () => {
-        const page = liveOwner(live_session_id).eventsAfter(live_session_id, cursor);
-        return okTool(page);
-      }),
+    async ({ session_id, workspace }) =>
+      guardTool(async () =>
+        okTool(await (await hubFor(workspace)).handoff(session_id)),
+      ),
   );
 
   server.registerTool(
-    "live_session_close",
+    "hub_gc",
     {
       description:
-        "Stop a live session's provider (graceful, or terminate with bounded SIGKILL escalation authorized) and report what shutdown proved: `closed` only with leader reap plus proof the owned process group is gone, `orphaned` otherwise (the lease and worktree then stay for recovery). An orphaned close is an isError AND keeps the session routed inside this hub process: a later close with `terminate: true` reaches the manager that still owns the transport and finishes the shutdown there. The route is released only after the session has truly finished.",
-      inputSchema: {
-        live_session_id: z.string().min(1),
-        terminate: z.boolean().default(false),
-      },
+        "Safe garbage collection for this repository: re-prove every lease, reap provably-orphaned provider groups, pin surviving worktrees as crash_recovery checkpoints, rewrite orphaned state, release leases last, retry worktree removals, prune. `dry_run` reports every intended action without touching anything.",
+      inputSchema: { workspace: workspaceShape, dry_run: z.boolean().default(false) },
     },
-    async ({ live_session_id, terminate }) =>
+    async ({ workspace, dry_run }) =>
       guardTool(async () => {
-        const owner = liveOwner(live_session_id);
-        const close = await owner.close(live_session_id, terminate ? "terminate" : "graceful");
-        // `orphaned` is NOT finished: the original manager still holds the
-        // transport, lease, and worktree, and only it can complete an
-        // authorized terminate. Keep the mapping on an orphan; once the
-        // shutdown is proven finished the mapping goes, and a manager that
-        // now runs nothing may leave the process-level cache.
-        const orphaned =
-          close.stop === null ? close.state.status === "orphaned" : close.stop.status === "orphaned";
-        if (!orphaned) {
-          liveOwners.delete(live_session_id);
-        }
-        processLiveSupervisor.retireIdle(owner);
-        return okTool(close, orphaned);
-      }),
-  );
-
-  server.registerTool(
-    "live_session_recover",
-    {
-      description:
-        "Conservatively reconcile one repository's durable live leases with what the OS and the repository prove: an orphaned provider is reaped before its surviving worktree is pinned and the record rewritten to orphaned, cleanup runs only on proven death, and any classification this hub cannot prove (foreign host, reused pid, corrupt record) is reported `manual` and never acted on. Sessions owned by this hub process are kept-live and untouched. The report is an isError only when at least one lease ended `manual`.",
-      inputSchema: {
-        workspace: z.string().min(1).default(process.cwd()),
-      },
-    },
-    async ({ workspace }) =>
-      guardTool(async () => {
-        const manager = await liveManagerForWorkspace(workspace);
-        const report = await manager.recover();
-        processLiveSupervisor.retireIdle(manager);
+        const report = await (await hubFor(workspace)).gc({ dry_run });
         return okTool(report, report.sessions.some((session) => session.outcome === "manual"));
+      }),
+  );
+
+  server.registerTool(
+    "hub_probe",
+    {
+      description:
+        "Honest capability probe of the installed provider commands (launches nothing). omp answers found=false unless its RPC v2 dialect evidence holds — the hub will then refuse omp launches rather than fall back to v1.",
+      inputSchema: { provider: z.enum(HUB_PROVIDERS).optional() },
+    },
+    async ({ provider }) =>
+      guardTool(async () => {
+        const bridges = dependencies.hubOptions?.transportFactories ?? productionBridgedFactories();
+        const documents: unknown[] = [];
+        for (const factory of bridges) {
+          if (provider !== undefined && factory.provider !== provider) continue;
+          const probe = await factory.probe();
+          documents.push({
+            provider: factory.provider,
+            transport: factory.transport,
+            ...probe,
+          });
+        }
+        if (provider !== undefined && documents.length === 0) {
+          throw new AgentHubError(
+            "TRANSPORT_UNAVAILABLE",
+            `no hub transport pairs with provider "${provider}"`,
+          );
+        }
+        return okTool({ probes: documents });
       }),
   );
 
@@ -546,12 +367,10 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
 }
 
 function isEntrypoint(): boolean {
-  if (!process.argv[1]) {
-    return false;
-  }
-
+  const invoked = process.argv[1];
+  if (invoked === undefined) return false;
   try {
-    return realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(invoked);
   } catch {
     return false;
   }

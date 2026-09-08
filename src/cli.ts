@@ -1,892 +1,775 @@
 #!/usr/bin/env node
-
-import { delegate } from "./delegate.js";
-import { runCompetition, type CompetitionResult } from "./competition.js";
-import { fanOut, FANOUT_MAX_CANDIDATES } from "./fanout.js";
-import { autoMerge } from "./merge.js";
-import { releaseFanOutArtifactRefs } from "./artifacts.js";
-import { createSession, resumeSession } from "./session.js";
-import {
-  isLiveProvider,
-  LiveStdinReader,
-  probeLiveAgent,
-  registerProductionLiveTransports,
-  runLiveRecover,
-  runLiveSession,
-  supportedLiveAgents,
-} from "./live/index.js";
-import { asDelegateError } from "./errors.js";
-import { supportedAgents } from "./adapters/index.js";
-import type {
-  DelegateError,
-  DelegateRequest,
-  ExecutionMode,
-  FanOutCandidateSpec,
-  FanOutRequest,
-  FanOutResult,
-  MergeOutcome,
-} from "./types.js";
-import type { CreateSessionRequest, ResumeSessionRequest } from "./session.js";
-import type { LivePermissionPolicy, LiveProviderId } from "./live/types.js";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const usage = `Usage:
-  agent-hub delegate --agent <omp|agy|grok> --mode <direct|isolated> [options] <task>
-  agent-hub fanout --agent <a> [--agent <a>...] --task "<text>" [--task "<text>"...] [options]
-  agent-hub session create --agent <a> --task "<text>" [options]
-  agent-hub session resume <session-id> --task "<text>" [options]
-  agent-hub live --agent <omp|agy|pi|hermes> [--workspace <path>] [options]
-  agent-hub live --resume <hub-live-id> [--workspace <path>] [options]
-  agent-hub live recover [--workspace <path>]
-  agent-hub live probe --agent <omp|agy|pi|hermes>
+import { AgentHubError, asDelegateError } from "./errors.js";
+import {
+  AgentHub,
+  HUB_PROVIDERS,
+  type TurnDocument,
+} from "./hub/agent-hub.js";
+import type { AgentHubOptions } from "./hub/agent-hub.js";
+import {
+  AgentHubSupervisor,
+  type HubOpen,
+} from "./hub/supervisor.js";
+import {
+  AttachInputPump,
+  ATTACH_CLOSE_DRAIN_DEFAULT_MS,
+} from "./hub/attach-io.js";
+import { productionBridgedFactories } from "./hub/transport-adapter.js";
+import { isPermissionDecision } from "./kernel/contracts.js";
+import type { PermissionPolicy } from "./kernel/contracts.js";
 
-Options:
-  --workspace <path>   Workspace to operate on (default: current directory)
-  --allow-dirty        Allow execution when the workspace has local changes
-  --max-output-bytes   Limit captured stdout, stderr, and diff output
-  --json               Emit the unified JSON result (the default)
-  --help               Show this help
-  --                   End of options: everything after it is the delegate
-                       task, so a task may literally start with "--"
+/**
+ * agent-hub — the command-line surface of the rewrite.
+ *
+ * Every command answers with ONE JSON document on stdout; human guidance
+ * goes to stderr. Exit codes: 0 success, 1 structured operation failure
+ * (the JSON document carries `error`), 2 usage/parse error.
+ *
+ * Real-time interaction (prompt, follow_up, steer, cancel, status,
+ * permission) lives in `--attach` mode: long-lived NDJSON — one command
+ * per line on stdin, `session`/`event`/`result`/`error`/`close` documents
+ * on stdout. A session belongs to the process that launched it; after a
+ * hub-process loss, reconcile with `gc` and continue with `resume`.
+ */
 
-Fan-out options (fanout):
-  --agent <a>          Candidate agent; repeat for one candidate per agent
-                       (at most ${FANOUT_MAX_CANDIDATES} candidates total)
-  --task "<text>"      Candidate task; repeat to pair 1:1 with --agent in order,
-                       or pass once to give every agent the same task
-  --concurrency <n>    Maximum candidates in flight (1..8)
-  --judge <agent>      fanout only: judge the candidates after fan-out
-  --auto-merge         fanout only (default off): opt in to adopting the
-                       competition winner into the primary checkout by
-                       verified fast-forward; requires --judge
+const HELP = `agent-hub — provider-neutral agent sessions with durable, checkpointed workspaces
 
-Session options (session create/resume):
-  --task "<text>"      Required agent turn; resume requires a new task
-  --agent <a>          Agent for session create
+Providers (transport auto-selected, honest probe gate):
+  omp    omp-rpc          RPC v2 dialect ONLY — no v1 fallback, ever
+  pi     pi-rpc           JSON-RPC over stdio
+  agy    agy-stream-json  stream-json
+  hermes hermes-acp       Agent Client Protocol (ACP)
 
-Live session (v3, live):
-  --agent <p>          Live provider (omp, agy, pi, hermes); pi/hermes are
-                       live-only and stay rejected by delegate/fanout/session
-  --resume <id>        Continue a durable live session (hub-live-id) from its
-                       chain head: fresh hub worktree at current_commit,
-                       verified provider resume identity, same live ref
-  --allow-dirty      Start/resume even over a dirty caller checkout (the
-                     live worktree still branches only from committed HEAD)
-  --permission-policy <deny|interactive>
-                     Permission policy for this launch/resume; a resume
-                     must select it explicitly, no selection means deny
-  stdin: one Hub NDJSON command per line:
-    {"action":"prompt"|"follow_up"|"steer","text":"..."} |
-    {"action":"cancel","reason":"..."} | {"action":"status"} |
-    {"action":"permission_response","request_id":"...","decision":"allow_once|deny","note":null} |
-    {"action":"close","terminate":false}
-  stdout: NDJSON — {type:"session"|"event"|"result"|"error"|"close"} documents
-  stderr: human-readable diagnostics
+Usage:
+  agent-hub start --provider <p> [--transport <t>] [--task TEXT] [--workspace DIR]
+                  [--permission-policy deny|interactive] [--max-output-bytes N]
+                  [--allow-dirty] [--attach]
+      One-shot (requires --task): start → prompt → turn result → close,
+      answering with {session, turn, close, handoff}. With --attach: keep the
+      process attached and drive the session over the NDJSON wire (below);
+      --task, when present, is issued as the first prompt.
 
-live recover reconciles every durable live lease with the OS and the
-repository and prints the JSON report. Each session reports one of
-kept-live / foreign / recovered / cleaned / manual; exit 1 means at least
-one session needs a human ("manual").
+  agent-hub resume <session-id> [--task TEXT] [--transport <t>] [--workspace DIR]
+                  [--permission-policy ...] [--attach]
+      Continue a terminal session from its durable record + checkpoint chain.
+      --task is delivered as a follow_up turn.
 
-Exit codes: 0 success, 1 structured operation failure (JSON on stdout),
-2 parse or usage error (message plus usage on stderr).
+  agent-hub status [session-id] [--workspace DIR]
+      One session's durable document (record + state + lease), or every
+      durable session in this repository when no id is given.
+
+  agent-hub handoff <session-id> [--workspace DIR]
+      The checkpoint chain as the deliverable: ref, commits, changed files,
+      and the human review/adopt command. Never merges anything.
+
+  agent-hub gc [--dry-run] [--workspace DIR]
+      Safe reconciliation: re-prove every lease, reap provably-orphaned
+      provider groups, pin surviving worktrees, rewrite to orphaned,
+      release leases last, retry worktree removals, prune. Nothing
+      unprovable is touched. Exit 1 when a session needs manual review.
+
+  agent-hub probe [provider ...]
+      Honest probe documents (found/version/detail). Launches nothing;
+      omp answers found=false unless its RPC v2 dialect evidence holds.
+
+Attach wire (start/resume --attach):
+  -> {"action":"prompt","text":"..."}            first task, exactly once
+  -> {"action":"follow_up","text":"..."}         next turn (queued while running)
+  -> {"action":"steer","text":"..."}             mid-turn guidance
+  -> {"action":"cancel","reason":"..."}          abort the in-flight turn
+  -> {"action":"status"}                         provider's authoritative progress
+  -> {"action":"permission","request_id":"...","decision":"allow_once|deny","note":"..."}
+  -> {"action":"close","mode":"graceful|terminate"}
+  <- {"type":"session",...} | {"type":"event",event} | {"type":"result",...}
+  <- {"type":"error",error} | {"type":"close",...}
+  Closing stdin EOFs the wire: already-received commands (including one
+  written before startup finished) are delivered and given the drain window
+  (--attach-close-drain-ms, default 5000) to settle before the graceful
+  close — EOF never cancels in-flight work that was received. An explicit
+  {"action":"close"} closes immediately (cancelling a running turn is the
+  kernel's honest behavior for that instruction). Stdin is read eagerly,
+  from before provider startup through the whole session, by a single
+  shared reader bounded to 128 commands / 1 MiB of queued input.
+
+Workspace: --workspace names the Git checkout to bind (default: cwd).
+Sessions run in hub-owned isolated worktrees; the caller checkout is never
+used as the provider workspace. A dirty caller checkout is refused unless
+--allow-dirty (the base is a commit either way).
 `;
 
-export interface CliOptions {
-  request: DelegateRequest;
-  help: boolean;
+export interface CliIo {
+  stdin: AsyncIterable<Uint8Array | string>;
+  stdout: { write(chunk: string): unknown };
+  stderr: { write(chunk: string): unknown };
 }
 
-export interface DelegateInvocation {
-  kind: "delegate";
-  options: CliOptions;
+export interface CliDependencies {
+  /** Test seam: replaces the hub construction entirely. */
+  openHub?: HubOpen;
+  /** Options merged into every hub construction (injected factories etc.). */
+  hubOptions?: AgentHubOptions;
+  /** Test seam: replace the process supervisor. */
+  supervisor?: AgentHubSupervisor;
+  /**
+   * Test seam: receives the eager stdin pump the moment an attached run
+   * attaches it (before any hub construction), proving startup ordering.
+   */
+  onAttachPump?: (pump: AttachInputPump) => void;
 }
 
-export interface FanoutInvocation {
-  kind: "fanout";
-  request: FanOutRequest;
-  /** null when no competition was requested. */
-  judge: string | null;
-  autoMerge: boolean;
+export type CliCommand =
+  | { kind: "help" }
+  | {
+      kind: "start";
+      workspace: string;
+      task: string | null;
+      attach: boolean;
+      attach_close_drain_ms: number;
+      start: StartArgs;
+    }
+  | {
+      kind: "resume";
+      workspace: string;
+      session_id: string;
+      task: string | null;
+      attach: boolean;
+      attach_close_drain_ms: number;
+      start: StartArgs;
+    }
+  | { kind: "status"; workspace: string; session_id: string | null }
+  | { kind: "handoff"; workspace: string; session_id: string }
+  | { kind: "gc"; workspace: string; dry_run: boolean }
+  | { kind: "probe"; providers: string[] };
+
+interface StartArgs {
+  provider: string;
+  transport?: string;
+  permission_policy: PermissionPolicy;
+  max_text_bytes?: number;
+  allow_dirty: boolean;
 }
 
-export interface SessionCreateInvocation {
-  kind: "session-create";
-  request: CreateSessionRequest;
-}
+export class UsageError extends Error {}
 
-export interface SessionResumeInvocation {
-  kind: "session-resume";
-  request: ResumeSessionRequest;
-}
+// ---------------------------------------------------------------------------
+// Argument parsing (pure; exported for tests)
+// ---------------------------------------------------------------------------
 
-export interface LiveSessionInvocation {
-  kind: "live";
-  request: {
-    agent: LiveProviderId | null;
-    resumeId: string | null;
-    workspace: string;
-    maxTextBytes: number | undefined;
-    allowDirty: boolean;
-    permissionPolicy: LivePermissionPolicy | null;
-  };
-}
-
-export interface LiveProbeInvocation {
-  kind: "live-probe";
-  agent: LiveProviderId;
-}
-
-export interface LiveRecoverInvocation {
-  kind: "live-recover";
-  workspace: string;
-}
-
-export interface HelpInvocation {
-  kind: "help";
-}
-
-export type CliInvocation =
-  | DelegateInvocation
-  | FanoutInvocation
-  | SessionCreateInvocation
-  | SessionResumeInvocation
-  | LiveSessionInvocation
-  | LiveProbeInvocation
-  | LiveRecoverInvocation
-  | HelpInvocation;
-
-function requireValue(argv: string[], index: number, option: string): string {
+function takeValue(flag: string, argv: string[], index: number): string {
   const value = argv[index + 1];
-  if (!value || value.startsWith("--")) {
-    throw new Error(`${option} requires a value`);
+  if (value === undefined || value.startsWith("-")) {
+    throw new UsageError(`${flag} requires a value`);
   }
   return value;
 }
 
-export function parseCliArgs(argv: string[]): CliOptions {
-  const args = argv[0] === "delegate" ? argv.slice(1) : argv;
-  // `--help` counts only before the `--` terminator; after it, the text is
-  // the task, not a flag.
-  const terminator = args.indexOf("--");
-  const optionsEnd = terminator === -1 ? args.length : terminator;
-  if (args.slice(0, optionsEnd).includes("--help") || args.length === 0) {
-    return {
-      help: true,
-      request: {
-        task: "",
-        agent: "",
-        mode: "isolated",
-        workspace: process.cwd(),
-      },
-    };
+function parseMaxBytes(flag: string, raw: string): number {
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new UsageError(`${flag} must be a positive integer`);
   }
+  return value;
+}
 
-  let agent = "";
-  let mode: ExecutionMode | "" = "";
-  let workspace = process.cwd();
-  let allowDirty = false;
-  let maxOutputBytes: number | undefined;
-  const taskParts: string[] = [];
+function parsePermissionPolicy(raw: string): PermissionPolicy {
+  if (raw === "deny" || raw === "interactive") return raw;
+  throw new UsageError(`--permission-policy must be deny or interactive, got "${raw}"`);
+}
 
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index];
-    if (argument === "--") {
-      // Standard terminator: everything after it is task text, so a task
-      // may literally start with "--".
-      taskParts.push(...args.slice(index + 1));
+function parseStartArgs(
+  argv: string[],
+  parseFrom: number,
+  providerFlagRequired: boolean,
+): { start: StartArgs; next: number } {
+  const start: StartArgs = {
+    provider: "",
+    permission_policy: "deny",
+    allow_dirty: false,
+  };
+  let index = parseFrom;
+  for (;;) {
+    const arg = argv[index];
+    if (arg === undefined) break;
+    if (arg === "--provider" || arg === "-p") {
+      start.provider = takeValue(arg, argv, index);
+      index += 2;
+    } else if (arg === "--transport") {
+      start.transport = takeValue(arg, argv, index);
+      index += 2;
+    } else if (arg === "--permission-policy") {
+      start.permission_policy = parsePermissionPolicy(takeValue(arg, argv, index));
+      index += 2;
+    } else if (arg === "--max-output-bytes") {
+      start.max_text_bytes = parseMaxBytes(arg, takeValue(arg, argv, index));
+      index += 2;
+    } else if (arg === "--allow-dirty") {
+      start.allow_dirty = true;
+      index += 1;
+    } else if (arg === "--task" || arg === "-t") {
+      break;
+    } else if (arg === "--attach") {
+      break;
+    } else if (arg === "--workspace" || arg === "-w") {
+      break;
+    } else if (arg.startsWith("-")) {
+      throw new UsageError(`unknown flag "${arg}"`);
+    } else {
       break;
     }
-    switch (argument) {
-      case "--agent":
-        agent = requireValue(args, index, argument);
-        index += 1;
-        break;
-      case "--mode": {
-        const value = requireValue(args, index, argument);
-        if (value !== "direct" && value !== "isolated") {
-          throw new Error(`--mode must be direct or isolated`);
-        }
-        mode = value;
-        index += 1;
-        break;
+  }
+  if (providerFlagRequired && start.provider === "") {
+    throw new UsageError(`start requires --provider (one of: ${HUB_PROVIDERS.join(", ")})`);
+  }
+  return { start, next: index };
+}
+
+export function parseCliCommand(argv: string[]): CliCommand {
+  const [command, ...rest] = argv;
+  if (command === undefined || command === "--help" || command === "-h" || command === "help") {
+    return { kind: "help" };
+  }
+  if (command.startsWith("-")) {
+    throw new UsageError(`unknown command/flag "${command}"`);
+  }
+
+  let workspace = process.cwd();
+  let task: string | null = null;
+  let attach = false;
+  let attachDrainMs = ATTACH_CLOSE_DRAIN_DEFAULT_MS;
+
+  const consumeCommonTail = (index: number): void => {
+    for (let i = index; i < rest.length; i += 1) {
+      const arg = rest[i];
+      if (arg === "--workspace" || arg === "-w") {
+        workspace = takeValue(arg, rest, i);
+        i += 1;
+      } else if (arg === "--task" || arg === "-t") {
+        task = takeValue(arg, rest, i);
+        i += 1;
+      } else if (arg === "--attach") {
+        attach = true;
+      } else if (arg === "--attach-close-drain-ms") {
+        attachDrainMs = parseMaxBytes(arg, takeValue(arg, rest, i));
+        i += 1;
+      } else if (arg.startsWith("-")) {
+        throw new UsageError(`unknown flag "${arg}"`);
+      } else {
+        throw new UsageError(`unexpected argument "${arg}"`);
       }
-      case "--workspace":
-        workspace = requireValue(args, index, argument);
-        index += 1;
-        break;
-      case "--allow-dirty":
-        allowDirty = true;
-        break;
-      case "--max-output-bytes": {
-        const value = requireValue(args, index, argument);
-        maxOutputBytes = Number(value);
-        if (!Number.isInteger(maxOutputBytes) || maxOutputBytes < 1) {
-          throw new Error(`--max-output-bytes must be a positive integer`);
-        }
-        index += 1;
-        break;
-      }
-      case "--json":
-        break;
-      default:
-        if (argument.startsWith("--")) {
-          throw new Error(`Unknown option: ${argument}`);
-        }
-        taskParts.push(argument);
     }
-  }
-
-  if (!agent) {
-    throw new Error(`--agent is required (${supportedAgents.join(", ")})`);
-  }
-  if (!mode) {
-    throw new Error(`--mode is required (direct or isolated)`);
-  }
-  if (taskParts.length === 0) {
-    throw new Error(`task is required`);
-  }
-
-  return {
-    help: false,
-    request: {
-      agent,
-      mode,
-      task: taskParts.join(" "),
-      workspace,
-      allowDirty,
-      maxOutputBytes,
-    },
   };
-}
 
-function assertSupportedAgent(agent: string, option: string): void {
-  if (!(supportedAgents as readonly string[]).includes(agent)) {
-    throw new Error(`${option} must be one of: ${supportedAgents.join(", ")}`);
-  }
-}
-
-function assertLiveAgent(agent: string, option: string): asserts agent is LiveProviderId {
-  if (!isLiveProvider(agent)) {
-    throw new Error(`${option} must be one of: ${supportedLiveAgents.join(", ")}`);
-  }
-}
-
-/** Grammar for the long-lived live session commands (v3, additive). */
-function parseLiveArgs(args: string[]): LiveSessionInvocation["request"] {
-  let agent: LiveProviderId | null = null;
-  let resumeId: string | null = null;
-  let workspace = process.cwd();
-  let maxTextBytes: number | undefined;
-  let allowDirty = false;
-  let permissionPolicy: LivePermissionPolicy | null = null;
-
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index];
-    switch (argument) {
-      case "--agent":
-        if (agent !== null) {
-          throw new Error("--agent may be specified only once for a live session");
-        }
-        {
-          const value = requireValue(args, index, argument);
-          assertLiveAgent(value, argument);
-          agent = value;
-        }
-        index += 1;
-        break;
-      case "--resume":
-        if (resumeId !== null) {
-          throw new Error("--resume may be specified only once for a live session");
-        }
-        resumeId = requireValue(args, index, argument);
-        index += 1;
-        break;
-      case "--workspace":
-        workspace = requireValue(args, index, argument);
-        index += 1;
-        break;
-      case "--max-output-bytes": {
-        const value = requireValue(args, index, argument);
-        maxTextBytes = Number(value);
-        if (!Number.isInteger(maxTextBytes) || maxTextBytes < 1) {
-          throw new Error("--max-output-bytes must be a positive integer");
-        }
-        index += 1;
-        break;
+  switch (command) {
+    case "start": {
+      const { start, next } = parseStartArgs(rest, 0, true);
+      consumeCommonTail(next);
+      return {
+        kind: "start",
+        workspace,
+        task,
+        attach,
+        attach_close_drain_ms: attachDrainMs,
+        start,
+      };
+    }
+    case "resume": {
+      const sessionId = rest[0];
+      if (sessionId === undefined || sessionId.startsWith("-")) {
+        throw new UsageError("resume requires <session-id>");
       }
-      case "--allow-dirty":
-        allowDirty = true;
-        break;
-      case "--permission-policy": {
-        if (permissionPolicy !== null) {
-          throw new Error("--permission-policy may be specified only once for a live session");
+      const { start, next } = parseStartArgs(rest, 1, false);
+      consumeCommonTail(next);
+      return {
+        kind: "resume",
+        workspace,
+        session_id: sessionId,
+        task,
+        attach,
+        attach_close_drain_ms: attachDrainMs,
+        // For resume the provider comes from the durable record; a
+        // --provider flag is not meaningful and is not parsed.
+        start: { ...start, provider: "" },
+      };
+    }
+    case "status": {
+      let sessionId: string | null = null;
+      for (let i = 0; i < rest.length; i += 1) {
+        const arg = rest[i];
+        if (arg === "--workspace" || arg === "-w") {
+          workspace = takeValue(arg, rest, i);
+          i += 1;
+        } else if (arg.startsWith("-")) {
+          throw new UsageError(`unknown flag "${arg}"`);
+        } else if (sessionId === null) {
+          sessionId = arg;
+        } else {
+          throw new UsageError(`unexpected argument "${arg}"`);
         }
-        {
-          const value = requireValue(args, index, argument);
-          if (value !== "deny" && value !== "interactive") {
-            throw new Error("--permission-policy must be deny or interactive");
-          }
-          permissionPolicy = value;
-        }
-        index += 1;
-        break;
       }
-      case "--json":
-        break;
-      default:
-        if (argument.startsWith("--")) {
-          throw new Error(`Unknown option: ${argument}`);
-        }
-        throw new Error(`unexpected argument "${argument}"; live commands take no positional text`);
+      return { kind: "status", workspace, session_id: sessionId };
     }
-  }
-
-  if (agent === null && resumeId === null) {
-    throw new Error(
-      `live requires --agent <${supportedLiveAgents.join("|")}> or --resume <hub-live-id>`,
-    );
-  }
-  if (agent !== null && resumeId !== null) {
-    throw new Error("live accepts either --agent or --resume, not both");
-  }
-  return { agent, resumeId, workspace, maxTextBytes, allowDirty, permissionPolicy };
-}
-
-/** Grammar for `agent-hub live probe --agent <provider>`. */
-function parseLiveProbeArgs(args: string[]): LiveProviderId {
-  let agent = "";
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index];
-    switch (argument) {
-      case "--agent":
-        if (agent) {
-          throw new Error("--agent may be specified only once for a live probe");
-        }
-        agent = requireValue(args, index, argument);
-        index += 1;
-        break;
-      case "--json":
-        break;
-      default:
-        throw new Error(`live probe accepts only --agent, got "${argument}"`);
-    }
-  }
-  if (!agent) {
-    throw new Error(`live probe requires --agent (${supportedLiveAgents.join(", ")})`);
-  }
-  assertLiveAgent(agent, "--agent");
-  return agent;
-}
-
-/** Grammar for `agent-hub live recover [--workspace <path>]`. */
-function parseLiveRecoverArgs(args: string[]): string {
-  let workspace = process.cwd();
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index];
-    switch (argument) {
-      case "--workspace":
-        workspace = requireValue(args, index, argument);
-        index += 1;
-        break;
-      case "--json":
-        break;
-      default:
-        throw new Error(`live recover accepts only --workspace, got "${argument}"`);
-    }
-  }
-  return workspace;
-}
-
-interface FanoutParse {
-  request: FanOutRequest;
-  judge: string | null;
-  autoMerge: boolean;
-}
-
-/** Grammar for the isolated fan-out command. */
-function parseFanoutArgs(args: string[], judgeAllowed: boolean): FanoutParse {
-  const agents: string[] = [];
-  const tasks: string[] = [];
-  let workspace = process.cwd();
-  let allowDirty = false;
-  let maxOutputBytes: number | undefined;
-  let concurrency: number | undefined;
-  let judge: string | null = null;
-  let autoMerge = false;
-
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index];
-    switch (argument) {
-      case "--agent":
-        agents.push(requireValue(args, index, argument));
-        index += 1;
-        break;
-      case "--task":
-        tasks.push(requireValue(args, index, argument));
-        index += 1;
-        break;
-      case "--workspace":
-        workspace = requireValue(args, index, argument);
-        index += 1;
-        break;
-      case "--concurrency": {
-        const value = requireValue(args, index, argument);
-        concurrency = Number(value);
-        if (!Number.isInteger(concurrency) || concurrency < 1) {
-          throw new Error(`--concurrency must be a positive integer`);
-        }
-        index += 1;
-        break;
+    case "handoff": {
+      const sessionId = rest[0];
+      if (sessionId === undefined || sessionId.startsWith("-")) {
+        throw new UsageError("handoff requires <session-id>");
       }
-      case "--allow-dirty":
-        allowDirty = true;
-        break;
-      case "--max-output-bytes": {
-        const value = requireValue(args, index, argument);
-        maxOutputBytes = Number(value);
-        if (!Number.isInteger(maxOutputBytes) || maxOutputBytes < 1) {
-          throw new Error(`--max-output-bytes must be a positive integer`);
+      for (let i = 1; i < rest.length; i += 1) {
+        const arg = rest[i];
+        if (arg === "--workspace" || arg === "-w") {
+          workspace = takeValue(arg, rest, i);
+          i += 1;
+        } else {
+          throw new UsageError(`unknown argument "${arg}"`);
         }
-        index += 1;
-        break;
       }
-      case "--judge":
-        judge = requireValue(args, index, argument);
-        index += 1;
-        break;
-      case "--auto-merge":
-        autoMerge = true;
-        break;
-      case "--json":
-        break;
-      default:
-        if (argument.startsWith("--")) {
-          throw new Error(`Unknown option: ${argument}`);
+      return { kind: "handoff", workspace, session_id: sessionId };
+    }
+    case "gc": {
+      let dryRun = false;
+      for (let i = 0; i < rest.length; i += 1) {
+        const arg = rest[i];
+        if (arg === "--dry-run") dryRun = true;
+        else if (arg === "--workspace" || arg === "-w") {
+          workspace = takeValue(arg, rest, i);
+          i += 1;
+        } else {
+          throw new UsageError(`unknown argument "${arg}"`);
         }
-        throw new Error(`unexpected argument "${argument}"; candidate tasks must use --task`);
+      }
+      return { kind: "gc", workspace, dry_run: dryRun };
     }
-  }
-
-  if (agents.length === 0) {
-    throw new Error(`--agent is required at least once (${supportedAgents.join(", ")})`);
-  }
-  for (const agent of agents) {
-    assertSupportedAgent(agent, "--agent");
-  }
-  if (tasks.length === 0) {
-    throw new Error(`--task is required`);
-  }
-
-  let candidates: FanOutCandidateSpec[];
-  if (tasks.length === agents.length) {
-    candidates = agents.map((agent, position) => ({ agent, task: tasks[position] }));
-  } else if (tasks.length === 1) {
-    candidates = agents.map((agent) => ({ agent, task: tasks[0] }));
-  } else {
-    throw new Error(`--task must be given once (shared task) or exactly once per --agent`);
-  }
-
-  if (candidates.length > FANOUT_MAX_CANDIDATES) {
-    throw new Error(
-      `at most ${FANOUT_MAX_CANDIDATES} candidates are supported per fan-out (got ${candidates.length})`,
-    );
-  }
-
-  if (judge !== null) {
-    if (!judgeAllowed) {
-      throw new Error(`--judge is only supported for the fanout command`);
+    case "probe": {
+      const providers = rest.filter((arg) => arg !== "--");
+      for (const provider of providers) {
+        if (!(HUB_PROVIDERS as readonly string[]).includes(provider)) {
+          throw new UsageError(
+            `unknown provider "${provider}" (shipped: ${HUB_PROVIDERS.join(", ")})`,
+          );
+        }
+      }
+      return { kind: "probe", providers };
     }
-    assertSupportedAgent(judge, "--judge");
+    default:
+      throw new UsageError(`unknown command "${command}" (see: agent-hub --help)`);
   }
-  if (autoMerge && judge === null) {
-    throw new Error(`--auto-merge requires --judge: adoption only follows an internal selection`);
-  }
+}
 
-  return {
-    request: {
-      workspace,
-      candidates,
-      maxConcurrency: concurrency,
-      allowDirty,
-      maxOutputBytes,
-    },
-    judge,
-    autoMerge: judgeAllowed ? autoMerge : false,
+// ---------------------------------------------------------------------------
+// Attach wire
+// ---------------------------------------------------------------------------
+
+interface WireIo {
+  out: (document: unknown) => void;
+}
+
+/**
+ * The attached NDJSON wire, driven by the EAGER input pump that was
+ * attached before the hub even started. Loop semantics:
+ *
+ *   - queued lines dispatch in arrival order, exactly once; commands
+ *     received during the handshake run as the session's first commands;
+ *   - an explicit `close` action closes immediately (a running turn
+ *     settles `cancelled` — the kernel's honest close semantics);
+ *   - EOF is NOT a cancel: it stops intake, then already-dispatched
+ *     commands get `drainMs` to settle before the graceful close, so a
+ *     first prompt written before startup is never killed by the drain.
+ */
+async function runAttachWire(
+  pump: AttachInputPump,
+  hub: AgentHub,
+  sessionId: string,
+  io: CliIo,
+  autoTask: string | null,
+  drainMs: number,
+): Promise<{ sawError: boolean }> {
+  const wire: WireIo = {
+    out: (document) => io.stdout.write(`${JSON.stringify(document)}\n`),
   };
-}
+  let sawError = false;
+  let closeIssued = false;
+  let clean = true;
 
-function parseSessionCreateArgs(args: string[]): CreateSessionRequest {
-  let agent = "";
-  let workspace = process.cwd();
-  let task = "";
-  let allowDirty = false;
-  let maxOutputBytes: number | undefined;
-
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index];
-    switch (argument) {
-      case "--agent":
-        if (agent) {
-          throw new Error("--agent may be specified only once for a session");
-        }
-        agent = requireValue(args, index, argument);
-        index += 1;
-        break;
-      case "--task":
-        if (task) {
-          throw new Error("--task may be specified only once for a session");
-        }
-        task = requireValue(args, index, argument);
-        index += 1;
-        break;
-      case "--workspace":
-        workspace = requireValue(args, index, argument);
-        index += 1;
-        break;
-      case "--allow-dirty":
-        allowDirty = true;
-        break;
-      case "--max-output-bytes": {
-        const value = requireValue(args, index, argument);
-        maxOutputBytes = Number(value);
-        if (!Number.isInteger(maxOutputBytes) || maxOutputBytes < 1) {
-          throw new Error("--max-output-bytes must be a positive integer");
-        }
-        index += 1;
-        break;
+  const eventsTail = (async () => {
+    try {
+      for await (const event of hub.streamEvents(sessionId)) {
+        wire.out({ type: "event", event });
       }
-      case "--json":
-        break;
-      default:
-        if (argument.startsWith("--")) {
-          throw new Error(`Unknown option: ${argument}`);
-        }
-        throw new Error(`unexpected argument "${argument}"; session tasks must use --task`);
+    } catch (error) {
+      sawError = true;
+      wire.out({ type: "error", error: asDelegateError(error) });
     }
-  }
+  })();
 
-  if (!agent) {
-    throw new Error(`--agent is required (${supportedAgents.join(", ")})`);
-  }
-  assertSupportedAgent(agent, "--agent");
-  if (!task) {
-    throw new Error("--task is required");
-  }
+  const inFlight = new Set<Promise<void>>();
+  const dispatch = (promise: Promise<TurnDocument>, action: string): void => {
+    const tracked = promise
+      .then((document) => wire.out({ type: "result", action, ...document }))
+      .catch((error: unknown) => {
+        sawError = true;
+        wire.out({ type: "error", action, error: asDelegateError(error) });
+      });
+    inFlight.add(tracked);
+    void tracked.finally(() => inFlight.delete(tracked));
+  };
 
-  return { agent, task, workspace, allowDirty, maxOutputBytes };
-}
-
-export function parseCliCommand(argv: string[]): CliInvocation {
-  const command = argv[0];
-
-  // v1 bare invocation: no subcommand, first token is an option (or absent).
-  if (command === undefined || command.startsWith("-")) {
-    return { kind: "delegate", options: parseCliArgs(argv) };
-  }
-
-  if (command === "delegate") {
-    // `parseCliArgs` strips the leading "delegate" itself.
-    return { kind: "delegate", options: parseCliArgs(argv) };
-  }
-
-  if (command === "fanout") {
-    if (argv.includes("--help")) {
-      return { kind: "help" };
+  const closeOnce = async (mode: "graceful" | "terminate"): Promise<boolean> => {
+    closeIssued = true;
+    try {
+      const document = await hub.close(sessionId, mode);
+      wire.out({ type: "close", ...document });
+      return document.cleanup_errors.length === 0;
+    } catch (error) {
+      sawError = true;
+      wire.out({ type: "error", action: "close", error: asDelegateError(error) });
+      return false;
     }
-    const parsed = parseFanoutArgs(argv.slice(1), true);
-    return { kind: "fanout", request: parsed.request, judge: parsed.judge, autoMerge: parsed.autoMerge };
-  }
+  };
 
-  if (command === "session") {
-    const action = argv[1];
-    if (argv.includes("--help")) {
-      return { kind: "help" };
+  const handleLine = async (line: string): Promise<boolean> => {
+    let command: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("not an object");
+      }
+      command = parsed as Record<string, unknown>;
+    } catch (error) {
+      sawError = true;
+      wire.out({
+        type: "error",
+        error: { code: "COMMAND_INVALID", message: `stdin line is not a JSON object: ${String(error)}` },
+      });
+      return true;
     }
-
-    if (action === "create") {
-      return { kind: "session-create", request: parseSessionCreateArgs(argv.slice(2)) };
-    }
-
-    if (action === "resume") {
-      const args = argv.slice(2);
-      let sessionId = "";
-      let workspace = process.cwd();
-      let task = "";
-      let maxOutputBytes: number | undefined;
-
-      for (let index = 0; index < args.length; index += 1) {
-        const argument = args[index];
-        switch (argument) {
-          case "--task":
-            if (task) {
-              throw new Error("--task may be specified only once for a session resume");
-            }
-            task = requireValue(args, index, argument);
-            index += 1;
-            break;
-          case "--workspace":
-            workspace = requireValue(args, index, argument);
-            index += 1;
-            break;
-          case "--max-output-bytes": {
-            const value = requireValue(args, index, argument);
-            maxOutputBytes = Number(value);
-            if (!Number.isInteger(maxOutputBytes) || maxOutputBytes < 1) {
-              throw new Error("--max-output-bytes must be a positive integer");
-            }
-            index += 1;
-            break;
+    const action = command.action;
+    const text = command.text;
+    try {
+      switch (action) {
+        case "prompt":
+          if (typeof text !== "string") throw new AgentHubError("COMMAND_INVALID", "prompt requires text");
+          dispatch(hub.prompt(sessionId, text), "prompt");
+          return true;
+        case "follow_up":
+          if (typeof text !== "string") throw new AgentHubError("COMMAND_INVALID", "follow_up requires text");
+          dispatch(hub.followUp(sessionId, text), "follow_up");
+          return true;
+        case "steer":
+          if (typeof text !== "string") throw new AgentHubError("COMMAND_INVALID", "steer requires text");
+          dispatch(hub.steer(sessionId, text), "steer");
+          return true;
+        case "cancel":
+          dispatch(hub.cancel(sessionId, typeof command.reason === "string" ? command.reason : null), "cancel");
+          return true;
+        case "status":
+          dispatch(hub.requestStatus(sessionId), "status");
+          return true;
+        case "permission": {
+          if (typeof command.request_id !== "string") {
+            throw new AgentHubError("COMMAND_INVALID", "permission requires request_id");
           }
-          case "--json":
-            break;
-          default:
-            if (argument.startsWith("--")) {
-              throw new Error(`Unknown option: ${argument}`);
-            }
-            if (sessionId) {
-              throw new Error(`unexpected argument "${argument}"`);
-            }
-            sessionId = argument;
+          if (!isPermissionDecision(command.decision)) {
+            throw new AgentHubError(
+              "COMMAND_INVALID",
+              `decision "${String(command.decision)}" is outside the contract vocabulary (allow_once, deny)`,
+            );
+          }
+          dispatch(
+            hub.respondPermission(
+              sessionId,
+              command.request_id,
+              command.decision,
+              typeof command.note === "string" ? command.note : null,
+            ),
+            "permission",
+          );
+          return true;
         }
+        case "close":
+          clean = (await closeOnce(command.mode === "terminate" ? "terminate" : "graceful")) && clean;
+          return true;
+        default:
+          throw new AgentHubError(
+            "COMMAND_INVALID",
+            `unknown action "${String(action)}" (prompt, follow_up, steer, cancel, status, permission, close)`,
+          );
       }
+    } catch (error) {
+      sawError = true;
+      wire.out({ type: "error", action: String(action), error: asDelegateError(error) });
+      return true;
+    }
+  };
 
-      if (!sessionId) {
-        throw new Error(`session resume requires <session-id>`);
-      }
-      if (!task) {
-        throw new Error("session resume requires --task");
-      }
-      return { kind: "session-resume", request: { session_id: sessionId, task, workspace, maxOutputBytes } };
-    }
-
-    throw new Error(`session requires "create" or "resume", got "${action ?? ""}"`);
-  }
-  if (command === "live") {
-    if (argv.includes("--help")) {
-      return { kind: "help" };
-    }
-    if (argv[1] === "probe") {
-      return { kind: "live-probe", agent: parseLiveProbeArgs(argv.slice(2)) };
-    }
-    if (argv[1] === "recover") {
-      return { kind: "live-recover", workspace: parseLiveRecoverArgs(argv.slice(2)) };
-    }
-    return { kind: "live", request: parseLiveArgs(argv.slice(1)) };
+  if (autoTask !== null) {
+    dispatch(hub.prompt(sessionId, autoTask), "prompt");
   }
 
-  if (command === "compete") {
-    throw new Error("compete is not a persisted-session command; use fanout with --judge");
+  for (;;) {
+    const event = await pump.next();
+    if (event === null || event.kind === "eof") break;
+    clean = (await handleLine(event.value)) && clean;
+    if (closeIssued) break;
+  }
+  if (pump.readError !== null) {
+    sawError = true;
+    wire.out({ type: "error", error: pump.readError });
+    clean = false;
   }
 
-  // Strict command vocabulary: a leading word that is not a recognized
-  // subcommand is a usage error (exit 2). It is never reinterpreted as
-  // delegate task text — an unknown command must never launch an agent.
-  // The v1 bare form survives only when the first token is an option.
-  throw new Error(
-    `unknown command "${command}"; expected delegate, fanout, session, or live`,
-  );
+  if (!closeIssued) {
+    // EOF (or input failure): commands already received must not be
+    // cancelled by the close. Give dispatched work the drain window, then
+    // close gracefully whatever the drain proved.
+    if (inFlight.size > 0) {
+      await Promise.race([
+        Promise.allSettled([...inFlight]),
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, drainMs);
+          timer.unref?.();
+        }),
+      ]);
+    }
+    clean = (await closeOnce("graceful")) && clean;
+  }
+  // Whatever the exit route, every dispatched command's document lands.
+  await Promise.allSettled([...inFlight]);
+  await eventsTail;
+  await pump.settled().catch(() => undefined);
+  return { sawError: sawError || !clean };
+}
+
+// ---------------------------------------------------------------------------
+// Command runners
+// ---------------------------------------------------------------------------
+
+function json(io: CliIo, document: unknown): void {
+  io.stdout.write(`${JSON.stringify(document, null, 2)}\n`);
+}
+
+async function withHub<T>(
+  command: { workspace: string },
+  deps: CliDependencies,
+  run: (hub: AgentHub, supervisor: AgentHubSupervisor) => Promise<T>,
+): Promise<T> {
+  const supervisor = deps.supervisor ?? new AgentHubSupervisor();
+  const open: HubOpen =
+    deps.openHub ??
+    ((workspace, options) => AgentHub.open(workspace, { ...deps.hubOptions, ...options }));
+  const hub = await supervisor.hubFor(command.workspace, deps.hubOptions ?? {}, open);
+  return run(hub, supervisor);
+}
+
+async function runStartLike(
+  kind: "start" | "resume",
+  workspace: string,
+  args: {
+    session_id?: string;
+    start: StartArgs;
+    task: string | null;
+    attach: boolean;
+    attach_close_drain_ms: number;
+  },
+  io: CliIo,
+  deps: CliDependencies,
+  pump: AttachInputPump | null,
+): Promise<number> {
+  return withHub({ workspace }, deps, async (hub, supervisor): Promise<number> => {
+    const started =
+      kind === "start"
+        ? await supervisor.launch(hub, () =>
+            hub.start({
+              provider: args.start.provider,
+              transport: args.start.transport,
+              permission_policy: args.start.permission_policy,
+              max_text_bytes: args.start.max_text_bytes,
+              allow_dirty: args.start.allow_dirty,
+            }),
+          )
+        : await supervisor.launch(hub, () =>
+            hub.resume(args.session_id as string, {
+              transport: args.start.transport,
+              permission_policy: args.start.permission_policy,
+              max_text_bytes: args.start.max_text_bytes,
+              allow_dirty: args.start.allow_dirty,
+            }),
+          );
+    const sessionId = started.session_id;
+    try {
+      if (args.attach) {
+        io.stderr.write(
+          `agent-hub: session ${sessionId} attached; speak NDJSON on stdin (see agent-hub --help), Ctrl-D to end.\n`,
+        );
+        json(io, { type: "session", ...started });
+        const wire = await runAttachWire(
+          pump as AttachInputPump,
+          hub,
+          sessionId,
+          io,
+          args.task,
+          args.attach_close_drain_ms,
+        );
+        return wire.sawError ? 1 : 0;
+      }
+      if (args.task === null) {
+        throw new AgentHubError(
+          "COMMAND_INVALID",
+          kind === "start"
+            ? "one-shot start requires --task (or use --attach for the NDJSON wire)"
+            : "one-shot resume requires --task (or use --attach for the NDJSON wire)",
+        );
+      }
+      const turn =
+        kind === "start"
+          ? await hub.prompt(sessionId, args.task)
+          : await hub.followUp(sessionId, args.task);
+      const closed = await hub.close(sessionId);
+      let handoff: unknown = null;
+      let handoffError: { code: string; message: string } | null = null;
+      try {
+        handoff = await hub.handoff(sessionId);
+      } catch (error) {
+        handoffError = asDelegateError(error);
+      }
+      json(io, {
+        session: started,
+        turn,
+        close: closed,
+        handoff,
+        ...(handoffError !== null ? { handoff_error: handoffError } : {}),
+      });
+      const cleanClose = closed.cleanup_errors.length === 0;
+      const turnOk =
+        (turn.outcome === "succeeded" || turn.outcome === "cancelled") &&
+        turn.checkpoint_error === undefined;
+      return turnOk && cleanClose ? 0 : 1;
+    } finally {
+      supervisor.retireIdle(hub);
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+
+/**
+ * Attaches the single eager stdin reader the moment an attached command is
+ * recognized — before hub construction, provider launch, or workspace
+ * reservation — so input written during the handshake is queued, not raced.
+ */
+function attachPump(
+  attach: boolean,
+  io: CliIo,
+  deps: CliDependencies,
+): AttachInputPump | null {
+  if (!attach) return null;
+  const pump = new AttachInputPump(io.stdin);
+  deps.onAttachPump?.(pump);
+  return pump;
 }
 
 export async function runCli(
   argv: string[],
-  output: { stdout: (value: string) => void; stderr: (value: string) => void } = {
-    stdout: (value) => process.stdout.write(value),
-    stderr: (value) => process.stderr.write(value),
-  },
+  io: CliIo,
+  deps: CliDependencies = {},
 ): Promise<number> {
-  let invocation: CliInvocation;
+  let command: CliCommand;
   try {
-    invocation = parseCliCommand(argv);
+    command = parseCliCommand(argv);
   } catch (error) {
-    output.stderr(`${error instanceof Error ? error.message : String(error)}\n\n${usage}`);
+    io.stderr.write(`agent-hub: ${(error as Error).message}\n\n${HELP}`);
     return 2;
   }
 
-  if (invocation.kind === "help") {
-    output.stdout(usage);
-    return 0;
-  }
-
   try {
-    return await execute(invocation, output);
+    switch (command.kind) {
+      case "help":
+        io.stdout.write(HELP);
+        return 0;
+      case "start":
+        return await runStartLike(
+          "start",
+          command.workspace,
+          command,
+          io,
+          deps,
+          attachPump(command.attach, io, deps),
+        );
+      case "resume":
+        return await runStartLike(
+          "resume",
+          command.workspace,
+          command,
+          io,
+          deps,
+          attachPump(command.attach, io, deps),
+        );
+      case "status":
+        return await withHub(command, deps, async (hub) => {
+          if (command.session_id === null) {
+            json(io, { sessions: await hub.list() });
+          } else {
+            json(io, await hub.status(command.session_id));
+          }
+          return 0;
+        });
+      case "handoff":
+        return await withHub(command, deps, async (hub) => {
+          json(io, await hub.handoff(command.session_id));
+          return 0;
+        });
+      case "gc":
+        return await withHub(command, deps, async (hub) => {
+          const report = await hub.gc({ dry_run: command.dry_run });
+          json(io, report);
+          return report.sessions.some((session) => session.outcome === "manual") ? 1 : 0;
+        });
+      case "probe": {
+        const bridges = deps.hubOptions?.transportFactories ?? productionBridgedFactories();
+        const documents: unknown[] = [];
+        for (const factory of bridges) {
+          if (command.providers.length > 0 && !command.providers.includes(factory.provider)) {
+            continue;
+          }
+          const probe = await factory.probe();
+          documents.push({
+            provider: factory.provider,
+            transport: factory.transport,
+            ...probe,
+          });
+        }
+        json(io, { probes: documents });
+        return 0;
+      }
+    }
   } catch (error) {
-    const failure = asDelegateError(error);
-    output.stdout(`${JSON.stringify({ error: failure }, null, 2)}\n`);
+    json(io, { error: asDelegateError(error) });
     return 1;
   }
 }
 
-async function execute(
-  invocation: Exclude<CliInvocation, HelpInvocation>,
-  output: { stdout: (value: string) => void; stderr: (value: string) => void },
-): Promise<number> {
-  const emitLine = output.stdout;
-  const emit = (document: unknown) => emitLine(`${JSON.stringify(document, null, 2)}\n`);
-
-  switch (invocation.kind) {
-    case "delegate": {
-      if (invocation.options.help) {
-        emitLine(usage);
-        return 0;
-      }
-      const result = await delegate(invocation.options.request);
-      emit(result);
-      return result.status === "success" ? 0 : 1;
-    }
-
-    case "fanout": {
-      const fan = await fanOut(invocation.request);
-      let document:
-        | (FanOutResult & { ref_cleanup_errors?: DelegateError[] })
-        | {
-            fan_out: FanOutResult;
-            competition: CompetitionResult;
-            merge?: MergeOutcome;
-            ref_cleanup_errors?: DelegateError[];
-          }
-        | undefined = undefined;
-      let failure = false;
-      let operationError: DelegateError | null = null;
-      let cleanupErrors: DelegateError[] = [];
-      try {
-        if (invocation.judge === null) {
-          document = fan;
-          // A partial or fully-failed fan-out is an operation failure.
-          failure = fan.status !== "success";
-        } else {
-          const competition = await runCompetition({
-            fan_out: fan,
-            strategy: "judge",
-            judge_agent: invocation.judge,
-            workspace: invocation.request.workspace,
-            maxOutputBytes: invocation.request.maxOutputBytes,
-          });
-          if (!invocation.autoMerge) {
-            document = { fan_out: fan, competition };
-            failure = fan.status !== "success" || competition.error !== null;
-          } else {
-            const merge = await autoMerge({
-              workspace: invocation.request.workspace,
-              fan_out: fan,
-              competition,
-            });
-            document = { fan_out: fan, competition, merge };
-            failure =
-              fan.status !== "success" ||
-              competition.error !== null ||
-              merge.error !== null ||
-              !merge.clean;
-          }
-        }
-      } catch (error) {
-        operationError = asDelegateError(error);
-      } finally {
-        // Terminal path: once this command's document exists, nothing else
-        // can consume the candidate artifact refs, so release them CAS-safe
-        // (refs already re-targeted by someone else are left untouched) — on
-        // the error path too, which is exactly when leaked refs matter most.
-        cleanupErrors = await releaseFanOutArtifactRefs(
-          invocation.request.workspace,
-          fan,
-        );
-      }
-
-      if (operationError !== null) {
-        emit({
-          error: operationError,
-          ...(cleanupErrors.length > 0 ? { ref_cleanup_errors: cleanupErrors } : {}),
-        });
-        return 1;
-      }
-      if (cleanupErrors.length > 0 && document !== undefined) {
-        // Cleanup trouble rides along on the document; it never masks the
-        // operation's own result — but it does make the command fail, because
-        // refs this command promised to release are still there.
-        document = { ...document, ref_cleanup_errors: cleanupErrors };
-      }
-      emit(document);
-      return failure || cleanupErrors.length > 0 ? 1 : 0;
-    }
-
-    case "session-create": {
-      const session = await createSession(invocation.request);
-      emit(session);
-      return session.run.status === "success" && session.cleanup_error === null ? 0 : 1;
-    }
-
-    case "session-resume": {
-      const session = await resumeSession(invocation.request);
-      emit(session);
-      return session.run.status === "success" && session.cleanup_error === null ? 0 : 1;
-    }
-
-    case "live-probe": {
-      // Production builds register the four real transports into the
-      // default registry before probing it — an empty default is a wiring
-      // bug, never a provider to guess.
-      registerProductionLiveTransports();
-      const document = await probeLiveAgent(invocation.agent);
-      emit(document);
-      // Not-found is honest data, but operationally it is a failed probe.
-      return document.found ? 0 : 1;
-    }
-
-    case "live": {
-      // Attach the stdin reader before provider provisioning.  The provider
-      // handshake can take seconds, and a TTY must not lose commands typed in
-      // that window (pipes/FIFOs happen to buffer them, which hid this race).
-      const stdin = new LiveStdinReader(process.stdin);
-      try {
-        return await runLiveSession(
-          {
-            provider: invocation.request.agent,
-            resumeId: invocation.request.resumeId,
-            workspace: invocation.request.workspace,
-            maxTextBytes: invocation.request.maxTextBytes,
-            allowDirty: invocation.request.allowDirty,
-            permissionPolicy: invocation.request.permissionPolicy,
-          },
-          {
-            stdin,
-            stdout: (document) => output.stdout(`${JSON.stringify(document)}\n`),
-            stderr: output.stderr,
-          },
-        );
-      } finally {
-        stdin.dispose();
-      }
-    }
-
-    case "live-recover": {
-      const outcome = await runLiveRecover(invocation.workspace);
-      emit(outcome.document);
-      const manual = outcome.document.sessions.filter(
-        (session) => session.outcome === "manual",
-      ).length;
-      output.stderr(
-        `agent-hub live recover: scanned=${outcome.document.scanned} manual=${manual}\n`,
-      );
-      return outcome.exitCode;
-    }
-  }
-}
-
 function isEntrypoint(): boolean {
-  if (!process.argv[1]) {
-    return false;
-  }
-
+  const invoked = process.argv[1];
+  if (invoked === undefined) return false;
   try {
-    return realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(invoked);
   } catch {
     return false;
   }
 }
 
 if (isEntrypoint()) {
-  runCli(process.argv.slice(2)).then((exitCode) => {
-    process.exitCode = exitCode;
-  });
+  const code = await runCli(
+    process.argv.slice(2),
+    {
+      stdin: process.stdin,
+      stdout: process.stdout,
+      stderr: process.stderr,
+    },
+    {},
+  );
+  process.exitCode = code;
 }
