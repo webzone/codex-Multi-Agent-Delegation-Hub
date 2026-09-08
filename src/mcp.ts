@@ -237,7 +237,7 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     "hub_close",
     {
       description:
-        "Close an attached session. Custody finalization captures the final state and RETAINS everything: the isolated worktree, lease, results, and ref stay under custody until an explicit hub_handoff names the exact result and the retention window expires. An unproven stop answers `orphaned` with ownership retained — `hub_gc` reconciles it.",
+        "Close an attached session. Custody finalization captures the final state and RETAINS the isolated worktree, results, and ref until an explicit hub_handoff names the exact result and the retention window expires. After a proven provider shutdown, the ownership lease may be released; an unproven stop answers `orphaned` with ownership retained — `hub_gc` reconciles it.",
       inputSchema: {
         ...sessionShape,
         mode: z.enum(["graceful", "terminate"]).default("graceful"),

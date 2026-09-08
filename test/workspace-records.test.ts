@@ -157,7 +157,7 @@ describe("resolveHubHome", () => {
     expect(resolveHubHome("/explicit", { AGENT_HUB_HOME: "/from-env" })).toBe("/explicit");
     expect(resolveHubHome(undefined, { AGENT_HUB_HOME: "/from-env" })).toBe("/from-env");
     // `env: {}` isolates from the ambient process environment.
-    expect(resolveHubHome(undefined, {})).toBe(resolve(homedir()));
+    expect(resolveHubHome(undefined, {})).toBe(resolve(homedir(), ".local", "share", "agent-hub"));
     // Relative values are made absolute against the cwd, never left relative.
     const relative = resolveHubHome("relative/home", {});
     expect(relative).toBe(resolve("relative/home"));

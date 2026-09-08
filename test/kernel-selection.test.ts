@@ -88,17 +88,19 @@ describe("transport selection", () => {
     expect(alpha.created.length).toBe(0);
   });
 
-  it("pins to an explicit transport and refuses pins that do not pair", async () => {
+  it("lets the provider factory, not the caller, choose the transport", async () => {
     const alpha = new FakeFactory("alpha", "fake");
     const beta = new FakeFactory("beta", "fake");
-    const kernel = new InteractionKernel({ transportFactories: [alpha, beta], ...fixedClock });
-    const result = await kernel.start({ provider: "fake", transport: "beta", workspace: "/ws" });
+    const providerFactory = new FakeProviderFactory("fake", ["beta", "alpha"]);
+    providerFactory.pick = (factories) => factories.find((factory) => factory.transport === "beta") ?? null;
+    const kernel = new InteractionKernel({
+      transportFactories: [alpha, beta],
+      providerFactories: [providerFactory],
+      ...fixedClock,
+    });
+    const result = await kernel.start({ provider: "fake", workspace: "/ws" });
     expect(result.record.transport).toBe("beta");
     expect(alpha.created.length).toBe(0);
-    await expectCode(
-      () => kernel.start({ provider: "fake", transport: "gamma", workspace: "/ws" }),
-      "TRANSPORT_UNAVAILABLE",
-    );
   });
 
   it("attaches the probe document to a successful selection", async () => {

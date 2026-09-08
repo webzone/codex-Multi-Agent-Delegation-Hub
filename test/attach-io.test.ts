@@ -158,6 +158,37 @@ describe("AttachInputPump hard bounds", () => {
     expect(events[events.length - 1]).toBe("eof");
     expect(events.length).toBe(total); // 20 remaining lines + eof
   });
+
+  it("never overshoots queued bytes when the next line fits alone but not in the remaining space", async () => {
+    const firstBlock = `${"x".repeat(100_000)}\n`.repeat(9);
+    const secondLine = `${"y".repeat(200_000)}\n`;
+    expect(Buffer.byteLength(firstBlock, "utf8")).toBeLessThan(ATTACH_QUEUE_MAX_BYTES);
+    expect(Buffer.byteLength(secondLine, "utf8")).toBeLessThanOrEqual(ATTACH_MAX_LINE_BYTES);
+
+    const source = makeSource();
+    const pump = new AttachInputPump(source.iterable);
+    source.push(Buffer.from(firstBlock, "utf8"));
+    while (pump.queuedBytes < 900_000) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    source.push(Buffer.from(secondLine, "utf8"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(pump.queuedBytes).toBeLessThanOrEqual(ATTACH_QUEUE_MAX_BYTES);
+    expect(pump.queuedCommands).toBe(9);
+    const first = await pump.next();
+    expect(first?.kind).toBe("line");
+    expect(pump.queuedBytes).toBeLessThanOrEqual(ATTACH_QUEUE_MAX_BYTES);
+
+    source.end();
+    const events = await collect(pump);
+    expect(events.at(-1)).toBe("eof");
+    const lines = events.filter((event): event is string => event !== "eof");
+    expect(lines).toHaveLength(9);
+    expect(lines.at(-1)).toMatch(/^y+$/);
+    expect(pump.readError).toBeNull();
+  });
+
   it("fails closed on a completed line above the hard line limit", async () => {
     const source = makeSource();
     const pump = new AttachInputPump(source.iterable);

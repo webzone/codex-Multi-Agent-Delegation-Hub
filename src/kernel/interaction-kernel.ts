@@ -127,8 +127,6 @@ interface ResolvedOptions extends KernelOptions {
 
 export interface StartRequest {
   provider: ProviderId;
-  /** Pin a specific transport; selection still requires an honest probe. */
-  transport?: TransportId;
   /** Opaque workspace root provided by the caller/WorkspaceLifecycle (P2). */
   workspace: string;
   /** Durable resume hint (restart of a previously started id without a full record). */
@@ -140,7 +138,6 @@ export interface StartRequest {
 }
 
 export interface ResumeOptions {
-  transport?: TransportId;
   max_text_bytes?: number;
   permission_policy?: PermissionPolicy;
 }
@@ -245,12 +242,17 @@ export class InteractionKernel {
   // -------------------------------------------------------------------------
 
   /**
-   * Filters injected factories by provider pairing (and optional pin), lets
-   * the provider factory pick among its accepted candidates, then requires
-   * an honest `found` probe on the selection. No fallback: a decline or a
-   * not-found probe ends the attempt.
+   * Selects a transport from the provider's injected pairing and requires an
+   * honest `found` probe. Callers choose a provider; transport selection is a
+   * provider fact, not a workflow input. No fallback: a decline or a not-found
+   * probe ends the attempt.
    */
-  async selectTransport(
+  async selectTransport(provider: ProviderId): Promise<TransportSelection> {
+    return this.selectTransportFor(provider);
+  }
+
+  /** Internal resume seam: durable records must re-open on their exact wire. */
+  private async selectTransportFor(
     provider: ProviderId,
     pin?: TransportId,
   ): Promise<TransportSelection> {
@@ -330,7 +332,7 @@ export class InteractionKernel {
         `session "${sessionId}" is already known to this kernel`,
       );
     }
-    const selection = await this.selectTransport(request.provider, request.transport);
+    const selection = await this.selectTransportFor(request.provider);
     const maxTextBytes = request.max_text_bytes ?? this.options.maxTextBytes;
     const transport = selection.factory.create();
     let spawned: ProcessFacts | null = null;
@@ -433,9 +435,9 @@ export class InteractionKernel {
     }
     this.checkQuota();
 
-    const selection = await this.selectTransport(
+    const selection = await this.selectTransportFor(
       prior.provider,
-      options.transport ?? prior.transport,
+      prior.transport,
     );
     if (selection.factory.transport !== prior.transport) {
       throw new AgentHubError(
@@ -1697,4 +1699,3 @@ export class InteractionKernel {
     session.subscribers.clear();
   }
 }
-

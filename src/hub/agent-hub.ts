@@ -88,13 +88,14 @@ export interface AgentHubOptions extends WorkspaceLifecycleOptions {
   newSessionId?: () => string;
   /**
    * Automatic custody cleanup. Default true: after the hub is constructed,
-   * `recover` + `gc` run once (startup catch-up). Never touches anything
-   * attached here, unacknowledged, orphaned, uncertain, or referenced.
+   * `recover` + `gc` run once (startup catch-up), then a bounded periodic
+   * sweep runs for long-lived hosts. Never touches anything attached here,
+   * unacknowledged, orphaned, uncertain, or referenced.
    */
   autoCleanup?: boolean;
   /**
-   * Bounded periodic sweep interval for long-lived hosts. 0 (default) means
-   * startup catch-up only; a positive value arms an unref'd interval.
+   * Bounded periodic sweep interval for long-lived hosts. Defaults to the
+   * fifteen-minute sweep; 0 disables periodic cleanup explicitly.
    */
   gcIntervalMs?: number;
 }
@@ -234,12 +235,13 @@ export class AgentHub {
       // Startup catch-up: settle provably-dead orphans, then collect only
       // expired, decided, unreferenced workspaces. Bounded: one pass.
       await hub.cleanup();
-    }
-    if (options.gcIntervalMs !== undefined && options.gcIntervalMs > 0) {
-      hub.sweepTimer = setInterval(() => {
-        void hub.cleanup().catch(() => undefined);
-      }, options.gcIntervalMs);
-      hub.sweepTimer.unref?.();
+      const gcIntervalMs = options.gcIntervalMs ?? HUB_GC_SWEEP_INTERVAL_MS;
+      if (gcIntervalMs > 0) {
+        hub.sweepTimer = setInterval(() => {
+          void hub.cleanup().catch(() => undefined);
+        }, gcIntervalMs);
+        hub.sweepTimer.unref?.();
+      }
     }
     return hub;
   }
@@ -330,14 +332,6 @@ export class AgentHub {
       );
     }
     const prior = inspected.runtime.record;
-    // Internal pin only: a session resumes on the transport it launched on.
-    const selection = await this.kernel.selectTransport(prior.provider, prior.transport);
-    if (selection.factory.transport !== prior.transport) {
-      throw new AgentHubError(
-        "TRANSPORT_PAIRING_INVALID",
-        `session "${sessionId}" was launched on "${prior.transport}"; resuming on "${selection.factory.transport}" is refused`,
-      );
-    }
     const started = await this.kernel.resume(
       { ...prior, workspace: workspace.worktree_path },
       {

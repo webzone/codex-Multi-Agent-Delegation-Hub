@@ -248,8 +248,8 @@ export class AttachInputPump {
               message: `the final unterminated ${tailBytes}-byte line exceeds the ${ATTACH_MAX_LINE_BYTES}-byte hard line limit; it is not delivered`,
             };
           } else {
-            await this.awaitSpace();
-            if (!this.disposed) {
+            await this.awaitLineSpace(tailBytes);
+            if (!this.disposed && !this.failed && this.canEnqueue(tailBytes)) {
               this.lines.push(tail);
               this.bufferedBytes += tailBytes;
               this.notify();
@@ -267,14 +267,22 @@ export class AttachInputPump {
     for (;;) {
       this.frame("");
       if (this.failed || this.disposed) return;
-      if (!this.full()) return;
+      if (this.pending.indexOf("\n") < 0 && !this.full()) return;
       await this.awaitSpace();
     }
   }
 
   /** Pause chunk pulls while the queue is at its bound. */
   private async awaitSpace(): Promise<void> {
-    while (this.full() && !this.disposed && !this.failed) {
+    while (this.needsSpace() && !this.disposed && !this.failed) {
+      this.holdingForSpace = true;
+      await Promise.race([this.once(), this.disposedSignal.promise]);
+      this.holdingForSpace = false;
+    }
+  }
+
+  private async awaitLineSpace(lineBytes: number): Promise<void> {
+    while (!this.canEnqueue(lineBytes) && !this.disposed && !this.failed) {
       this.holdingForSpace = true;
       await Promise.race([this.once(), this.disposedSignal.promise]);
       this.holdingForSpace = false;
@@ -282,11 +290,23 @@ export class AttachInputPump {
   }
 
   private frame(text: string): void {
-    if (text.length > 0) this.pending += text;
+    const combined = this.pending + text;
+    let offset = 0;
     for (;;) {
-      const index = this.pending.indexOf("\n");
-      if (index < 0) break;
-      const line = this.pending.slice(0, index).trim();
+      const index = combined.indexOf("\n", offset);
+      if (index < 0) {
+        const partial = combined.slice(offset);
+        if (Buffer.byteLength(partial, "utf8") > ATTACH_MAX_LINE_BYTES) {
+          this.failClosed(
+            "ATTACH_INPUT_PARTIAL_LINE_TOO_LARGE",
+            `an unterminated command line already exceeds the ${ATTACH_MAX_LINE_BYTES}-byte hard line limit; the wire fails closed`,
+          );
+          return;
+        }
+        this.pending = partial;
+        return;
+      }
+      const line = combined.slice(offset, index).trim();
       const lineBytes = Buffer.byteLength(line, "utf8");
       if (lineBytes > ATTACH_MAX_LINE_BYTES) {
         this.failClosed(
@@ -295,23 +315,19 @@ export class AttachInputPump {
         );
         return;
       }
-      if (line.length > 0 && this.full()) break;
-      this.pending = this.pending.slice(index + 1);
+      if (line.length > 0 && !this.canEnqueue(lineBytes)) {
+        // Keep the unconsumed suffix at a line boundary. The reader pauses
+        // before pulling another chunk, so a single read cannot make this
+        // held framing buffer grow without bound.
+        this.pending = combined.slice(offset);
+        return;
+      }
       if (line.length > 0) {
         this.lines.push(line);
         this.bufferedBytes += lineBytes;
         this.notify();
       }
-    }
-    if (
-      this.pending.length > 0 &&
-      this.pending.indexOf("\n") < 0 &&
-      Buffer.byteLength(this.pending, "utf8") > ATTACH_MAX_LINE_BYTES
-    ) {
-      this.failClosed(
-        "ATTACH_INPUT_PARTIAL_LINE_TOO_LARGE",
-        `an unterminated command line already exceeds the ${ATTACH_MAX_LINE_BYTES}-byte hard line limit; the wire fails closed`,
-      );
+      offset = index + 1;
     }
   }
 
@@ -320,5 +336,20 @@ export class AttachInputPump {
       this.lines.length >= ATTACH_QUEUE_MAX_COMMANDS ||
       this.bufferedBytes >= ATTACH_QUEUE_MAX_BYTES
     );
+  }
+
+  private canEnqueue(lineBytes: number): boolean {
+    return (
+      this.lines.length < ATTACH_QUEUE_MAX_COMMANDS &&
+      this.bufferedBytes + lineBytes <= ATTACH_QUEUE_MAX_BYTES
+    );
+  }
+
+  private needsSpace(): boolean {
+    if (this.full()) return true;
+    const index = this.pending.indexOf("\n");
+    if (index < 0) return false;
+    const line = this.pending.slice(0, index).trim();
+    return line.length > 0 && !this.canEnqueue(Buffer.byteLength(line, "utf8"));
   }
 }
