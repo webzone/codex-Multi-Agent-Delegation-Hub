@@ -203,6 +203,18 @@ describe("AttachInputPump hard bounds", () => {
     expect(pump.queuedCommands).toBe(0);
   });
 
+  it("counts whitespace before trimming when enforcing the completed line limit", async () => {
+    const source = makeSource();
+    const pump = new AttachInputPump(source.iterable);
+    source.push(Buffer.alloc(ATTACH_MAX_LINE_BYTES, 0x20));
+    await source.firstPull();
+    source.push(Buffer.from("x\n", "utf8"));
+    source.end();
+    expect(await pump.next()).toEqual({ kind: "eof" });
+    expect(pump.readError?.code).toBe("ATTACH_INPUT_LINE_TOO_LARGE");
+    expect(pump.queuedCommands).toBe(0);
+  });
+
   it("fails closed on an unterminated partial line above the hard line limit", async () => {
     const source = makeSource();
     const pump = new AttachInputPump(source.iterable);

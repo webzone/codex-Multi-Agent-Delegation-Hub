@@ -168,6 +168,41 @@ describe("MCP tool surface", () => {
     await world.cleanup();
   });
 
+  it("allows handoff of a closed workspace with no published turns", async () => {
+    const world = await mcpHarness();
+    const sessionId = await startSession(world.client, world.repository);
+
+    const closed = await world.client.callTool({
+      name: "hub_close",
+      arguments: { session_id: sessionId, workspace: world.repository },
+    });
+    expect(isError(closed)).toBe(false);
+
+    const status = await world.client.callTool({
+      name: "hub_status",
+      arguments: { session_id: sessionId, workspace: world.repository },
+    });
+    const workspace = payload(status)["workspace"] as {
+      last_result_seq: number;
+      head_commit: string;
+    };
+    expect(workspace.last_result_seq).toBe(0);
+
+    const handoff = await world.client.callTool({
+      name: "hub_handoff",
+      arguments: {
+        session_id: sessionId,
+        workspace: world.repository,
+        decision: "discarded",
+        result_seq: 0,
+        commit: workspace.head_commit,
+      },
+    });
+    expect(isError(handoff)).toBe(false);
+    expect((payload(handoff)["handoff"] as { result_seq: number }).result_seq).toBe(0);
+    await world.cleanup();
+  });
+
   it("refuses commands for unknown sessions with structured errors", async () => {
     const world = await mcpHarness();
     const turn = await world.client.callTool({

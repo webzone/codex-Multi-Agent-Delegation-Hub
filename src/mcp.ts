@@ -309,7 +309,7 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
         session_id: z.string().min(1),
         workspace: workspaceShape,
         decision: z.enum(["accepted", "discarded"]),
-        result_seq: z.number().int().positive(),
+        result_seq: z.number().int().nonnegative(),
         commit: z.string().min(40),
         consumer: z.string().min(1).nullable().optional(),
       },

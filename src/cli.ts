@@ -179,6 +179,14 @@ function parseMaxBytes(flag: string, raw: string): number {
   return value;
 }
 
+function parseResultSeq(flag: string, raw: string): number {
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new UsageError(`${flag} must be a non-negative integer`);
+  }
+  return value;
+}
+
 function parsePermissionPolicy(raw: string): PermissionPolicy {
   if (raw === "deny" || raw === "interactive") return raw;
   throw new UsageError(`--permission-policy must be deny or interactive, got "${raw}"`);
@@ -320,7 +328,7 @@ export function parseCliCommand(argv: string[]): CliCommand {
           decision = parseHandoffDecision(takeValue(arg, rest, i));
           i += 1;
         } else if (arg === "--result-seq") {
-          resultSeq = parseMaxBytes(arg, takeValue(arg, rest, i));
+          resultSeq = parseResultSeq(arg, takeValue(arg, rest, i));
           i += 1;
         } else if (arg === "--commit") {
           commit = takeValue(arg, rest, i);

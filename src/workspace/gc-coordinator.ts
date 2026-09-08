@@ -24,7 +24,6 @@ const GC_STATE_LOCK = "gc-state";
 const GC_WORKER_LOCK = "gc-worker";
 const GC_STATE_FILE = `${HUB_STATE_SUBDIR}/gc/coordinator.json`;
 const WORKER_POLL_MS = 30_000;
-const WORKER_LOCK_WAIT_MS = 5_000;
 const RETRY_MS = 15 * 60 * 1000;
 const MAX_TIMER_MS = 2_147_000_000;
 
@@ -245,9 +244,12 @@ export async function runGcWorker(home: string): Promise<void> {
       commonDir: normalizedHome,
       name: GC_WORKER_LOCK,
       // A handoff can launch a replacement while the previous worker is
-      // finishing its last state update. Waiting closes that exit/wakeup race;
-      // the durable state is then re-read after the lease is acquired.
-      waitMs: WORKER_LOCK_WAIT_MS,
+      // finishing its last state update. Wait without a deadline: the state
+      // is re-read after the lease is acquired, so a replacement cannot exit
+      // during an arbitrary pause between the old worker's final state check
+      // and lock release. Dead same-host owners are still reclaimed by the
+      // lock's proof-based recovery.
+      waitMs: Number.POSITIVE_INFINITY,
     });
   } catch {
     return;

@@ -159,6 +159,22 @@ describe("CLI parsing", () => {
     expect(() => parse(["resume"])).toThrow(/session-id/);
     expect(() => parse(["handoff", "--workspace", "/x"])).toThrow(/session-id/);
   });
+  it("accepts zero as the exact result sequence for an empty closed workspace", () => {
+    const command = parse([
+      "handoff",
+      "session-1",
+      "--decision",
+      "accepted",
+      "--result-seq",
+      "0",
+      "--commit",
+      "a".repeat(40),
+    ]);
+    expect(command).toMatchObject({
+      kind: "handoff",
+      decision: { result_seq: 0 },
+    });
+  });
   it("parses the full start surface", () => {
     const command = parse([
       "start",

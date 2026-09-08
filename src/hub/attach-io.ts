@@ -306,15 +306,17 @@ export class AttachInputPump {
         this.pending = partial;
         return;
       }
-      const line = combined.slice(offset, index).trim();
-      const lineBytes = Buffer.byteLength(line, "utf8");
-      if (lineBytes > ATTACH_MAX_LINE_BYTES) {
+      const rawLine = combined.slice(offset, index);
+      const rawLineBytes = Buffer.byteLength(rawLine, "utf8");
+      if (rawLineBytes > ATTACH_MAX_LINE_BYTES) {
         this.failClosed(
           "ATTACH_INPUT_LINE_TOO_LARGE",
-          `a ${lineBytes}-byte command exceeds the ${ATTACH_MAX_LINE_BYTES}-byte hard line limit; the wire fails closed`,
+          `a ${rawLineBytes}-byte command exceeds the ${ATTACH_MAX_LINE_BYTES}-byte hard line limit; the wire fails closed`,
         );
         return;
       }
+      const line = rawLine.trim();
+      const lineBytes = Buffer.byteLength(line, "utf8");
       if (line.length > 0 && !this.canEnqueue(lineBytes)) {
         // Keep the unconsumed suffix at a line boundary. The reader pauses
         // before pulling another chunk, so a single read cannot make this
