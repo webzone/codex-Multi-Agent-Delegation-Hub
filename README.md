@@ -155,7 +155,8 @@ merges or applies the work for you.
 When automatic cleanup is enabled (the default), handoff also records the
 deadline in a durable GC coordinator and starts a detached worker. The worker
 outlives a short-lived CLI command, uses a singleton lease, catches up after a
-restart, and calls the same safe GC checks described below. It never deletes a
+restart; every later default hub startup also re-arms an unfinished schedule,
+and it calls the same safe GC checks described below. It never deletes a
 workspace merely because its timer fired. If the worker cannot start, the
 durable record remains safe and a later hub startup or `agent-hub gc` catches it
 up.

@@ -172,6 +172,16 @@ export class GcCoordinator {
     });
     this.spawnWorker(this.home);
   }
+
+  /**
+   * Startup catch-up for a worker that died without deleting the durable
+   * schedule. The worker lock makes this safe when another copy is already
+   * alive; the state file makes it possible to recover without a new handoff.
+   */
+  async ensureWorker(): Promise<void> {
+    const scheduled = await withStateLock(this.home, async () => (await readState(this.home)) !== null);
+    if (scheduled) this.spawnWorker(this.home);
+  }
 }
 
 async function runGcPass(home: string): Promise<{ report: GcReport; records: WorkspaceRecord[] }> {

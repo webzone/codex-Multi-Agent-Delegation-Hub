@@ -217,6 +217,7 @@ export class AgentHub {
       ...(options.probePid === undefined ? {} : { probePid: options.probePid }),
     });
     const bridges = options.transportFactories ?? productionBridgedFactories();
+    const gcCoordinator = options.autoCleanup === false ? null : new GcCoordinator(lifecycle.home);
     const kernel = new InteractionKernel({
       transportFactories: bridges,
       providerFactories: options.providerFactories ?? productionBridgedProviderFactories(),
@@ -234,12 +235,15 @@ export class AgentHub {
       identity.worktree_root,
       identity.common_dir,
       options.processQuota ?? HUB_PROCESS_SESSION_QUOTA,
-      options.autoCleanup === false ? null : new GcCoordinator(lifecycle.home),
+      gcCoordinator,
     );
     if (options.autoCleanup !== false) {
       // Startup catch-up: settle provably-dead orphans, then collect only
       // expired, decided, unreferenced workspaces. Bounded: one pass.
       await hub.cleanup();
+      // If a detached worker died while a retention window was still active,
+      // startup must re-arm it from durable state even without a new handoff.
+      await gcCoordinator?.ensureWorker();
       const gcIntervalMs = options.gcIntervalMs ?? HUB_GC_SWEEP_INTERVAL_MS;
       if (gcIntervalMs > 0) {
         hub.sweepTimer = setInterval(() => {

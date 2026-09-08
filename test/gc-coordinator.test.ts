@@ -50,5 +50,26 @@ describe("durable GC coordinator", () => {
     expect(await readJsonFile(gcCoordinatorStatePath(home))).toBeUndefined();
     await removeTree(home);
   });
-});
 
+  it("re-arms a durable schedule after a worker crash", async () => {
+    const home = await mkdtemp(join(tmpdir(), "agent-hub-gc-rearm-"));
+    const firstLaunches: string[] = [];
+    const first = new GcCoordinator(home, {
+      spawnWorker: (workerHome) => firstLaunches.push(workerHome),
+    });
+    await first.arm({
+      repository_cwd: process.cwd(),
+      retention_until: new Date(Date.now() + 60_000).toISOString(),
+    });
+
+    const recoveredLaunches: string[] = [];
+    const recovered = new GcCoordinator(home, {
+      spawnWorker: (workerHome) => recoveredLaunches.push(workerHome),
+    });
+    await recovered.ensureWorker();
+
+    expect(firstLaunches).toEqual([home]);
+    expect(recoveredLaunches).toEqual([home]);
+    await removeTree(home);
+  });
+});
