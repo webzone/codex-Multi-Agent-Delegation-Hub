@@ -99,8 +99,18 @@ export class AgentHubSupervisor {
   /** Drop a cached hub once it runs nothing and no launch is in flight. */
   retireIdle(hub: AgentHub): void {
     if (hub.activeCount > 0 || this.inFlight > 0) return;
+    let retired = false;
     for (const [key, cached] of this.ready) {
-      if (cached === hub) this.ready.delete(key);
+      if (cached === hub) {
+        this.ready.delete(key);
+        retired = true;
+      }
+    }
+    if (retired) {
+      // `AgentHub.open()` arms an unref'd periodic custody sweep by default.
+      // Retiring the cache entry must stop that timer too, otherwise the timer
+      // closure keeps the old hub alive and every open/retire cycle leaks one.
+      void hub.settle().catch(() => undefined);
     }
   }
 
