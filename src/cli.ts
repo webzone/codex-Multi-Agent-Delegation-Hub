@@ -68,8 +68,9 @@ Usage:
       The consumer's takeover decision. It must name the workspace's exact
       published head (result sequence + commit) from \`status\` or a turn
       document, or it is refused. This starts the retention clock (default
-      24 h); nothing is deleted here. Until a decision exists, close/GC
-      never removes the worktree, lease, results, or ref.
+      24 h); automatic cleanup records the deadline for an independent
+      detached worker. Nothing is deleted here. Until a decision exists,
+      close/GC never removes the worktree, lease, results, or ref.
 
   agent-hub gc [--workspace DIR]
       Safe manual reconciliation: re-prove every lease, settle provably-dead

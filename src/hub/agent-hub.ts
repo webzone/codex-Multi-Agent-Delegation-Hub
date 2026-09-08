@@ -28,6 +28,7 @@ import type {
   WorkspaceInspection,
   WorkspaceLifecycleOptions,
 } from "../workspace/lifecycle.js";
+import { GcCoordinator } from "../workspace/gc-coordinator.js";
 import { isWorkspaceSessionId } from "../workspace/home.js";
 import type {
   HandoffDecision,
@@ -179,6 +180,7 @@ export class AgentHub {
   private readonly bridges: readonly BridgedTransportFactory[];
   private readonly processQuota: number;
   private readonly pendingCommands = new Map<string, Set<Promise<unknown>>>();
+  private readonly gcCoordinator: GcCoordinator | null;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
   private lastCleanupReport: HubCleanupDocument | null = null;
   private closed = false;
@@ -190,6 +192,7 @@ export class AgentHub {
     repositoryCwd: string,
     commonDir: string,
     processQuota: number,
+    gcCoordinator: GcCoordinator | null,
   ) {
     this.kernel = kernel;
     this.lifecycle = lifecycle;
@@ -197,6 +200,7 @@ export class AgentHub {
     this.repositoryCwd = repositoryCwd;
     this.commonDirResolved = commonDir;
     this.processQuota = processQuota;
+    this.gcCoordinator = gcCoordinator;
   }
 
   /** Bind a hub to one repository checkout (identity resolved eagerly). */
@@ -230,6 +234,7 @@ export class AgentHub {
       identity.worktree_root,
       identity.common_dir,
       options.processQuota ?? HUB_PROCESS_SESSION_QUOTA,
+      options.autoCleanup === false ? null : new GcCoordinator(lifecycle.home),
     );
     if (options.autoCleanup !== false) {
       // Startup catch-up: settle provably-dead orphans, then collect only
@@ -557,14 +562,20 @@ export class AgentHub {
    * Refused unless `result_seq`/`commit` name the current head exactly; the
    * retention clock starts at the decision. Nothing is deleted here.
    */
-  handoff(sessionId: string, decision: HandoffDecisionInput): Promise<WorkspaceRecord> {
-    return this.lifecycle.handoff({
+  async handoff(sessionId: string, decision: HandoffDecisionInput): Promise<WorkspaceRecord> {
+    const record = await this.lifecycle.handoff({
       session_id: sessionId,
       decision: decision.decision,
       result_seq: decision.result_seq,
       commit: decision.commit,
       consumer: decision.consumer ?? null,
     });
+    // The CLI may exit immediately after this call. Persist the deadline and
+    // arm the detached worker before reporting a successful handoff.
+    if (this.gcCoordinator !== null) {
+      await this.gcCoordinator.arm(record);
+    }
+    return record;
   }
 
   /**
