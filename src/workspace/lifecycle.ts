@@ -1317,19 +1317,20 @@ export class WorkspaceLifecycle {
         return;
       }
       // Deletion order, crash-safe by tombstone continuation:
-      // tombstone → ref CAS-delete → worktree remove → prune → custody tree → lease.
+      // tombstone → worktree remove → ref CAS-delete → prune → custody tree → lease.
+      // Keep the result ref as a pin until the worktree removal is proven.
       await writeTombstone(this.home, rec, this.now);
+      const removal = await removeWorktree(rec.repository_cwd, worktreePath(this.home, id));
+      if (!removal.removed) {
+        retain("worktree-remove-failed", removal.reason);
+        return;
+      }
       if (refNow !== null) {
         const refGone = await casDeleteRef(rec.repository_cwd, rec.ref, rec.head_commit);
         if (!refGone) {
           retain("ref-diverged", "the ref moved between probe and CAS-delete (racing)");
           return;
         }
-      }
-      const removal = await removeWorktree(rec.repository_cwd, worktreePath(this.home, id));
-      if (!removal.removed) {
-        retain("worktree-remove-failed", removal.reason);
-        return;
       }
       pruned.add(rec.repository_cwd);
       await pruneWorktrees(rec.repository_cwd).catch(() => undefined);

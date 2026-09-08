@@ -603,6 +603,32 @@ describe("workspace GC — the only deletion path", () => {
     }
   });
 
+  it("keeps the result ref pinned when the first worktree removal fails", async () => {
+    const fx = await makeFixture({ retentionMs: RETENTION_MS });
+    const removal = vi.spyOn(gitops, "removeWorktree").mockResolvedValue({
+      removed: false,
+      reason: "simulated first removal failure",
+    });
+    try {
+      const { id, head } = await decidedWorkspace(fx);
+      fx.clock.advance(RETENTION_MS + 1);
+
+      const report = await fx.lc.gc();
+
+      expect(removal).toHaveBeenCalled();
+      expect(report.deleted).toEqual([]);
+      expect(report.retained).toEqual([
+        { session_id: id, code: "worktree-remove-failed", detail: "simulated first removal failure" },
+      ]);
+      expect(await resolveRef(fx.repo, workspaceRefFor(id))).toBe(head);
+      expect(await exists(worktreePath(fx.home, id))).toBe(true);
+      expect(await exists(workspaceRecordPath(fx.home, id))).toBe(true);
+    } finally {
+      removal.mockRestore();
+      await fx.cleanup();
+    }
+  });
+
   it("a second gc over a deleted workspace is a clean no-op", async () => {
     const fx = await makeFixture({ retentionMs: RETENTION_MS });
     try {
