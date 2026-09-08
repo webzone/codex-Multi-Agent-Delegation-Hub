@@ -99,6 +99,69 @@ Every command answers with one JSON document on stdout; human guidance goes
 to stderr. Exit codes: `0` success, `1` structured operation failure (the
 document carries `error`), `2` usage error.
 
+## Use from Codex
+
+Agent Hub works with Codex in two ways. Use the MCP connection when Codex
+should keep an agent session available for follow-up questions and steering;
+use the CLI when you want Codex to run a self-contained command in its
+terminal.
+
+### Recommended: connect the MCP server
+
+Register the local MCP server once:
+
+```sh
+codex mcp add agent_hub -- agent-hub-mcp
+codex mcp get agent_hub
+```
+
+If `agent_hub` is already listed by `codex mcp list`, do not add it again.
+Restart Codex if the tools do not appear in the current session. The server
+provides `hub_probe`, `hub_start`, `hub_prompt`, `hub_follow_up`, `hub_steer`,
+`hub_cancel`, `hub_command_status`, `hub_events`, `hub_permission`,
+`hub_close`, `hub_resume`, `hub_status`, `hub_handoff`, and `hub_gc`.
+
+In a Codex conversation, a request can be as simple as:
+
+```text
+在当前仓库使用 Agent Hub：先调用 hub_probe 检查 omp；如果 RPC v2 检查通过，
+用同一个 workspace 调用 hub_start 启动 omp agent，再用 hub_prompt 发送任务。
+工作过程中用 hub_events、hub_status 和 hub_steer 实时查看或调整进度。
+结束时调用 hub_close；检查返回的精确 result_seq 和 commit，确认结果后再调用
+hub_handoff。不要直接接受未经检查的结果，也不要修改当前 checkout。
+```
+
+每个 MCP 调用都必须传入同一个 Git checkout 的 `workspace`。Agent Hub 会
+在 `AGENT_HUB_HOME` 下创建独立 worktree；Codex 当前打开的 checkout 只是
+身份锚点，不是 provider 实际工作的目录。`hub_handoff` 只记录
+`accepted`/`discarded` 决定和精确结果，不会自动合并或覆盖当前分支。
+
+### Use the CLI from Codex's terminal
+
+Codex 也可以直接运行已安装的 CLI：
+
+```sh
+cd /path/to/your/repo
+agent-hub probe
+agent-hub start --provider omp --workspace "$PWD" \
+  --task "检查并修复登录流程中的 flaky test"
+```
+
+需要持续交互时使用 attach wire：
+
+```sh
+agent-hub start --provider omp --workspace "$PWD" --attach
+```
+
+它通过 stdin/stdout 使用 NDJSON；可发送 `prompt`、`follow_up`、`steer`、
+`cancel`、`status`、`permission` 和 `close`。在 Codex 中，MCP 通常比手动
+维护 NDJSON 管道更适合持续对话。
+
+不论通过 MCP 还是 CLI，都先运行 `agent-hub probe`。OMP 只接受 RPC v2；
+如果探测不到 v2 证据，Agent Hub 会拒绝启动，而不是猜测旧协议。provider
+完成后，先审查精确的 commit/tree，再决定接受或丢弃；最后让
+`agent-hub gc` 或自动 GC 清理已经过 retention 期的废弃 worktree。
+
 ## Commands
 
 ### `agent-hub start`
