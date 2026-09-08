@@ -4,7 +4,13 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { parseCliCommand, runCli, type CliCommand, type CliIo } from "../src/cli.js";
+import {
+  parseCliCommand,
+  runCli,
+  type CliCommand,
+  type CliDependencies,
+  type CliIo,
+} from "../src/cli.js";
 import { AgentHubSupervisor } from "../src/hub/supervisor.js";
 import type { AttachInputPump } from "../src/hub/attach-io.js";
 import { PassThrough } from "node:stream";
@@ -63,7 +69,11 @@ async function cliHarness(
     repository,
     hubOptions,
     factory,
-    async run(argv, stdin = emptyLines) {
+    async run(
+      argv: string[],
+      stdin: AsyncIterable<string> = emptyLines,
+      extraDeps: CliDependencies = {},
+    ) {
       let out = "";
       let err = "";
       const io: CliIo = {
@@ -73,7 +83,7 @@ async function cliHarness(
         stdout: { write: (chunk: string) => (out += chunk) },
         stderr: { write: (chunk: string) => (err += chunk) },
       };
-      const code = await runCli(argv, io, { hubOptions });
+      const code = await runCli(argv, io, { hubOptions, ...extraDeps });
       return { code, out, err };
     },
     cleanup: () => removeDirectory(repository),
@@ -140,6 +150,9 @@ describe("CLI parsing", () => {
     expect(() => parse(["fanout"])).toThrow(/unknown command/);
     expect(() => parse(["live"])).toThrow(/unknown command/);
     expect(() => parse(["start", "--provider", "omp", "--json"])).toThrow(/unknown flag/);
+    // The public surface auto-selects: transport pinning is not a CLI input.
+    expect(() => parse(["start", "--provider", "omp", "--transport", "pi-rpc"])).toThrow(/unknown flag/);
+    expect(() => parse(["resume", "s-1", "--transport", "pi-rpc"])).toThrow(/unknown flag/);
     expect(() => parse(["probe", "grok"])).toThrow(/unknown provider/);
   });
   it("requires a session id for resume and handoff", () => {
@@ -161,8 +174,6 @@ describe("CLI parsing", () => {
       "--task",
       "hello",
       "--attach",
-      "--attach-close-drain-ms",
-      "1000",
     ]) as CliCommand & { kind: "start" };
     expect(command.kind).toBe("start");
     expect(command.start).toEqual({
@@ -173,7 +184,6 @@ describe("CLI parsing", () => {
     });
     expect(command.task).toBe("hello");
     expect(command.attach).toBe(true);
-    expect(command.attach_close_drain_ms).toBe(1000);
     expect(command.workspace).toBe("/tmp/wherever");
   });
   it("rejects bad values structurally", () => {
@@ -367,34 +377,99 @@ describe("CLI attach wire", () => {
     await world.cleanup();
   });
 
-  it("closes an in-flight turn honestly on EOF", async () => {
+  it("waits for NORMAL settlement after EOF — no fixed window cancels an accepted turn", async () => {
     const world = await cliHarness({ turn: { hang: true } });
-    const settle = await world.run(
-      [
-        "start",
-        "--provider",
-        "omp",
-        "--attach",
-        "--attach-close-drain-ms",
-        "150",
-        "--workspace",
-        world.repository,
-      ],
-      // prompt hangs; the EOF drain window expires, then close cancels the turn.
-      scripted(['{"action":"prompt","text":"slow one"}']),
-    );
+    let settledEarly = false;
+    let pump: AttachInputPump | undefined;
+    const running = world
+      .run(
+        ["start", "--provider", "omp", "--attach", "--workspace", world.repository],
+        // stdin EOFs with the prompt still in flight…
+        scripted(['{"action":"prompt","text":"slow one"}']),
+        {
+          onAttachPump: (attached) => {
+            pump = attached;
+          },
+        },
+      )
+      .then((result) => {
+        settledEarly = true;
+        return result;
+      });
+    const transport = await world.factory.transportAt(0);
+    await transport.awaitCommand("prompt");
+    // The eager pump has reached EOF; the turn is in flight. The ONLY way
+    // the wire can finish from here is the turn settling normally — there
+    // is no drain timer left to cancel it.
+    await pump!.settled();
+    expect(settledEarly).toBe(false);
+    // The provider settles the accepted turn normally: that result, not a
+    // cancellation, is what the wire reports before closing gracefully.
+    transport.push({
+      kind: "text",
+      role: "assistant",
+      stream_id: "s-1",
+      text: { text: "finally done", truncated: false },
+      final: true,
+    });
+    transport.push({ kind: "status", status: "idle", note: null });
+    const settle = await running;
     const documents = parseJsonDocuments(settle.out) as Array<{
       type: string;
       outcome?: string;
       action?: string;
     }>;
-    // The cancelled turn is reported honestly; an orderly close is not an error.
-    const cancelled = documents.find(
-      (document) => document.type === "result" && document.outcome === "cancelled",
+    const succeeded = documents.find(
+      (document) => document.type === "result" && document.outcome === "succeeded",
     );
-    expect(cancelled?.action).toBe("prompt");
+    expect(succeeded?.action).toBe("prompt");
     expect(documents[documents.length - 1]?.type).toBe("close");
     expect(settle.code).toBe(0);
+    await world.cleanup();
+  });
+
+  it("answers an explicit close without ever awaiting stdin EOF", async () => {
+    const world = await cliHarness({ turn: { writes: { "closed.md": "x\n" } } });
+    // A live writer holds stdin open forever (TTY/FIFO semantics): close
+    // must dispose the reader instead of waiting for an EOF that never
+    // comes, and still let dispatched commands land their documents.
+    const source = new PassThrough();
+    source.write('{"action":"close","mode":"graceful"}\n');
+    const closing = world.run(
+      ["start", "--provider", "omp", "--attach", "--workspace", world.repository],
+      source,
+    );
+    const result = await closing;
+    expect(result.code).toBe(0);
+    const documents = parseJsonDocuments(result.out) as Array<{ type: string }>;
+    expect(documents[0]?.type).toBe("session");
+    expect(documents[documents.length - 1]?.type).toBe("close");
+    source.destroy();
+    await world.cleanup();
+  });
+
+  it("settles a dispatched command before the wire exits on explicit close", async () => {
+    const world = await cliHarness({ turn: { writes: { "late.md": "landed\n" } } });
+    const source = new PassThrough();
+    // The turn is dispatched, then close follows at once.
+    source.write('{"action":"prompt","text":"go"}\n{"action":"close","mode":"graceful"}\n');
+    const result = await world.run(
+      ["start", "--provider", "omp", "--attach", "--workspace", world.repository],
+      source,
+    );
+    expect(result.code).toBe(0);
+    const documents = parseJsonDocuments(result.out) as Array<{
+      type: string;
+      action?: string;
+    }>;
+    // The prompt's document landed (succeeded, or honestly cancelled by the
+    // close the caller itself issued) — it never vanished.
+    const prompt = documents.find(
+      (document) => document.type === "result" && document.action === "prompt",
+    );
+    expect(prompt).toBeDefined();
+    expect(documents[documents.length - 1]?.type).toBe("close");
+    source.destroy();
     await world.cleanup();
   });
 });

@@ -68,10 +68,25 @@ export class HubFakeTransport implements LiveTransport {
   private wake: (() => void) | null = null;
   private ended = false;
   private readonly turnSettled = Promise.withResolvers<void>();
+  private readonly commandWaiters = new Set<() => void>();
 
   /** Resolves once this transport's scripted turn emitted its terminal idle. */
   awaitTurnSettled(): Promise<void> {
     return this.turnSettled.promise;
+  }
+
+  /** Resolves once a command of this kind has been delivered to this transport. */
+  async awaitCommand(kind: LiveCommand["kind"]): Promise<void> {
+    for (;;) {
+      if (this.commands.some((command) => command.kind === kind)) return;
+      await new Promise<void>((resolve) => {
+        this.commandWaiters.add(resolve);
+        if (this.commands.some((command) => command.kind === kind)) {
+          this.commandWaiters.delete(resolve);
+          resolve();
+        }
+      });
+    }
   }
 
   constructor(
@@ -118,6 +133,9 @@ export class HubFakeTransport implements LiveTransport {
 
   async send(command: LiveCommand): Promise<void> {
     this.commands.push(command);
+    const commandWaiters = [...this.commandWaiters];
+    this.commandWaiters.clear();
+    for (const notify of commandWaiters) notify();
     if (command.kind === "prompt" || command.kind === "follow_up") {
       const behavior = this.turnBehavior;
       if (behavior !== null) {
