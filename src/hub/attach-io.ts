@@ -53,6 +53,11 @@ export const ATTACH_CHUNK_MAX_BYTES = ATTACH_MAX_CHUNK_BYTES;
 
 const DISPOSED = Symbol("attach-input-disposed");
 
+interface ReadableInput {
+  pause?(): void;
+  unref?(): void;
+}
+
 export class AttachInputPump {
   private readonly lines: string[] = [];
   private readonly waiters = new Set<() => void>();
@@ -64,12 +69,18 @@ export class AttachInputPump {
   private disposed = false;
   private failed = false;
   private readonly iterator: AsyncIterator<Uint8Array | string>;
+  private readonly stream: ReadableInput | null;
   private readonly disposedSignal: Deferred<typeof DISPOSED> = deferred();
   private readonly reading: Promise<void>;
   readError: { code: string; message: string } | null = null;
 
   constructor(stdin: AsyncIterable<Uint8Array | string>) {
     this.iterator = stdin[Symbol.asyncIterator]();
+    this.stream =
+      typeof (stdin as ReadableInput).pause === "function" ||
+      typeof (stdin as ReadableInput).unref === "function"
+        ? (stdin as ReadableInput)
+        : null;
     this.reading = this.run();
   }
 
@@ -136,6 +147,7 @@ export class AttachInputPump {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.releaseInput();
     try {
       const closing = this.iterator.return?.(undefined);
       if (closing && typeof (closing as Promise<unknown>).catch === "function") {
@@ -163,6 +175,7 @@ export class AttachInputPump {
     this.pending = "";
     this.failed = true;
     this.readError = { code, message: detail };
+    this.releaseInput();
     try {
       const closing = this.iterator.return?.(undefined);
       if (closing && typeof (closing as Promise<unknown>).catch === "function") {
@@ -172,6 +185,17 @@ export class AttachInputPump {
       // As above: nothing left to release.
     }
     this.notify();
+  }
+
+  /** Stop Node TTY/socket activity as well as the async iterator. */
+  private releaseInput(): void {
+    try {
+      this.stream?.pause?.();
+      this.stream?.unref?.();
+    } catch {
+      // A stream that refuses pause/unref is not a reason to keep the wire
+      // alive; iterator.return() below remains the best available release.
+    }
   }
 
   private async run(): Promise<void> {

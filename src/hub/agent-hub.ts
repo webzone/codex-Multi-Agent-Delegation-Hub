@@ -177,6 +177,7 @@ export class AgentHub {
   private readonly commonDirResolved: string;
   private readonly bridges: readonly BridgedTransportFactory[];
   private readonly processQuota: number;
+  private readonly pendingCommands = new Map<string, Set<Promise<unknown>>>();
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
   private lastCleanupReport: HubCleanupDocument | null = null;
   private closed = false;
@@ -394,29 +395,46 @@ export class AgentHub {
   // Real-time commands (kernel owns the gates; P2 owns result identity)
   // ---------------------------------------------------------------------------
 
+  /** Keep a command's publication ahead of custody finalization on close. */
+  private trackCommand<T extends TurnDocument>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    const pending = operation();
+    const commands = this.pendingCommands.get(sessionId) ?? new Set<Promise<unknown>>();
+    commands.add(pending);
+    this.pendingCommands.set(sessionId, commands);
+    const release = (): void => {
+      commands.delete(pending);
+      if (commands.size === 0) this.pendingCommands.delete(sessionId);
+    };
+    void pending.then(release, release);
+    return pending;
+  }
+
+  private async waitForPendingCommands(sessionId: string): Promise<void> {
+    for (;;) {
+      const pending = this.pendingCommands.get(sessionId);
+      if (pending === undefined || pending.size === 0) return;
+      await Promise.allSettled([...pending]);
+    }
+  }
+
   async prompt(sessionId: string, text: string): Promise<TurnDocument> {
-    const turn = await this.kernel.prompt(sessionId, text);
-    return this.publish(turn);
+    return this.trackCommand(sessionId, async () => this.publish(await this.kernel.prompt(sessionId, text)));
   }
 
   async followUp(sessionId: string, text: string): Promise<TurnDocument> {
-    const turn = await this.kernel.followUp(sessionId, text);
-    return this.publish(turn);
+    return this.trackCommand(sessionId, async () => this.publish(await this.kernel.followUp(sessionId, text)));
   }
 
   async steer(sessionId: string, text: string): Promise<TurnDocument> {
-    const turn = await this.kernel.steer(sessionId, text);
-    return this.publish(turn);
+    return this.trackCommand(sessionId, async () => this.publish(await this.kernel.steer(sessionId, text)));
   }
 
   async cancel(sessionId: string, reason: string | null): Promise<TurnDocument> {
-    const turn = await this.kernel.cancel(sessionId, reason);
-    return this.publish(turn);
+    return this.trackCommand(sessionId, async () => this.publish(await this.kernel.cancel(sessionId, reason)));
   }
 
   async requestStatus(sessionId: string): Promise<TurnDocument> {
-    const turn = await this.kernel.requestStatus(sessionId);
-    return this.publish(turn);
+    return this.trackCommand(sessionId, async () => this.publish(await this.kernel.requestStatus(sessionId)));
   }
 
   async respondPermission(
@@ -425,8 +443,9 @@ export class AgentHub {
     decision: PermissionDecision,
     note: string | null = null,
   ): Promise<TurnDocument> {
-    const turn = await this.kernel.respondPermission(sessionId, requestId, decision, note);
-    return this.publish(turn);
+    return this.trackCommand(sessionId, async () =>
+      this.publish(await this.kernel.respondPermission(sessionId, requestId, decision, note)),
+    );
   }
 
   /**
@@ -507,7 +526,12 @@ export class AgentHub {
    * the retention window passes.
    */
   async close(sessionId: string, mode: StopMode = "graceful"): Promise<HubCloseDocument> {
-    const { close, finalize } = await this.lifecycle.closeSession(this.kernel, sessionId, mode);
+    const { close, finalize } = await this.lifecycle.closeSession(
+      this.kernel,
+      sessionId,
+      mode,
+      () => this.waitForPendingCommands(sessionId),
+    );
     let leaseReleased = false;
     if (close.record.status === "closed") {
       // Proven shutdown releases the ownership lease; an `orphaned` close

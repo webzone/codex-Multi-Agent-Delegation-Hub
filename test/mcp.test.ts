@@ -38,9 +38,9 @@ async function mcpHarness(
   );
   factory.defaultTurn = turn;
   const hubOptions: AgentHubOptions = {
+    home: tmpRoot,
     transportFactories: [bridgeTransportFactory(factory)],
     providerFactories: [hubFakeProviderFactory],
-    tmpRoot,
     probes: hubFakeProbes(),
   };
   // Each harness gets its own supervisor so in-flight process quotas never
@@ -124,7 +124,7 @@ describe("MCP tool surface", () => {
     });
     expect(isError(turn)).toBe(false);
     expect(payload(turn)["outcome"]).toBe("succeeded");
-    expect(payload(turn)["checkpoint"]).not.toBeNull();
+    expect(payload(turn)["result"]).not.toBeNull();
 
     const events = await world.client.callTool({
       name: "hub_events",
@@ -143,14 +143,22 @@ describe("MCP tool surface", () => {
       arguments: { session_id: sessionId, workspace: world.repository },
     });
     expect(isError(closed)).toBe(false);
-    expect((payload(closed)["cleanup_errors"] as unknown[])).toEqual([]);
+    expect(payload(closed)["finalize"]).toBeDefined();
+    expect((payload(closed)["record"] as { status: string }).status).toBe("closed");
+
+    const result = payload(turn)["result"] as { seq: number; commit: string };
 
     const handoff = await world.client.callTool({
       name: "hub_handoff",
-      arguments: { session_id: sessionId, workspace: world.repository },
+      arguments: {
+        session_id: sessionId,
+        workspace: world.repository,
+        decision: "accepted",
+        result_seq: result.seq,
+        commit: result.commit,
+      },
     });
-    expect(payload(handoff)["changed_files"]).toEqual(["mcp.md"]);
-    expect(String(payload(handoff)["apply_hint"])).toContain("git cherry-pick");
+    expect((payload(handoff)["handoff"] as { decision: string }).decision).toBe("accepted");
 
     const status = await world.client.callTool({
       name: "hub_status",
@@ -271,10 +279,10 @@ describe("MCP tool surface", () => {
     const world = await mcpHarness();
     const gc = await world.client.callTool({
       name: "hub_gc",
-      arguments: { workspace: world.repository, dry_run: true },
+      arguments: { workspace: world.repository },
     });
     expect(isError(gc)).toBe(false);
-    expect(payload(gc)["worktrees_pruned"]).toBe(false);
+    expect((payload(gc)["cleanup"] as { deleted: unknown[] }).deleted).toEqual([]);
 
     const probe = await world.client.callTool({
       name: "hub_probe",

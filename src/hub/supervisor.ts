@@ -1,6 +1,7 @@
 import { realpathSync } from "node:fs";
 
 import { AgentHubError } from "../errors.js";
+import { resolveRepositoryIdentity } from "../git.js";
 import { AgentHub, HUB_PROCESS_SESSION_QUOTA, type AgentHubOptions } from "./agent-hub.js";
 
 /**
@@ -56,16 +57,25 @@ export class AgentHubSupervisor {
     options: AgentHubOptions = {},
     open: HubOpen = (path, hubOptions) => AgentHub.open(path, hubOptions),
   ): Promise<AgentHub> {
-    const hub = await open(workspace, options);
-    const key = canonicalCommonDir(hub.commonDir);
+    // Resolve the identity before constructing a fresh hub. Constructing one
+    // first would run its automatic recovery pass; on every subsequent MCP
+    // command that could misclassify a live provider owned by the cached hub
+    // (especially when a probe cannot see the provider's PID) and close its
+    // custody before the cached hub handles the command.
+    const identity = await resolveRepositoryIdentity(workspace);
+    const key = canonicalCommonDir(identity.common_dir);
     const cached = this.ready.get(key);
     if (cached !== undefined) {
-      // The fresh hub above only resolved the identity; no session ever
-      // launched through it, so settling its pumps is the whole cleanup.
-      await hub.settle();
       return cached;
     }
-    this.ready.set(key, hub);
+    const hub = await open(workspace, options);
+    const openedKey = canonicalCommonDir(hub.commonDir);
+    const existing = this.ready.get(openedKey);
+    if (existing !== undefined) {
+      await hub.settle();
+      return existing;
+    }
+    this.ready.set(openedKey, hub);
     return hub;
   }
 

@@ -59,9 +59,9 @@ async function cliHarness(
     factory.probeResult = { found: false, version: null, detail: "no RPC v2 evidence" };
   }
   const hubOptions: AgentHubOptions = {
+    home: tmpRoot,
     transportFactories: [bridgeTransportFactory(factory)],
     providerFactories: [hubFakeProviderFactory],
-    tmpRoot,
     probes: hubFakeProbes(),
     ...options.hubOptions,
   };
@@ -168,7 +168,6 @@ describe("CLI parsing", () => {
       "interactive",
       "--max-output-bytes",
       "4096",
-      "--allow-dirty",
       "--workspace",
       "/tmp/wherever",
       "--task",
@@ -180,7 +179,6 @@ describe("CLI parsing", () => {
       provider: "hermes",
       permission_policy: "interactive",
       max_text_bytes: 4096,
-      allow_dirty: true,
     });
     expect(command.task).toBe("hello");
     expect(command.attach).toBe(true);
@@ -213,29 +211,40 @@ describe("CLI one-shot commands", () => {
     const [document] = parseJsonDocuments(result.out) as Array<Record<string, never>>;
     const typed = document as unknown as {
       session: { session_id: string; probe: { found: boolean } };
-      turn: { outcome: string; checkpoint: unknown };
-      close: { cleanup_errors: unknown[] };
-      handoff: { changed_files: string[]; apply_hint: string };
+      turn: { outcome: string; result: { seq: number; commit: string } | null };
+      close: { record: { status: string }; finalize: unknown };
+      next: { handoff_command: string; discard_command: string };
     };
     expect(typed.session.probe.found).toBe(true);
     expect(typed.turn.outcome).toBe("succeeded");
-    expect(typed.turn.checkpoint).not.toBeNull();
-    expect(typed.close.cleanup_errors).toEqual([]);
-    expect(typed.handoff.changed_files).toEqual(["fixed.md"]);
-    expect(typed.handoff.apply_hint).toContain("git cherry-pick");
+    expect(typed.turn.result).not.toBeNull();
+    expect(typed.close.record.status).toBe("closed");
+    expect(typed.close.finalize).toBeDefined();
+    expect(typed.next.handoff_command).toContain("--decision accepted");
 
     // The durable session is now visible to a fresh command process.
     const status = await world.run(["status", typed.session.session_id, "--workspace", world.repository]);
     expect(status.code).toBe(0);
     const [statusDoc] = parseJsonDocuments(status.out) as Array<Record<string, unknown>>;
-    expect((statusDoc as { state: { status: string } }).state.status).toBe("closed");
+    expect((statusDoc as { workspace: { custody: string } }).workspace.custody).toBe("closed");
     expect((statusDoc as { attached_here: boolean }).attached_here).toBe(false);
 
     const list = await world.run(["status", "--workspace", world.repository]);
     const [listDoc] = parseJsonDocuments(list.out) as Array<{ sessions: unknown[] }>;
     expect(listDoc.sessions).toHaveLength(1);
 
-    const handoff = await world.run(["handoff", typed.session.session_id, "--workspace", world.repository]);
+    const handoff = await world.run([
+      "handoff",
+      typed.session.session_id,
+      "--decision",
+      "accepted",
+      "--result-seq",
+      String(typed.turn.result?.seq),
+      "--commit",
+      typed.turn.result?.commit ?? "",
+      "--workspace",
+      world.repository,
+    ]);
     expect(handoff.code).toBe(0);
 
     // Resume: the durable line continues (transport echoes identity back).
@@ -303,14 +312,13 @@ describe("CLI one-shot commands", () => {
     const [secondDoc] = parseJsonDocuments(second.out) as Array<{
       session: { session_id: string };
       turn: { kind: string };
-      handoff: { changed_files: string[] };
+      next: { handoff_command: string };
     }>;
     expect((secondDoc as { session: { session_id: string } }).session.session_id).toBe(sessionId);
     expect((secondDoc as { turn: { kind: string } }).turn.kind).toBe("follow_up");
-    expect((secondDoc as { handoff: { changed_files: string[] } }).handoff.changed_files.sort()).toEqual([
-      "one.md",
-      "two.md",
-    ]);
+    expect((secondDoc as { next: { handoff_command: string } }).next.handoff_command).toContain(
+      "--decision accepted",
+    );
     await world.cleanup();
   });
 
@@ -318,8 +326,13 @@ describe("CLI one-shot commands", () => {
     const world = await cliHarness();
     const clean = await world.run(["gc", "--workspace", world.repository]);
     expect(clean.code).toBe(0);
-    const [report] = parseJsonDocuments(clean.out) as Array<{ scanned: number; sessions: unknown[] }>;
-    expect((report as { scanned: number }).scanned).toBe(0);
+    const [report] = parseJsonDocuments(clean.out) as Array<{
+      recovery: { reconciled: unknown[] };
+      cleanup: { deleted: unknown[]; retained: unknown[] };
+    }>;
+    expect(report.recovery.reconciled).toEqual([]);
+    expect(report.cleanup.deleted).toEqual([]);
+    expect(report.cleanup.retained).toEqual([]);
     await world.cleanup();
   });
 });

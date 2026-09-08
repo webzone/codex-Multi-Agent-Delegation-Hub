@@ -1,14 +1,15 @@
 # agent-hub
 
-Provider-neutral coding-agent sessions with durable, checkpointed workspaces.
+Provider-neutral coding-agent sessions with durable, real-time interaction and
+isolated workspaces.
 
 One hub object composes two cores:
 
 - **`InteractionKernel`** — the Git-free interaction core: prompt, follow_up,
   steer, cancel, status, permission, event streaming, resume boundaries.
 - **`WorkspaceLifecycle`** — the durable workspace core: hub-owned isolated
-  worktrees, a hook-free checkpoint chain pinned on a private Git ref, an
-  ownership lease, sidecar/CAS transactional state, safe reconciliation.
+  worktrees, exact result identities, handoff, retention, leases, recovery,
+  and safe garbage collection.
 
 Interaction crosses **only** the shipped provider transports, auto-selected
 per provider:
@@ -48,15 +49,14 @@ npm run build
 npm install -g .
 ```
 
-`npm install -g .` links the `agent-hub` and `agent-hub-mcp` commands built
-from `dist/`. Every example below assumes the installed command — the
-same binary, the same semantics, no per-repo aliasing.
+`npm install -g .` installs the `agent-hub` and `agent-hub-mcp` commands built
+from `dist/`.
 
 ### Upgrading
 
 ```sh
 cd agent-hub
-git pull
+git pull --ff-only
 npm ci
 npm run build
 npm install -g .   # refreshes the same global link
@@ -71,10 +71,10 @@ breaking rewrite: nothing from the 0.1 command surface carries over.
 npm uninstall -g agent-hub
 ```
 
-That removes both commands. Repository-local state (`<git-common-dir>/agent-hub/**`,
-session refs under `refs/agent-hub/live/…`, hub worktrees under the OS temp
-namespace) is **not** touched by uninstalling — reconcile first with
-`agent-hub gc` per repository; `handoff` tells you what each session pinned.
+That removes both commands. Durable state is kept under
+`$AGENT_HUB_HOME` (default `~/.local/share/agent-hub`) and is **not** touched
+by uninstalling. Inspect it with `agent-hub status`, make the required
+handoff decisions, and run `agent-hub gc` after retention expires.
 
 ## Quick start
 
@@ -91,9 +91,8 @@ agent-hub start --provider pi --task "triage the TODO list in docs/plan.md"
 agent-hub probe
 agent-hub probe omp            # v2-only refusal shows up here as found: false
 
-# Review and adopt the result (the hub never merges anything for you)
-agent-hub handoff <session-id>
-git cherry-pick <base>..<ref>   # exactly what handoff's apply_hint names
+# Review the exact result identity printed by the one-shot document
+agent-hub status <session-id>
 ```
 
 Every command answers with one JSON document on stdout; human guidance goes
@@ -105,10 +104,10 @@ document carries `error`), `2` usage error.
 ### `agent-hub start`
 
 ```
-agent-hub start --provider <omp|pi|agy|hermes> [--transport <id>]
+agent-hub start --provider <omp|pi|agy|hermes>
                 [--task TEXT] [--workspace DIR]
                 [--permission-policy deny|interactive] [--max-output-bytes N]
-                [--allow-dirty] [--attach]
+                [--attach]
 ```
 
 Reserves resources under a repository-wide admin lock (quota check → worktree
@@ -119,12 +118,13 @@ the durable pair: the kernel's session record plus the lifecycle state.
 
 Without `--attach` this is one-shot: `--task` is required, the turn settles,
 the session closes, and the final document contains `session`, `turn`,
-`close`, and `handoff`.
+`close`, and `next`. `turn.result` is the exact result identity to use for
+handoff.
 
 ### `agent-hub resume <session-id>`
 
-Continues a **terminal** durable session from this repository: a fresh
-hub worktree is materialized at the checkpoint-chain head, the recorded
+Continues a **closed** durable session from this repository: its retained
+hub worktree is reopened at the recorded head, the recorded
 provider resume handle is replayed and the provider identity must round-trip
 (a transport that cannot show post-handshake resume state is refused — a
 silent fresh session would lie), and the **same** durable line + ref advance.
@@ -138,27 +138,27 @@ lifecycle state, the kernel mirror record, lease facts, and the session ref.
 
 ### `agent-hub handoff <session-id>`
 
-The result handoff for a released terminal session: the checkpoint chain
-(ref, commits, per-checkpoint reasons), changed files, diff stat, and the
-exact human review/adopt command. **The hub never merges, applies, or moves
-your branch** — adoption is a `git cherry-pick` you run after review.
+Handoff is an explicit consumer decision for a closed workspace. It must name
+the exact current result:
 
-### `agent-hub gc [--dry-run]`
+```sh
+agent-hub handoff <session-id> \
+  --decision accepted|discarded \
+  --result-seq N --commit <40-character-commit> \
+  --workspace /path/to/repository
+```
 
-Safe reconciliation for this repository:
+The commit and sequence come from `turn.result` or `status`. Handoff starts
+the retention clock but does not modify the caller's branch. The hub never
+merges or applies the work for you.
 
-1. re-prove every ownership lease (foreign hosts, live hub processes, and
-   anything unprovable are left completely untouched and reported);
-2. reap provably-orphaned provider process groups (bounded
-   SIGTERM→SIGKILL, group-death proof required);
-3. pin surviving worktrees as a `crash_recovery` checkpoint **before**
-   rewriting state to `orphaned`;
-4. release leases only after the worktrees they name are proven removed;
-5. retry worktree removal for terminal sessions, then `worktree prune`.
+### `agent-hub gc`
 
-`--dry-run` prints every intended action without touching anything. Exit
-code `1` means at least one session needs manual review — that is data, not
-a crash.
+GC first re-proves leases and recovers only what can be proven. It deletes a
+workspace only after an exact `accepted` or `discarded` handoff, an expired
+retention deadline, no live or uncertain lease, no active reference, and
+consistent Git state. Unacknowledged, orphaned, uncertain, or actively used
+work is retained and reported. Exit code `1` means manual review is needed.
 
 ### `agent-hub probe [provider ...]`
 
@@ -182,48 +182,48 @@ NDJSON: one command per line on stdin, documents on stdout.
 -> {"action":"close","mode":"graceful|terminate"}
 <- {"type":"session",...}                      the launch document
 <- {"type":"event",event}                      normalized provider events (gapless seqs)
-<- {"type":"result",...}                       a settled command (turn docs pin checkpoints)
+<- {"type":"result",...}                       a settled command and result identity
 <- {"type":"error",error}                      structured refusal/failure (never a hang)
 <- {"type":"close",...}                        teardown facts
 ```
 
-Closing stdin ends the session gracefully. Commands are gated against the
-launch's capability snapshot: an `outcome: "unsupported"` result with a
-`stage: "capability"` error means the hub refused the command pre-dispatch —
-choosing a different provider or flow is the fix, not retrying. A
-`checkpoint_error` on a settled turn means the turn ended but the chain
-could not be pinned: the session's durable chain is stale and is reported
-as such, never silently.
+The reader starts before provider startup finishes, so input written during
+the handshake is queued and delivered exactly once. It enforces hard bounds
+of 128 queued commands, 1 MiB of queued text, 1 MiB per chunk, and 1 MiB per
+line; overflow fails closed. Closing stdin is EOF, not cancellation: accepted
+commands settle normally before graceful close. An explicit `close` stops
+intake immediately without waiting for an open TTY or FIFO, while already
+dispatched commands still produce result documents.
+
+Commands are gated against the launch capability snapshot. An
+`outcome: "unsupported"` result with a `stage: "capability"` error means the
+hub refused the command before dispatch; nothing reached the provider.
 
 ## Semantics worth knowing
 
-**Where work happens.** The provider edits a hub-owned worktree under the OS
-temp namespace, detached at a captured commit. Your checkout is only ever the
-identity anchor: it is required to be clean unless `--allow-dirty` (the base
-is a commit either way; your uncommitted changes never travel).
+**Where work happens.** The provider edits a hub-owned isolated worktree below
+`AGENT_HUB_HOME` (default `~/.local/share/agent-hub`). Your checkout is only
+the identity anchor and is never used as the provider workspace.
 
-**Checkpoints are the artifact.** Every terminal boundary the hub observes —
-turn end, cancel, error, close — captures the worktree's full working state
-as the next commit of a hook-free chain, committed with hub-owned identity
-through a sidecar-guarded compare-and-swap on `refs/agent-hub/live/<session-id>`
-(the on-disk namespace label is part of the durable storage layout and stays).
-Durable records store identity and lineage only: no task text, transcripts,
-or event bodies by construction.
+**Results are exact.** Every terminal prompt or follow-up turn publishes a
+`result_seq`, commit, tree, and private workspace ref. The result is recorded
+before custody can be handed off. Durable records store identities and
+lineage only: task text, transcripts, and event bodies are not persisted.
 
-**Close only tears down on proof.** If shutdown cannot prove the provider
-process group is gone, the session is `orphaned`, not `closed`: the lease,
-worktree, and ownership facts stay, and a `terminate`-authorized close or
-`gc` finishes the job. A lease is never released unless its worktree removal
-ran, under the admin lock, and was proven.
+**Close retains work.** Closing captures final state and retains the worktree,
+results, ref, and ownership facts. If shutdown cannot prove the provider
+process group is gone, the session is `orphaned`, not `closed`; recovery and
+GC leave it in place until ownership is proven. Deletion is only possible
+through GC after the exact handoff and retention checks pass.
 
 **Permissions.** `deny` (default) answers permission requests headlessly;
 `interactive` surfaces them verbatim and answers only with `allow_once` or
 `deny` — any other verdict is a caller error, never silently converted.
 
-**Ownership.** One hub process per session. Running sessions live in the
-process that launched them (a CLI one-shot, an attached CLI, or the MCP
-server). After a hub-process loss: `agent-hub gc` re-proves and reconciles,
-`agent-hub resume` adopts.
+**Ownership.** One hub process owns a running session. MCP requests for a
+session must use the same `workspace`, so the supervisor can reuse the owning
+hub. After a hub-process loss, `agent-hub gc` re-proves and reconciles before
+`agent-hub resume` adopts a retained session.
 
 **Quotas and bounds.** 8 live sessions per hub process, 4 durable leases per
 Git common dir, follow-up queues of 32 messages / 1 MiB total / 128 KiB per
@@ -265,11 +265,14 @@ import { AgentHub } from "agent-hub";
 const hub = await AgentHub.open("/path/to/repo");
 const started = await hub.start({ provider: "omp", permission_policy: "interactive" });
 const turn = await hub.prompt(started.session_id, "fix the flaky test");
-if (turn.checkpoint === null && turn.checkpoint_error === undefined) {
-  // unsupported outcome — refused pre-dispatch, nothing reached the provider
+await hub.close(started.session_id);
+if (turn.result !== null) {
+  await hub.handoff(started.session_id, {
+    decision: "accepted",
+    result_seq: turn.result.seq,
+    commit: turn.result.commit,
+  });
 }
-const closed = await hub.close(started.session_id);
-const handoff = await hub.handoff(started.session_id);
 ```
 
 `hub.kernel` is the `InteractionKernel` and `hub.lifecycle` the
@@ -282,7 +285,7 @@ snapshot — trust the claim and its evidence, not hope.
 ## Safety and scope
 
 - The hub never merges, fast-forwards, rebases, or applies to your branch.
-  Handoff names a ref and a review command; adoption is yours.
+  Handoff names the exact result; review and adoption are yours.
 - Provider stderr, transcripts, and task text never enter durable records or
   error messages; bounded previews are the only text that crosses.
 - Locks: the admin lock serializes worktree/lease administration; the

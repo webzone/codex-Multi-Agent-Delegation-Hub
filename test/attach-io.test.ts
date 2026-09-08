@@ -1,3 +1,6 @@
+import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -226,3 +229,59 @@ describe("AttachInputPump dispose", () => {
   });
 });
 
+describe("AttachInputPump on a POSIX PTY", () => {
+  it.skipIf(process.platform === "win32" || !existsSync("/usr/bin/expect"))(
+    "explicit close disposes a real TTY reader while the writer stays open",
+    async () => {
+      const expectBin = "/usr/bin/expect";
+      const moduleUrl = new URL("../src/hub/attach-io.ts", import.meta.url).href;
+      const childSource = [
+        `import { AttachInputPump } from ${JSON.stringify(moduleUrl)};`,
+        "const pump = new AttachInputPump(process.stdin);",
+        "const event = await pump.next();",
+        "if (event?.kind !== 'line') process.exitCode = 2;",
+        "pump.dispose();",
+        "process.stdout.write(event?.kind ?? 'none');",
+      ].join(" ");
+      const expectSource = [
+        "log_user 1",
+        `spawn ${process.execPath} --import tsx -e {${childSource}}`,
+        "send \"{\\\"action\\\":\\\"close\\\",\\\"mode\\\":\\\"graceful\\\"}\\r\"",
+        "expect eof",
+      ].join("\n");
+      const child = spawn(
+        expectBin,
+        ["-c", expectSource],
+        { stdio: ["pipe", "pipe", "pipe"] },
+      );
+      let output = "";
+      let error = "";
+      child.stdout.on("data", (chunk: Buffer) => {
+        output += chunk.toString("utf8");
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        error += chunk.toString("utf8");
+      });
+      const finished = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+        child.once("exit", (code, signal) => resolve({ code, signal }));
+      });
+
+      // Expect gives the child a real PTY. Its stdin remains open after the
+      // command is sent: this is the condition that previously made explicit
+      // close wait forever on a TTY/FIFO.
+      let timedOut = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, 3_000);
+      const result = await finished;
+      clearTimeout(timeout);
+      child.stdin.destroy();
+      if (timedOut) {
+        throw new Error(`PTY child did not exit: ${error || output}`);
+      }
+      expect(result.code, error || output).toBe(0);
+      expect(output).toContain("line");
+    },
+  );
+});

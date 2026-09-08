@@ -139,7 +139,7 @@ export function kernelizeResume(state: ProviderResumeState): ResumeState {
  * Required provider fields must already be in `data` — the adapter never
  * invents a resume fact a transport did not previously report.
  */
-export function liveResumeOf(state: ResumeState): ProviderResumeState {
+function liveResumeOf(state: ResumeState): ProviderResumeState {
   const verification = verificationOf(state.verified, state.verified_via);
   const base = {
     provider_session_id: state.provider_session_id,

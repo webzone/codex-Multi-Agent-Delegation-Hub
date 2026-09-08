@@ -392,7 +392,6 @@ export class WorkspaceLifecycle {
     kernel: InteractionKernel,
     input: ProvisionInput & {
       provider: string;
-      transport?: string;
       max_text_bytes?: number;
       permission_policy?: "deny" | "interactive";
     },
@@ -400,7 +399,6 @@ export class WorkspaceLifecycle {
     const workspace = await this.provision(input);
     const start = await kernel.start({
       provider: input.provider,
-      ...(input.transport ? { transport: input.transport } : {}),
       workspace: workspace.worktree_path,
       session_id: workspace.session_id,
       ...(input.max_text_bytes ? { max_text_bytes: input.max_text_bytes } : {}),
@@ -428,8 +426,14 @@ export class WorkspaceLifecycle {
     kernel: InteractionKernel,
     sessionId: string,
     mode: "graceful" | "terminate" = "graceful",
+    beforeFinalize?: () => Promise<void>,
   ): Promise<{ close: Awaited<ReturnType<InteractionKernel["close"]>>; finalize: FinalizeReport }> {
     const close = await kernel.close(sessionId, mode);
+    // A host may be publishing the terminal turn settled by kernel.close.
+    // Let that publication finish while custody is still live; otherwise a
+    // concurrent explicit close could finalize first and erase the result's
+    // exact identity from the public response.
+    await beforeFinalize?.();
     const stop = close.stop;
     const evidence = stop
       ? `kernel ${mode} close: stop=${stop.status} exit_code=${stop.exit_code ?? "null"} exit_signal=${stop.exit_signal ?? "null"}`
