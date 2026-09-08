@@ -138,6 +138,32 @@ is advertised by the MCP server and recorded by the Codex integration.
 
 ## Use from Codex
 
+The packaged `agent-hub` skill is the Codex instruction layer for this
+project. It is not another provider and it is not the MCP server itself:
+
+- `agent-hub-mcp` provides the `hub_*` tools.
+- `skills/agent-hub/SKILL.md` tells Codex when and how to use those tools,
+  including provider probing, real-time interaction, result review, handoff,
+  and safe worktree cleanup.
+- The CLI is the fallback when the current Codex session does not expose the
+  MCP tools.
+
+After `agent-hub codex install`, restart Codex so it discovers the skill and
+the MCP server. You normally do not execute `SKILL.md` directly. Instead,
+describe the work in your Codex conversation and mention Agent Hub when you
+want the skill to apply:
+
+```text
+Use Agent Hub in this workspace. Probe the available providers, start an omp
+session in its isolated worktree, keep it interactive, and review the exact
+commit before handoff. Do not modify my current checkout.
+```
+
+When `hub_*` tools are available, Codex uses the MCP path automatically. The
+skill requires every call for one session to use the same `workspace`, and it
+requires an explicit review of the returned `result_seq` and commit before
+accepting the work. If MCP is unavailable, follow the CLI examples below.
+
 Agent Hub works with Codex in two ways. Use the MCP connection when Codex
 should keep an agent session available for follow-up questions and steering;
 use the CLI when you want Codex to run a self-contained command in its
