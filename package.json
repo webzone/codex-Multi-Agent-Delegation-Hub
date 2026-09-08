@@ -1,6 +1,6 @@
 {
   "name": "agent-hub",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Provider-neutral agent sessions in durable, isolated workspaces: omp (RPC v2), pi (RPC), agy (stream-json), hermes (ACP).",
   "keywords": [
     "agent",
@@ -24,14 +24,17 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "dist"
+    "dist",
+    "skills/agent-hub/SKILL.md",
+    "README.md"
   ],
   "bin": {
     "agent-hub": "./dist/cli.js",
     "agent-hub-mcp": "./dist/mcp.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/build.mjs",
+    "prepack": "npm run build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "hub": "tsx src/cli.ts",

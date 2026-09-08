@@ -7,6 +7,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import { AgentHubError, asHubError } from "./errors.js";
+import { PACKAGE_VERSION } from "./version.js";
 import { AgentHub, HUB_PROVIDERS, type TurnDocument } from "./hub/agent-hub.js";
 import type { AgentHubOptions } from "./hub/agent-hub.js";
 import {
@@ -98,7 +99,7 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     return supervisor.launch(hub, run);
   }
 
-  const server = new McpServer({ name: "agent-hub", version: "0.2.0" });
+  const server = new McpServer({ name: "agent-hub", version: PACKAGE_VERSION });
 
   server.registerTool(
     "hub_start",

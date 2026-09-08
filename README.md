@@ -39,7 +39,34 @@ one agent per session, durably, and hand the work back for a human to adopt.
   (`omp`, `pi`, `agy`, `hermes`; each honors an `AGENT_HUB_<PROVIDER>_BIN`
   env override for the executable path)
 
-## Install (from Git)
+## Install
+
+### Recommended: install the versioned package
+
+The npm package is the one distribution unit: it contains the `agent-hub` CLI,
+the `agent-hub-mcp` stdio server, and the Codex skill.
+
+```sh
+npm install -g agent-hub@latest
+agent-hub codex install
+agent-hub codex status
+```
+
+`agent-hub codex install` copies the packaged skill to
+`$CODEX_HOME/skills/agent-hub/SKILL.md` (or `~/.codex/skills/...`) and adds
+the `agent_hub` MCP registration only when it is absent. It never overwrites
+an existing MCP entry by default. Use `--repair-mcp` only when you explicitly
+want to replace that entry. A modified skill is retained and reported as a
+conflict; use `--force-skill` only after reviewing the local changes.
+
+The installer writes a small, Codex-home-specific ownership manifest under
+`$XDG_STATE_HOME/agent-hub/codex/` (or `~/.local/state/...`). It uses that
+manifest and a SHA-256 hash to make upgrades and uninstall safe. A custom
+`--codex-home` therefore cannot accidentally reuse or remove another Codex
+home's integration. It does not use npm `postinstall` or `preuninstall` hooks
+and never touches durable agent sessions under `$AGENT_HUB_HOME`.
+
+### Install from Git (development install)
 
 ```sh
 git clone <repository-url> agent-hub
@@ -47,31 +74,38 @@ cd agent-hub
 npm ci
 npm run build
 npm install -g .
+agent-hub codex install
 ```
 
 `npm install -g .` installs the `agent-hub` and `agent-hub-mcp` commands built
-from `dist/`.
+from `dist/`; the following `agent-hub codex install` installs the matching
+skill and reconciles the Codex MCP registration.
 
 ### Upgrading
 
 ```sh
-cd agent-hub
-git pull --ff-only
-npm ci
-npm run build
-npm install -g .   # refreshes the same global link
+npm install -g agent-hub@latest
+agent-hub codex install
+agent-hub codex status
 ```
 
-The package is `agent-hub` (versioned in `package.json`). The 0.2 line is the
-breaking rewrite: nothing from the 0.1 command surface carries over.
+For a checkout-based development install, use `git pull --ff-only`, then
+`npm ci`, `npm run build`, `npm install -g .`, and `agent-hub codex install`.
+The CLI, MCP server, and skill always use the same version from `package.json`.
+Restart Codex or the MCP host after an upgrade so a running host starts the new
+server and reloads the skill.
 
 ### Uninstalling
 
 ```sh
+agent-hub codex uninstall
 npm uninstall -g agent-hub
 ```
 
-That removes both commands. Durable state is kept under
+The first command removes only the skill and MCP registration created by Agent
+Hub. If either was changed after installation, it is retained and the command
+reports a conflict. The second command removes both CLI commands. Durable state
+is kept under
 `$AGENT_HUB_HOME` (default `~/.local/share/agent-hub`) and is **not** touched
 by uninstalling. Inspect it with `agent-hub status`, make the required
 handoff decisions, and run `agent-hub gc` after retention expires.
@@ -99,6 +133,9 @@ Every command answers with one JSON document on stdout; human guidance goes
 to stderr. Exit codes: `0` success, `1` structured operation failure (the
 document carries `error`), `2` usage error.
 
+Check the installed distribution with `agent-hub --version`. The same version
+is advertised by the MCP server and recorded by the Codex integration.
+
 ## Use from Codex
 
 Agent Hub works with Codex in two ways. Use the MCP connection when Codex
@@ -108,7 +145,14 @@ terminal.
 
 ### Recommended: connect the MCP server
 
-Register the local MCP server once:
+The package can install the skill and MCP registration together:
+
+```sh
+agent-hub codex install
+agent-hub codex status
+```
+
+For a manual registration, use:
 
 ```sh
 codex mcp add agent_hub -- agent-hub-mcp
@@ -116,7 +160,9 @@ codex mcp get agent_hub
 ```
 
 If `agent_hub` is already listed by `codex mcp list`, do not add it again.
-Restart Codex if the tools do not appear in the current session. The server
+`agent-hub codex install` follows the same rule and leaves an existing entry
+untouched unless `--repair-mcp` is supplied. Restart Codex if the tools do not
+appear in the current session. The server
 provides `hub_probe`, `hub_start`, `hub_prompt`, `hub_follow_up`, `hub_steer`,
 `hub_cancel`, `hub_command_status`, `hub_events`, `hub_permission`,
 `hub_close`, `hub_resume`, `hub_status`, `hub_handoff`, and `hub_gc`.
@@ -161,6 +207,29 @@ agent-hub start --provider omp --workspace "$PWD" --attach
 如果探测不到 v2 证据，Agent Hub 会拒绝启动，而不是猜测旧协议。provider
 完成后，先审查精确的 commit/tree，再决定接受或丢弃；最后让
 `agent-hub gc` 或自动 GC 清理已经过 retention 期的废弃 worktree。
+
+### Use from another MCP-capable AI agent
+
+The MCP server is provider-neutral and does not depend on Codex. Any MCP host
+can use this stdio configuration:
+
+```json
+{
+  "mcpServers": {
+    "agent-hub": {
+      "command": "agent-hub-mcp"
+    }
+  }
+}
+```
+
+If the host does not inherit your shell `PATH`, run `agent-hub codex status`
+or `command -v agent-hub-mcp` and put that absolute executable path in the
+client configuration. The skill is included at
+`<global-npm-root>/agent-hub/skills/agent-hub/SKILL.md`; copy it into the
+agent's supported skill directory when that agent implements the same
+`SKILL.md` convention. MCP and the skill are complementary: MCP provides the
+tools, while the skill teaches an agent when and how to use them.
 
 ## Commands
 

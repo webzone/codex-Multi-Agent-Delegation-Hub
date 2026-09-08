@@ -8,6 +8,46 @@ description: Run provider-neutral coding-agent sessions (omp, pi, agy, hermes) t
 Use the installed `agent-hub` command when a coding task should be carried by
 a separate local agent while the orchestrator keeps review and adoption.
 
+## Install, upgrade, and uninstall
+
+The npm package is the single distribution unit. It contains the CLI, the
+stdio MCP server, and this skill. For Codex, install or upgrade all three with:
+
+```sh
+npm install -g agent-hub@latest
+agent-hub codex install
+agent-hub codex status
+```
+
+`agent-hub codex install` copies this skill to
+`$CODEX_HOME/skills/agent-hub/SKILL.md` (normally `~/.codex/skills/...`) and
+keeps a separate ownership record for each Codex home. It registers the
+`agent_hub` MCP server only when it is absent. It does not
+overwrite an existing MCP registration unless `--repair-mcp` is explicit. If
+the installed skill was edited, the installer refuses to replace it unless
+`--force-skill` is explicit. Restart Codex after an upgrade if the skill or
+MCP tools are not visible yet.
+
+To remove the Codex integration and then the package:
+
+```sh
+agent-hub codex uninstall
+npm uninstall -g agent-hub
+```
+
+Uninstall never deletes `$AGENT_HUB_HOME`, retained worktrees, results, or
+other durable session data. A skill or MCP registration changed outside Agent
+Hub is retained rather than deleted.
+
+Other MCP-capable AI agents can use the same `agent-hub-mcp` stdio command and
+the JSON MCP configuration in the project README. If they support
+`SKILL.md`, copy this packaged file from
+`<global-npm-root>/agent-hub/skills/agent-hub/SKILL.md` into their skill
+directory. MCP supplies the tools; this skill supplies the operating rules.
+
+When the current agent already exposes `hub_*` MCP tools, use those tools
+directly. Otherwise fall back to the installed CLI described below.
+
 ## Choosing a provider
 
 `agent-hub probe` first. Providers and transports (auto-selected; never

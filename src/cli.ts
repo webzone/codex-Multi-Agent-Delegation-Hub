@@ -4,6 +4,12 @@ import { fileURLToPath } from "node:url";
 
 import { AgentHubError, asHubError } from "./errors.js";
 import {
+  codexStatus,
+  installCodex,
+  uninstallCodex,
+  type CodexCommandRunner,
+} from "./integrations/codex.js";
+import {
   AgentHub,
   HUB_PROVIDERS,
   type HandoffDecisionInput,
@@ -19,6 +25,7 @@ import { productionBridgedFactories } from "./hub/transport-adapter.js";
 import { isPermissionDecision } from "./kernel/contracts.js";
 import type { PermissionPolicy } from "./kernel/contracts.js";
 import type { HandoffDecision } from "./workspace/records.js";
+import { PACKAGE_VERSION } from "./version.js";
 
 /**
  * agent-hub — the command-line surface of the rewrite.
@@ -45,6 +52,19 @@ transport is reported as a fact and can never be pinned by callers):
   hermes hermes-acp       Agent Client Protocol (ACP)
 
 Usage:
+  agent-hub --version
+      Print the package version shared by the CLI, MCP server, and skill.
+
+  agent-hub codex install [--codex-home DIR] [--force-skill] [--repair-mcp]
+      Install or upgrade the Agent Hub skill and, when absent, register the
+      existing agent_hub MCP server. Never overwrites an existing MCP entry
+      unless --repair-mcp is explicit.
+  agent-hub codex status [--codex-home DIR]
+      Inspect the managed skill, MCP registration, and resolved executable.
+  agent-hub codex uninstall [--codex-home DIR]
+      Remove only integration files still owned by Agent Hub; durable session
+      data under AGENT_HUB_HOME is never removed.
+
   agent-hub start --provider <p> [--task TEXT] [--workspace DIR]
                   [--permission-policy deny|interactive] [--max-output-bytes N]
                   [--attach]
@@ -127,10 +147,22 @@ export interface CliDependencies {
    * attaches it (before any hub construction), proving startup ordering.
    */
   onAttachPump?: (pump: AttachInputPump) => void;
+  /** Test seam for the explicit Codex integration commands. */
+  codexRunner?: CodexCommandRunner;
+  /** Test seam for the integration ownership manifest location. */
+  integrationStateHome?: string;
 }
 
 export type CliCommand =
   | { kind: "help" }
+  | { kind: "version" }
+  | {
+      kind: "codex";
+      action: "install" | "status" | "uninstall";
+      codex_home?: string;
+      force_skill: boolean;
+      repair_mcp: boolean;
+    }
   | {
       kind: "start";
       workspace: string;
@@ -242,6 +274,7 @@ export function parseCliCommand(argv: string[]): CliCommand {
   if (command === undefined || command === "--help" || command === "-h" || command === "help") {
     return { kind: "help" };
   }
+  if (command === "--version" || command === "-V") return { kind: "version" };
   if (command.startsWith("-")) {
     throw new UsageError(`unknown command/flag "${command}"`);
   }
@@ -270,6 +303,41 @@ export function parseCliCommand(argv: string[]): CliCommand {
   };
 
   switch (command) {
+    case "codex": {
+      const action = rest[0];
+      if (action !== "install" && action !== "status" && action !== "uninstall") {
+        throw new UsageError("codex requires install, status, or uninstall");
+      }
+      let codexHome: string | undefined;
+      let forceSkill = false;
+      let repairMcp = false;
+      for (let i = 1; i < rest.length; i += 1) {
+        const arg = rest[i];
+        if (arg === "--codex-home") {
+          codexHome = takeValue(arg, rest, i);
+          i += 1;
+        } else if (arg === "--force-skill") {
+          forceSkill = true;
+        } else if (arg === "--repair-mcp") {
+          repairMcp = true;
+        } else {
+          throw new UsageError(`unknown argument "${arg}"`);
+        }
+      }
+      if (action !== "install" && forceSkill) {
+        throw new UsageError("--force-skill is only valid with codex install");
+      }
+      if (action !== "install" && repairMcp) {
+        throw new UsageError("--repair-mcp is only valid with codex install");
+      }
+      return {
+        kind: "codex",
+        action,
+        ...(codexHome === undefined ? {} : { codex_home: codexHome }),
+        force_skill: forceSkill,
+        repair_mcp: repairMcp,
+      };
+    }
     case "start": {
       const { start, next } = parseStartArgs(rest, 0, true);
       consumeCommonTail(next);
@@ -702,6 +770,26 @@ export async function runCli(
       case "help":
         io.stdout.write(HELP);
         return 0;
+      case "version":
+        io.stdout.write(`${PACKAGE_VERSION}\n`);
+        return 0;
+      case "codex": {
+        const options = {
+          ...(command.codex_home === undefined ? {} : { codexHome: command.codex_home }),
+          ...(command.force_skill ? { forceSkill: true } : {}),
+          ...(command.repair_mcp ? { repairMcp: true } : {}),
+          ...(deps.codexRunner === undefined ? {} : { runCodex: deps.codexRunner }),
+          ...(deps.integrationStateHome === undefined ? {} : { stateHome: deps.integrationStateHome }),
+        };
+        const result =
+          command.action === "install"
+            ? await installCodex(options)
+            : command.action === "status"
+              ? await codexStatus(options)
+              : await uninstallCodex(options);
+        json(io, result);
+        return 0;
+      }
       case "start":
         return await runStartLike(
           "start",
