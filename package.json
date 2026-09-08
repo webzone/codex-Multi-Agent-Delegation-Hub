@@ -1,12 +1,31 @@
 {
   "name": "agent-hub",
   "version": "0.2.0",
-  "private": true,
-  "type": "module",
-  "description": "Provider-neutral agent sessions with durable, checkpointed workspaces: omp (RPC v2), pi (RPC), agy (stream-json), hermes (ACP).",
+  "description": "Provider-neutral agent sessions in durable, isolated workspaces: omp (RPC v2), pi (RPC), agy (stream-json), hermes (ACP).",
+  "keywords": [
+    "agent",
+    "workspace",
+    "worktree",
+    "omp",
+    "acp"
+  ],
+  "license": "MIT",
   "engines": {
     "node": ">=20"
   },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
   "bin": {
     "agent-hub": "./dist/cli.js",
     "agent-hub-mcp": "./dist/mcp.js"

@@ -4,7 +4,7 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 
 import { deferred } from "./deferred.js";
-import { asDelegateError, AgentHubError } from "./errors.js";
+import { asHubError, AgentHubError } from "./errors.js";
 
 /**
  * Repository-local advisory lock stored under `<git-common-dir>/agent-hub/locks`.
@@ -370,11 +370,11 @@ export async function claimUnderLock<T>(
     try {
       await lock.release();
     } catch (releaseError) {
-      const failure = asDelegateError(error);
+      const failure = asHubError(error);
       throw new AgentHubError(
         failure.code,
         `${failure.message} (and the repository lock could not be released either: ${
-          asDelegateError(releaseError).message
+          asHubError(releaseError).message
         })`,
       );
     }
@@ -385,7 +385,7 @@ export async function claimUnderLock<T>(
     await lock.release();
     return { value, releaseError: null };
   } catch (releaseError) {
-    const failure = asDelegateError(releaseError);
+    const failure = asHubError(releaseError);
     return {
       value,
       releaseError: new AgentHubError(

@@ -1,423 +1,494 @@
-import { readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { hostname } from "node:os";
-import { join } from "node:path";
+import { stat } from "node:fs/promises";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
-import { AgentHubError } from "../src/errors.js";
 import { AgentHub } from "../src/hub/agent-hub.js";
+import * as publicApi from "../src/index.js";
+import { AgentHubError } from "../src/errors.js";
+import { readJsonFile, tombstonePath, worktreePath } from "../src/workspace/home.js";
+import { workspaceRefFor } from "../src/workspace/records.js";
+import { resolveRef, runGit } from "./helpers.js";
 import {
-  createHubHarness,
-  fullHubCapabilities,
-  hubFakeProbes,
-  hubFakeProviderFactory,
   HubFakeFactory,
-  HubFakeTransport,
+  createHubHarness,
+  hubOptionsFor,
   scriptTurn,
+  type HubHarness,
 } from "./hub-fakes.js";
-import { bridgeTransportFactory } from "../src/hub/transport-adapter.js";
-import { listLiveLeases, readLiveLease, liveLeasePath } from "../src/live/lease.js";
-import { liveRefFor } from "../src/live/state.js";
-import { removeDirectory, resolveRef, runGit } from "./helpers.js";
 
-async function expectCode(
-  promise: Promise<unknown>,
-  code: string,
-): Promise<AgentHubError> {
-  try {
-    await promise;
-  } catch (error) {
-    const failure = error as AgentHubError;
-    expect(failure.code).toBe(code);
-    return failure;
-  }
-  throw new Error(`expected rejection with code ${code}`);
+/**
+ * Public AgentHub API — durable custody contract.
+ *
+ * Everything below runs the shipped stack: real Git repositories, a real
+ * temp AGENT_HUB_HOME, the P2 custody store, leases, GC — only the
+ * transport is fake. The contract under test is P2's: close never deletes;
+ * deletion requires an exact accepted/discarded handoff plus expired
+ * retention; automatic cleanup collects only that and nothing else.
+ */
+
+const harnesses: HubHarness[] = [];
+
+async function harness(options: Parameters<typeof createHubHarness>[0] = {}): Promise<HubHarness> {
+  const created = await createHubHarness(options);
+  harnesses.push(created);
+  return created;
 }
 
-describe("AgentHub launch", () => {
-  it("reserves lease + worktree and records the honest launch pair", async () => {
-    const world = await createHubHarness();
-    const started = await world.hub.start({ provider: "omp" });
+afterEach(async () => {
+  for (const h of harnesses.splice(0)) {
+    await h.hub.closeAll().catch(() => undefined);
+  }
+});
 
+async function headCommit(repository: string): Promise<string> {
+  return (await runGit(repository, ["rev-parse", "HEAD"])).trim();
+}
+
+describe("AgentHub start: P2 custody provisioning", () => {
+  it("starts in a hub-owned isolated worktree keyed by the session id", async () => {
+    const h = await harness();
+    const started = await h.hub.start({ provider: "omp" });
+    expect(started.transport).toBe("omp-rpc");
+    expect(started.provider).toBe("omp");
     expect(started.probe.found).toBe(true);
-    expect(started.state.status).toBe("idle");
-    expect(started.state.worktree_path).not.toBe(world.repository);
-    // The durable record keeps the FULL 9-claim launch snapshot.
-    expect(Object.keys(started.state.capabilities)).toHaveLength(9);
-    // The kernel snapshot dropped only the lifecycle-owned checkpoint claim.
-    expect(Object.keys(started.capabilities)).toHaveLength(8);
-    expect(started.capabilities).not.toHaveProperty("checkpoint");
-
-    const lease = await readLiveLease(world.commonDir, started.session_id);
-    expect(lease?.worktree_path).toBe(started.state.worktree_path);
-    // Spawn facts land on the lease the moment the provider process exists.
-    expect(lease?.provider_pid).toBe(424_242);
-    expect(await resolveRef(world.repository, liveRefFor(started.session_id))).toBe(
-      started.state.base_commit,
-    );
-
-    // The kernel mirror record rides its own sidecar and parses clean.
-    const recordPath = join(
-      world.commonDir,
-      "agent-hub",
-      "live",
-      "interaction-records",
-      `${started.session_id}.json`,
-    );
-    const record = JSON.parse(await readFile(recordPath, "utf8")) as {
-      schema: string;
-      status: string;
-    };
-    expect(record.schema).toBe("agent-hub-interaction/v1");
-    expect(record.status).toBe("idle");
-
-    await world.hub.closeAll();
-    await removeDirectory(world.repository);
+    const workspace = started.workspace;
+    expect(workspace.custody).toBe("live");
+    expect(workspace.session_id).toBe(started.session_id);
+    expect(workspace.base_commit).toBe(await headCommit(h.repository));
+    expect(workspace.worktree_path).toBe(worktreePath(h.home, started.session_id));
+    expect(started.worktree_path).toBe(workspace.worktree_path);
+    await expect(stat(workspace.worktree_path)).resolves.toBeTruthy();
+    // Isolation: the provider runs in the custody worktree, never the caller checkout.
+    expect((await h.factory.transportAt(0)).launch?.workspace).toBe(workspace.worktree_path);
+    expect(workspace.handoff).toBeNull();
+    expect(workspace.retention_until).toBeNull();
+    expect(workspace.last_result_seq).toBe(0);
   });
 
-  it("refuses launch on an honest not-found probe and reserves nothing", async () => {
-    const world = await createHubHarness({
-      probe: { found: false, version: null, detail: "no RPC v2 evidence" },
+  it("refuses non-UUID session ids before touching custody", async () => {
+    const h = await harness();
+    await expect(h.hub.start({ provider: "omp", session_id: "task-1" })).rejects.toMatchObject({
+      code: "WORKSPACE_ID_INVALID",
     });
-    const failure = await expectCode(world.hub.start({ provider: "omp" }), "TRANSPORT_UNAVAILABLE");
-    expect(failure.message).toContain("no RPC v2 evidence");
-    expect(await listLiveLeases(world.commonDir)).toHaveLength(0);
-    expect(await world.hub.list()).toHaveLength(0);
-    await removeDirectory(world.repository);
+    expect(await h.hub.list()).toEqual([]);
   });
 
-  it("refuses a dirty caller checkout unless allow_dirty", async () => {
-    const world = await createHubHarness();
-    await writeFile(join(world.repository, "stray.txt"), "untracked\n", "utf8");
-    await expectCode(world.hub.start({ provider: "omp" }), "DIRTY_WORKTREE");
-    const started = await world.hub.start({ provider: "omp", allow_dirty: true });
-    expect(started.state.status).toBe("idle");
-    await world.hub.closeAll();
-    await removeDirectory(world.repository);
+  it("a probe decline never provisions custody", async () => {
+    const h = await harness({ probe: { found: false, version: null, detail: "not installed" } });
+    await expect(h.hub.start({ provider: "omp" })).rejects.toMatchObject({
+      code: "TRANSPORT_UNAVAILABLE",
+    });
+    expect(await h.hub.list()).toEqual([]);
   });
 
-  it("enforces the durable lease quota per common dir", async () => {
-    const world = await createHubHarness({ hubOptions: { commonDirQuota: 1 } });
-    const first = await world.hub.start({ provider: "omp" });
-    await expectCode(world.hub.start({ provider: "omp" }), "QUOTA_EXCEEDED");
-    expect(await listLiveLeases(world.commonDir)).toHaveLength(1);
-    await world.hub.close(first.session_id);
-    const second = await world.hub.start({ provider: "omp" });
-    expect(second.session_id).not.toBe(first.session_id);
-    await world.hub.closeAll();
-    await removeDirectory(world.repository);
+  it("a launch that fails after provisioning closes custody honestly and retains everything", async () => {
+    const h = await harness({ capabilities: () => ({} as never) });
+    await expect(h.hub.start({ provider: "omp" })).rejects.toBeInstanceOf(AgentHubError);
+    const [record] = await h.hub.list();
+    expect(record).toBeDefined();
+    expect(record.workspace.custody).toBe("closed");
+    expect(record.workspace.close_evidence).toContain("start failed");
+    // Nothing was deleted: the worktree stays for review until a decision.
+    await expect(stat(record.workspace.worktree_path)).resolves.toBeTruthy();
+    const report = await h.hub.cleanup();
+    expect(report.cleanup.retained.map((r) => r.code)).toContain("handoff-undecided");
+    expect(report.cleanup.deleted).toEqual([]);
   });
 });
 
-describe("AgentHub turns and checkpoints", () => {
-  it("settles a prompt turn and pins the checkpoint chain", async () => {
-    const world = await createHubHarness();
-    const started = await world.hub.start({ provider: "omp" });
-    const transport = scriptTurn(world.factory, 0, {
-      writes: { "note.md": "worked on\n" },
-    });
-
-    const turn = await world.hub.prompt(started.session_id, "do the work");
+describe("AgentHub turns: exact result identity (P2 publication)", () => {
+  it("a changed-tree turn publishes seq/parent/commit/tree/ref", async () => {
+    const h = await harness();
+    const started = await h.hub.start({ provider: "omp" });
+    scriptTurn(h.factory, 0, { writes: { "feature.txt": "work" } });
+    const turn = await h.hub.prompt(started.session_id, "do it");
     expect(turn.outcome).toBe("succeeded");
-    expect(turn.checkpoint).not.toBeNull();
-    expect(turn.checkpoint?.reason).toBe("turn_end");
-    expect(turn.final_text?.text).toBe("done: prompt");
+    expect(turn.publish_error).toBeUndefined();
+    const result = turn.result!;
+    expect(result.seq).toBe(1);
+    expect(result.kind).toBe("prompt");
+    expect(result.tree_changed).toBe(true);
+    expect(result.parent).toBe(started.workspace.base_commit);
+    expect(result.ref).toBe(workspaceRefFor(started.session_id));
+    expect(await resolveRef(h.repository, result.ref)).toBe(result.commit);
+    expect(result.commit).not.toBe(result.parent);
+    const tree = (await runGit(h.repository, ["rev-parse", `${result.commit}^{tree}`])).trim();
+    expect(result.tree).toBe(tree);
+    const after = await h.hub.status(started.session_id);
+    expect(after.workspace.last_result_seq).toBe(1);
+    expect(after.workspace.head_commit).toBe(result.commit);
+  });
 
-    const state = await world.hub.status(started.session_id);
-    expect(state.state?.current_commit).toBe(turn.checkpoint?.commit);
-    expect(state.state?.checkpoint_seq).toBe(1);
-    expect(state.state?.last_checkpoint_reason).toBe("turn_end");
-    expect(await resolveRef(world.repository, liveRefFor(started.session_id))).toBe(
-      turn.checkpoint?.commit,
-    );
-    // The work lives in the hub worktree, never in the caller checkout.
-    expect(existsSync(join(world.repository, "note.md"))).toBe(false);
-    expect(existsSync(join(started.workspace, "note.md"))).toBe(true);
-    // The kernel re-stamped envelopes: transport lies never survive.
-    const events = world.hub.eventsAfter(started.session_id, 0);
-    expect(events.status).toBe("ok");
-    if (events.status === "ok") {
-      expect(events.events.every((event) => event.session_id === started.session_id)).toBe(true);
+  it("an unchanged-tree turn still publishes a result naming the current head", async () => {
+    const h = await harness();
+    const started = await h.hub.start({ provider: "omp" });
+    scriptTurn(h.factory, 0, {});
+    const one = await h.hub.prompt(started.session_id, "think");
+    const two = await h.hub.followUp(started.session_id, "think more");
+    expect(one.result!.seq).toBe(1);
+    expect(two.result!.seq).toBe(2);
+    expect(one.result!.tree_changed).toBe(false);
+    expect(two.result!.tree_changed).toBe(false);
+    expect(two.result!.commit).toBe(one.result!.commit);
+    expect(one.result!.commit).toBe(started.workspace.base_commit);
+    expect(two.result!.parent).toBe(one.result!.commit);
+  });
+
+  it("non-turn commands carry no result and say why", async () => {
+    const h = await harness();
+    const started = await h.hub.start({ provider: "omp" });
+    const cancel = await h.hub.cancel(started.session_id, null);
+    expect(cancel.result).toBeNull();
+    expect(cancel.publish_skipped_reason).toContain("not a turn");
+  });
+
+  it("the result sequence is gapless across mixed changed turns", async () => {
+    const h = await harness();
+    const started = await h.hub.start({ provider: "omp" });
+    const seqs: number[] = [];
+    const commits: string[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      scriptTurn(h.factory, 0, { writes: { [`f${i}.txt`]: `x${i}` } });
+      const turn =
+        i === 0
+          ? await h.hub.prompt(started.session_id, `t${i}`)
+          : await h.hub.followUp(started.session_id, `t${i}`);
+      seqs.push(turn.result!.seq);
+      commits.push(turn.result!.commit);
     }
-    void transport;
-    await world.hub.closeAll();
-    await removeDirectory(world.repository);
-  });
-
-  it("settles a cancelled turn with a cancel-reason checkpoint", async () => {
-    const world = await createHubHarness();
-    const started = await world.hub.start({ provider: "omp" });
-    scriptTurn(world.factory, 0, { writes: { "half.md": "partial\n" }, hang: true });
-
-    const running = world.hub.prompt(started.session_id, "slow work");
-    const cancelled = await world.hub.cancel(started.session_id, "changed my mind");
-    expect(cancelled.outcome).toBe("succeeded"); // the cancel command itself delivered
-    const turn = await running;
-    expect(turn.outcome).toBe("cancelled");
-    expect(turn.checkpoint?.reason).toBe("cancel");
-
-    await world.hub.closeAll();
-    await removeDirectory(world.repository);
-  });
-
-  it("refuses steer pre-dispatch when the launch snapshot says unsupported", async () => {
-    const world = await createHubHarness({
-      capabilities: () =>
-        fullHubCapabilities({ steer: { support: "unsupported", evidence: null } }),
-    });
-    const started = await world.hub.start({ provider: "omp" });
-    const turn = await world.hub.steer(started.session_id, "left!").catch(() => null);
-    // The kernel refuses capability-unsupported steer with a result, not a throw.
-    expect(turn?.outcome).toBe("unsupported");
-    expect(turn?.error?.stage).toBe("capability");
-    const transport = world.factory.created[0] as HubFakeTransport;
-    expect(transport.commands.some((command) => command.kind === "steer")).toBe(false);
-    await world.hub.closeAll();
-    await removeDirectory(world.repository);
+    expect(seqs).toEqual([1, 2, 3]);
+    for (let i = 1; i < commits.length; i += 1) {
+      expect(commits[i]).not.toBe(commits[i - 1]);
+    }
   });
 });
 
-describe("AgentHub permissions", () => {
-  it("delivers only contract verdicts, and only for observed requests", async () => {
-    const world = await createHubHarness();
-    const started = await world.hub.start({
-      provider: "omp",
-      permission_policy: "interactive",
-    });
-    scriptTurn(world.factory, 0, {
-      during: [
-        {
-          kind: "permission_request",
-          request_id: "req-1",
-          tool: "shell",
-          summary: { text: "rm -rf build", truncated: false },
-        },
-      ],
-    });
-    await world.hub.prompt(started.session_id, "clean the build dir");
+describe("AgentHub close: retention until an explicit handoff decision", () => {
+  it("close retains the worktree, ref, results, and lease; automatic cleanup still never deletes", async () => {
+    const h = await harness();
+    const started = await h.hub.start({ provider: "omp" });
+    scriptTurn(h.factory, 0, { writes: { "deliverable.txt": "gold" } });
+    const turn = await h.hub.prompt(started.session_id, "mine it");
+    const closed = await h.hub.close(started.session_id);
 
-    const answer = await world.hub.respondPermission(started.session_id, "req-1", "allow_once");
-    expect(answer.outcome).toBe("succeeded");
-    const transport = world.factory.created[0] as HubFakeTransport;
-    const delivered = transport.commands.find((command) => command.kind === "permission_response");
-    expect(delivered).toMatchObject({ request_id: "req-1", decision: "allow_once" });
+    expect(closed.record.status).toBe("closed");
+    expect(closed.finalize.workspace.custody).toBe("closed");
+    expect(closed.finalize.workspace.handoff).toBeNull();
+    expect(closed.finalize.workspace.retention_until).toBeNull();
+    expect(closed.lease_released).toBe(true);
 
-    await expectCode(
-      world.hub.respondPermission(
-        started.session_id,
-        "req-1",
-        "allow_always" as "allow_once",
-      ),
-      "COMMAND_INVALID",
+    // The blocker contract: nothing was deleted by close.
+    await expect(stat(worktreePath(h.home, started.session_id))).resolves.toBeTruthy();
+    expect(await resolveRef(h.repository, workspaceRefFor(started.session_id))).toBe(
+      turn.result!.commit,
     );
-    await expectCode(
-      world.hub.respondPermission(started.session_id, "req-9", "deny"),
-      "PERMISSION_REQUEST_UNKNOWN",
+
+    // Startup-catch-up cleanup (the manual `gc` path) also refuses to delete.
+    const report = await h.hub.cleanup();
+    expect(report.cleanup.deleted).toEqual([]);
+    expect(report.cleanup.retained).toContainEqual(
+      expect.objectContaining({ session_id: started.session_id, code: "handoff-undecided" }),
     );
-    await world.hub.closeAll();
-    await removeDirectory(world.repository);
+    await expect(stat(worktreePath(h.home, started.session_id))).resolves.toBeTruthy();
+  });
+
+  it("age alone never deletes an undecided workspace", async () => {
+    let nowMs = Date.UTC(2026, 8, 7, 12, 0, 0);
+    const h = await harness({
+      hubOptions: { now: () => new Date(nowMs), retentionMs: 1_000 },
+    });
+    const started = await h.hub.start({ provider: "omp" });
+    scriptTurn(h.factory, 0, { writes: { "a.txt": "1" } });
+    await h.hub.prompt(started.session_id, "work");
+    await h.hub.close(started.session_id);
+    nowMs += 60 * 60 * 1000; // an hour later
+    const report = await h.hub.cleanup();
+    expect(report.cleanup.deleted).toEqual([]);
+    expect(report.cleanup.retained.map((r) => r.code)).toContain("handoff-undecided");
+    await expect(stat(worktreePath(h.home, started.session_id))).resolves.toBeTruthy();
+  });
+
+  it("close with an unproven stop keeps the lease and says so honestly", async () => {
+    const h = await harness();
+    const started = await h.hub.start({ provider: "omp" });
+    const transport = await h.factory.transportAt(0);
+    transport.stopResults.push({
+      status: "orphaned",
+      exit_code: null,
+      exit_signal: null,
+      waited_ms: 1,
+    });
+    const closed = await h.hub.close(started.session_id);
+    expect(closed.record.status).toBe("orphaned");
+    expect(closed.lease_released).toBe(false);
+    // Custody was still finalized (capture + close), nothing deleted.
+    expect(closed.finalize.workspace.custody).toBe("closed");
+    expect(closed.finalize.workspace.runtime_status).toBe("orphaned");
+    await expect(stat(worktreePath(h.home, started.session_id))).resolves.toBeTruthy();
   });
 });
 
-describe("AgentHub close, handoff, resume, gc", () => {
-  it("tears down on proven shutdown and hands off the chain", async () => {
-    const world = await createHubHarness();
-    const started = await world.hub.start({ provider: "omp" });
-    scriptTurn(world.factory, 0, { writes: { "a.md": "first\n" } });
-    await world.hub.prompt(started.session_id, "task one");
-    // Provider activity after the last pinned boundary: close must pin it.
-    await writeFile(join(started.workspace, "late.md"), "late\n", "utf8");
+describe("AgentHub handoff: the exact-identity decision", () => {
+  async function closedSession(h: HubHarness) {
+    const started = await h.hub.start({ provider: "omp" });
+    scriptTurn(h.factory, 0, { writes: { "out.txt": "result" } });
+    const turn = await h.hub.prompt(started.session_id, "produce");
+    await h.hub.close(started.session_id);
+    return { started, turn };
+  }
 
-    const closed = await world.hub.close(started.session_id);
-    expect(closed.cleanup_errors).toHaveLength(0);
-    expect(closed.checkpoint_taken).toBe(true);
-    expect(await readLiveLease(world.commonDir, started.session_id)).toBeUndefined();
-    expect(existsSync(started.workspace)).toBe(false);
-
-    const handoff = await world.hub.handoff(started.session_id);
-    expect(handoff.changed_files.sort()).toEqual(["a.md", "late.md"]);
-    expect(handoff.checkpoints.map((c) => c.reason)).toEqual(["turn_end", "close"]);
-    expect(handoff.status).toBe("closed");
-    expect(handoff.final_commit).not.toBe(handoff.base_commit);
-    expect(handoff.apply_hint).toContain("git cherry-pick");
-    expect(handoff.ref).toBe(liveRefFor(started.session_id));
-    await removeDirectory(world.repository);
-  });
-
-  it("retains everything when shutdown cannot be proven", async () => {
-    const world = await createHubHarness();
-    const started = await world.hub.start({ provider: "omp" });
-    const transport = world.factory.created[0] as HubFakeTransport;
-    transport.stopResults = [{ status: "orphaned", exit_code: null, exit_signal: null, waited_ms: 5 }];
-
-    const closed = await world.hub.close(started.session_id);
-    expect((closed.record as { status: string }).status).toBe("orphaned");
-    expect(closed.checkpoint_taken).toBe(false);
-    expect(await readLiveLease(world.commonDir, started.session_id)).toBeDefined();
-    expect(existsSync(started.workspace)).toBe(true);
-    await expectCode(world.hub.handoff(started.session_id), "SESSION_STILL_OWNED");
-    await removeDirectory(world.repository);
-  });
-
-  it("resumes the same durable line with identity verification", async () => {
-    const world = await createHubHarness({ transportOptions: { resumeState: "echo" } });
-    const first = await world.hub.start({ provider: "omp" });
-    scriptTurn(world.factory, 0, { writes: { "a.md": "first\n" } });
-    await world.hub.prompt(first.session_id, "task one");
-    await world.hub.close(first.session_id);
-    const afterClose = await world.hub.status(first.session_id);
-    const closeRevision = afterClose.state?.revision ?? 0;
-    const refAfterClose = await resolveRef(world.repository, liveRefFor(first.session_id));
-
-    const resumed = await world.hub.resume(first.session_id);
-    expect(resumed.session_id).toBe(first.session_id);
-    const resumedState = await world.hub.status(first.session_id);
-    expect(resumedState.state?.revision).toBeGreaterThan(closeRevision);
-    // The chain is continuous: same ref, checkpoint head kept.
-    expect(resumedState.state?.current_commit).toBe(refAfterClose);
-    expect(resumedState.state?.worktree_path).not.toBe(first.workspace);
-    // The transport echoed the durable handle: verification is observed, not claimed.
-    expect(resumedState.state?.resume?.verified_via).toBe("transport-verified:open-echo");
-
-    scriptTurn(world.factory, 1, { writes: { "b.md": "second\n" } });
-    const turn = await world.hub.followUp(first.session_id, "keep going");
-    expect(turn.outcome).toBe("succeeded");
-    await world.hub.close(first.session_id);
-
-    const handoff = await world.hub.handoff(first.session_id);
-    expect(handoff.changed_files.sort()).toEqual(["a.md", "b.md"]);
-    await removeDirectory(world.repository);
-  });
-
-  it("refuses resume while leased", async () => {
-    const world = await createHubHarness();
-    const started = await world.hub.start({ provider: "omp" });
-    // A second hub over the same repository must not adopt the live session.
-    const other = await AgentHub.open(world.repository, {
-      transportFactories: [bridgeTransportFactory(new HubFakeFactory())],
-      providerFactories: [hubFakeProviderFactory],
-      tmpRoot: world.tmpRoot,
-      probes: hubFakeProbes(),
+  it("refuses decisions that do not name the exact published head", async () => {
+    const h = await harness();
+    const { started, turn } = await closedSession(h);
+    const wrongSeq = h.hub.handoff(started.session_id, {
+      decision: "accepted",
+      result_seq: 99,
+      commit: turn.result!.commit,
     });
-    // While the session is live its state is non-terminal: that gate answers first.
-    await expectCode(other.resume(started.session_id), "SESSION_NOT_RESUMABLE");
-    // A terminal state with a still-held lease (crash between rewrite and
-    // teardown) must route through gc, never be adopted underneath the lease.
-    const statePath = join(
-      world.commonDir,
-      "agent-hub",
-      "live",
-      "sessions",
-      `${started.session_id}.json`,
-    );
-    const state = JSON.parse(await readFile(statePath, "utf8")) as Record<string, unknown>;
-    await writeFile(statePath, JSON.stringify({ ...state, status: "orphaned" }, null, 2), "utf8");
-    await expectCode(other.resume(started.session_id), "LIVE_LEASE_EXISTS");
-    await world.hub.closeAll();
-    await removeDirectory(world.repository);
+    await expect(wrongSeq).rejects.toMatchObject({ code: "WORKSPACE_HANDOFF_MISMATCH" });
+    const wrongCommit = h.hub.handoff(started.session_id, {
+      decision: "accepted",
+      result_seq: turn.result!.seq,
+      commit: "0".repeat(40),
+    });
+    await expect(wrongCommit).rejects.toMatchObject({ code: "WORKSPACE_HANDOFF_MISMATCH" });
+    const record = await h.hub.status(started.session_id);
+    expect(record.workspace.handoff).toBeNull();
   });
 
-  it("gc reconciles an orphaned lease: reaps, pins, rewrites, releases", async () => {
-    const world = await createHubHarness();
-    const started = await world.hub.start({ provider: "omp" });
-    scriptTurn(world.factory, 0, { writes: { "work.md": "dangling\n" }, hang: true });
-    void world.hub.prompt(started.session_id, "abandoned task").catch(() => undefined);
-
-    // Forge hub loss on the durable artifact: a dead hub pid with provider
-    // facts that probe as a dead leader and a gone owned group.
-    const lease = await readLiveLease(world.commonDir, started.session_id);
-    expect(lease).toBeDefined();
-    const forged = {
-      ...lease!,
-      hub_pid: 999_999,
-      hub_start_token: "dead-dead-dead",
+  it("lands the exact decision, is idempotent, and never revises", async () => {
+    const h = await harness({ hubOptions: { retentionMs: 60_000 } });
+    const { started, turn } = await closedSession(h);
+    const decision = {
+      decision: "accepted" as const,
+      result_seq: turn.result!.seq,
+      commit: turn.result!.commit,
+      consumer: "release-bot",
     };
-    await writeFile(
-      liveLeasePath(world.commonDir, started.session_id),
-      `${JSON.stringify(forged, null, 2)}\n`,
-      "utf8",
+    const landed = await h.hub.handoff(started.session_id, decision);
+    expect(landed.handoff?.decision).toBe("accepted");
+    expect(landed.handoff?.result_seq).toBe(turn.result!.seq);
+    expect(landed.handoff?.commit).toBe(turn.result!.commit);
+    expect(landed.handoff?.consumer).toBe("release-bot");
+    expect(landed.retention_until).not.toBeNull();
+    const replay = await h.hub.handoff(started.session_id, decision);
+    expect(replay.revision).toBe(landed.revision);
+    await expect(
+      h.hub.handoff(started.session_id, { ...decision, decision: "discarded" }),
+    ).rejects.toMatchObject({ code: "WORKSPACE_HANDOFF_CONFLICT" });
+  });
+
+  it("handoff on a still-live session is refused", async () => {
+    const h = await harness();
+    const started = await h.hub.start({ provider: "omp" });
+    await expect(
+      h.hub.handoff(started.session_id, {
+        decision: "discarded",
+        result_seq: 0,
+        commit: started.workspace.base_commit,
+      }),
+    ).rejects.toMatchObject({ code: "WORKSPACE_NOT_CLOSED" });
+  });
+});
+
+describe("AgentHub GC: only decided + expired workspaces are ever collected", () => {
+  it("collects an accepted, retention-expired workspace and leaves a tombstone", async () => {
+    let nowMs = Date.UTC(2026, 8, 7, 12, 0, 0);
+    const h = await harness({ hubOptions: { now: () => new Date(nowMs), retentionMs: 60_000 } });
+    const started = await h.hub.start({ provider: "omp" });
+    scriptTurn(h.factory, 0, { writes: { "ship.txt": "yes" } });
+    const turn = await h.hub.prompt(started.session_id, "ship");
+    await h.hub.close(started.session_id);
+    await h.hub.handoff(started.session_id, {
+      decision: "accepted",
+      result_seq: turn.result!.seq,
+      commit: turn.result!.commit,
+    });
+
+    // Inside the window: retained with the exact reason.
+    let report = await h.hub.cleanup();
+    expect(report.cleanup.deleted).toEqual([]);
+    expect(report.cleanup.retained).toContainEqual(
+      expect.objectContaining({ session_id: started.session_id, code: "retention-active" }),
     );
 
-    // Reconciliation runs where the session is NOT attached: a fresh hub.
-    const other = await AgentHub.open(world.repository, {
-      transportFactories: [bridgeTransportFactory(new HubFakeFactory())],
-      providerFactories: [hubFakeProviderFactory],
-      tmpRoot: world.tmpRoot,
-      probes: hubFakeProbes(),
-    });
-    const report = await other.gc();
-    const entry = report.sessions.find((session) => session.session_id === started.session_id);
-    expect(entry?.outcome).toBe("recovered");
-    expect(entry?.detail).toContain("orphaned");
-    expect(await readLiveLease(world.commonDir, started.session_id)).toBeUndefined();
-    expect(existsSync(started.workspace)).toBe(false);
-
-    const state = await world.hub.status(started.session_id);
-    expect(state.state?.status).toBe("orphaned");
-    expect(state.state?.last_error?.code).toBe("SESSION_ORPHANED");
-    // The surviving work was pinned BEFORE the rewrite.
-    const chain = await runGit(world.repository, [
-      "log",
-      "--format=%s",
-      liveRefFor(started.session_id),
-      "--not",
-      state.state?.base_commit as string,
+    nowMs += 61_000;
+    report = await h.hub.cleanup();
+    expect(report.cleanup.deleted).toEqual([
+      {
+        session_id: started.session_id,
+        last_result_seq: turn.result!.seq,
+        head_commit: turn.result!.commit,
+        decision: "accepted",
+        continued: false,
+      },
     ]);
-    expect(chain).toContain("crash_recovery");
-
-    // Handoff on an orphan carries the honest warning.
-    const handoff = await world.hub.handoff(started.session_id);
-    expect(handoff.warning).toContain("orphaned");
-    await removeDirectory(world.repository);
+    await expect(stat(worktreePath(h.home, started.session_id))).rejects.toThrow();
+    expect(await resolveRef(h.repository, workspaceRefFor(started.session_id))).toBeNull();
+    const tomb = await readJsonFile(tombstonePath(h.home, started.session_id));
+    expect((tomb as { decision: string }).decision).toBe("accepted");
+    expect(await h.hub.list()).toEqual([]);
+    // The repository worktree bookkeeping is pruned too.
+    const worktreeList = await runGit(h.repository, ["worktree", "list", "--porcelain"]);
+    expect(worktreeList).not.toContain(worktreePath(h.home, started.session_id));
   });
 
-  it("gc dry-run touches nothing", async () => {
-    const world = await createHubHarness();
-    const started = await world.hub.start({ provider: "omp" });
-    const lease = await readLiveLease(world.commonDir, started.session_id);
-    await writeFile(
-      liveLeasePath(world.commonDir, started.session_id),
-      `${JSON.stringify({ ...lease!, hub_pid: 999_999 }, null, 2)}\n`,
-      "utf8",
-    );
-    const other = await AgentHub.open(world.repository, {
-      transportFactories: [bridgeTransportFactory(new HubFakeFactory())],
-      providerFactories: [hubFakeProviderFactory],
-      tmpRoot: world.tmpRoot,
-      probes: hubFakeProbes(),
+  it("startup catch-up cleanup collects a decided, expired workspace automatically", async () => {
+    let nowMs = Date.UTC(2026, 8, 7, 12, 0, 0);
+    const clock = { now: () => new Date(nowMs) };
+    const h = await harness({ hubOptions: { ...clock, retentionMs: 1_000 } });
+    const started = await h.hub.start({ provider: "omp" });
+    scriptTurn(h.factory, 0, { writes: { "tmp.txt": "junk" } });
+    const turn = await h.hub.prompt(started.session_id, "scratch");
+    await h.hub.close(started.session_id);
+    await h.hub.handoff(started.session_id, {
+      decision: "discarded",
+      result_seq: turn.result!.seq,
+      commit: turn.result!.commit,
     });
-    const report = await other.gc({ dry_run: true });
-    const entry = report.sessions.find((session) => session.session_id === started.session_id);
-    expect(entry?.outcome).toBe("dry-run");
-    expect(entry?.detail).toContain("would");
-    expect(report.worktrees_pruned).toBe(false);
-    expect(await readLiveLease(world.commonDir, started.session_id)).toBeDefined();
-    expect(existsSync(started.workspace)).toBe(true);
-    await removeDirectory(world.repository);
+    nowMs += 5_000;
+    await h.hub.closeAll();
+
+    // A fresh hub over the same home performs startup catch-up by default.
+    const factory = new HubFakeFactory();
+    const hub2 = await AgentHub.open(
+      h.repository,
+      hubOptionsFor(h, factory, { ...clock, autoCleanup: true }),
+    );
+    const collected = hub2.lastCleanup?.cleanup.deleted ?? [];
+    expect(collected).toEqual([
+      {
+        session_id: started.session_id,
+        last_result_seq: turn.result!.seq,
+        head_commit: turn.result!.commit,
+        decision: "discarded",
+        continued: false,
+      },
+    ]);
+    await expect(stat(worktreePath(h.home, started.session_id))).rejects.toThrow();
+    await hub2.closeAll();
   });
 
-  it("hostname proof keeps foreign leases hands-off", async () => {
-    const world = await createHubHarness();
-    const started = await world.hub.start({ provider: "omp" });
-    const lease = await readLiveLease(world.commonDir, started.session_id);
-    await writeFile(
-      liveLeasePath(world.commonDir, started.session_id),
-      `${JSON.stringify({ ...lease!, hub_hostname: "not-this-host" }, null, 2)}\n`,
-      "utf8",
-    );
-    const other = await AgentHub.open(world.repository, {
-      transportFactories: [bridgeTransportFactory(new HubFakeFactory())],
-      providerFactories: [hubFakeProviderFactory],
-      tmpRoot: world.tmpRoot,
-      probes: hubFakeProbes(),
+  it("an actively referenced session is untouchable even when its peer is collectible", async () => {
+    let nowMs = Date.UTC(2026, 8, 7, 12, 0, 0);
+    const h = await harness({
+      hubOptions: { now: () => new Date(nowMs), retentionMs: 1_000 },
     });
-    const report = await other.gc();
-    const entry = report.sessions.find((session) => session.session_id === started.session_id);
-    expect(entry?.outcome).toBe("foreign");
-    expect(entry?.detail).toContain("not-this-host");
-    expect(await readLiveLease(world.commonDir, started.session_id)).toBeDefined();
-    expect(hostname()).toBeTruthy();
-    await removeDirectory(world.repository);
+    const started = await h.hub.start({ provider: "omp" });
+    scriptTurn(h.factory, 0, { writes: { "x.txt": "1" } });
+    const turn = await h.hub.prompt(started.session_id, "work");
+    await h.hub.close(started.session_id);
+    await h.hub.handoff(started.session_id, {
+      decision: "accepted",
+      result_seq: turn.result!.seq,
+      commit: turn.result!.commit,
+    });
+    // A second, ATTACHED session shares the pass.
+    const second = await h.hub.start({ provider: "omp" });
+    nowMs += 60_000;
+    const report = await h.hub.cleanup();
+    const decided = report.cleanup.deleted.find((d) => d.session_id === started.session_id);
+    expect(decided).toBeDefined(); // the decided one is collectible
+    expect(report.cleanup.retained).toContainEqual(
+      expect.objectContaining({ session_id: second.session_id, code: "runtime-attached" }),
+    );
+    await expect(stat(worktreePath(h.home, second.session_id))).resolves.toBeTruthy();
+  });
+});
+
+describe("AgentHub resume: same durable line, guarded by custody", () => {
+  it("resume after close continues the same session id, worktree, and result sequence", async () => {
+    const h = await harness({ transportOptions: { resumeState: "echo" } });
+    const first = await h.hub.start({ provider: "omp" });
+    scriptTurn(h.factory, 0, { writes: { "a.txt": "1" } });
+    const turnOne = await h.hub.prompt(first.session_id, "phase 1");
+    await h.hub.close(first.session_id);
+
+    const resumed = await h.hub.resume(first.session_id);
+    expect(resumed.session_id).toBe(first.session_id);
+    expect(resumed.workspace.worktree_path).toBe(first.workspace.worktree_path);
+    expect(resumed.transport).toBe("omp-rpc");
+    scriptTurn(h.factory, 1, { writes: { "b.txt": "2" } });
+    const turnTwo = await h.hub.followUp(first.session_id, "phase 2");
+    expect(turnTwo.result!.seq).toBe(2);
+    expect(turnTwo.result!.parent).toBe(turnOne.result!.commit);
+    expect(turnTwo.result!.commit).not.toBe(turnOne.result!.commit);
+  });
+
+  it("resume after a handoff decision is refused", async () => {
+    const h = await harness();
+    const started = await h.hub.start({ provider: "omp" });
+    scriptTurn(h.factory, 0, { writes: { "a.txt": "1" } });
+    const turn = await h.hub.prompt(started.session_id, "work");
+    await h.hub.close(started.session_id);
+    await h.hub.handoff(started.session_id, {
+      decision: "accepted",
+      result_seq: turn.result!.seq,
+      commit: turn.result!.commit,
+    });
+    await expect(h.hub.resume(started.session_id)).rejects.toMatchObject({
+      code: "WORKSPACE_HANDOFF_DECIDED",
+    });
+  });
+
+  it("resume over a session attached in this process is refused before custody moves", async () => {
+    const h = await harness();
+    const started = await h.hub.start({ provider: "omp" });
+    await expect(h.hub.resume(started.session_id)).rejects.toMatchObject({
+      code: "SESSION_ALREADY_LIVE",
+    });
+  });
+
+  it("a second hub cannot take over a lease that is still live here", async () => {
+    const h = await harness();
+    const started = await h.hub.start({ provider: "omp" });
+    const otherFactory = new HubFakeFactory();
+    const hub2 = await AgentHub.open(h.repository, hubOptionsFor(h, otherFactory));
+    // The lease names this very process (hub_pid), so the takeover is refused
+    // outright — even though close would have released it honestly.
+    await expect(hub2.resume(started.session_id)).rejects.toMatchObject({
+      code: "WORKSPACE_LIVE",
+    });
+    await hub2.closeAll();
+  });
+});
+
+describe("public package surface", () => {
+  it("exports no legacy delegate/live vocabulary and no transport-pinning surface", () => {
+    const api = publicApi as Record<string, unknown>;
+    for (const legacy of [
+      "asDelegateError",
+      "liveResumeOf",
+      "kernelizeResume",
+      "kernelCapabilities",
+      "mergeKernelResume",
+      "kernelResumeFromState",
+      "projectRecordFromState",
+      "HUB_TRANSPORT_BY_PROVIDER",
+      "HUB_SESSION_QUOTA",
+      "HUB_REF_NAMESPACE",
+      "ATTACH_CLOSE_DRAIN_DEFAULT_MS",
+      "delegate",
+      "fanout",
+    ]) {
+      expect(api[legacy], legacy).toBeUndefined();
+    }
+    // The canonical pieces are present.
+    expect(api.AgentHub).toBeDefined();
+    expect(api.WorkspaceLifecycle).toBeDefined();
+    expect(api.AttachInputPump).toBeDefined();
+  });
+
+  it("hub start carries no public transport input and reports the selected one as fact", async () => {
+    const h = await harness();
+    const started = await h.hub.start({
+      provider: "omp",
+      // @ts-expect-error the public request type has no `transport` input.
+      transport: "omp-rpc",
+    });
+    // A stray runtime `transport` key is ignored, never honored: selection is
+    // internal. The fact still reports the auto-selected transport.
+    expect(started.transport).toBe("omp-rpc");
+    expect(h.factory.created.length).toBe(1);
   });
 });

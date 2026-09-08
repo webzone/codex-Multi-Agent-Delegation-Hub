@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { AgentHubError, asDelegateError } from "../errors.js";
+import { AgentHubError, asHubError } from "../errors.js";
 import { deferred, type Deferred } from "../deferred.js";
 import {
   asKernelError,
@@ -597,7 +597,7 @@ export class InteractionKernel {
     spawned: ProcessFacts | null,
     cause: unknown,
   ): Promise<AgentHubError> {
-    const failure = asDelegateError(cause);
+    const failure = asHubError(cause);
     let stop: StopReport;
     try {
       stop = await transport.stop("terminate");
@@ -899,7 +899,7 @@ export class InteractionKernel {
     try {
       await session.transport.send(command);
     } catch (error) {
-      const failure = asDelegateError(error);
+      const failure = asHubError(error);
       throw new AgentHubError(failure.code, `session "${session.id}" ${verb} delivery failed: ${failure.message}`);
     }
   }
@@ -1058,7 +1058,7 @@ export class InteractionKernel {
       if (!session.closing && !session.finished) {
         await this.crashSafely(
           session,
-          asDelegateError(error),
+          asHubError(error),
         );
       }
     } finally {
@@ -1079,7 +1079,7 @@ export class InteractionKernel {
     try {
       await this.handleCrash(session, error);
     } catch (inner) {
-      const failure = asDelegateError(inner);
+      const failure = asHubError(inner);
       session.closing = true;
       session.status = "error";
       session.degrade ??= {
@@ -1265,7 +1265,7 @@ export class InteractionKernel {
       await session.transport.send(command);
     } catch (error) {
       session.turn = null;
-      const failure = asDelegateError(error);
+      const failure = asHubError(error);
       throw new AgentHubError(failure.code, `command dispatch failed: ${failure.message}`);
     }
     return result.promise;
@@ -1328,7 +1328,7 @@ export class InteractionKernel {
       session.queue_bytes -= nextItem.bytes;
       void this.dispatchTurn(session, nextItem.command, nextItem.result, fromProviderQueue).catch(
         (error: unknown) => {
-          const failure = asDelegateError(error);
+          const failure = asHubError(error);
           nextItem.result.resolve(
             this.failedResult(session, nextItem.command, failure.code, failure.message),
           );
@@ -1437,7 +1437,7 @@ export class InteractionKernel {
    * `MIRROR_WRITE_FAILED`. Raw provider/filesystem content never echoes.
    */
   private durableWriteError(session: LiveSession, cause: unknown, what: string): KernelError {
-    const failure = asDelegateError(cause);
+    const failure = asHubError(cause);
     return {
       code: cause instanceof AgentHubError ? failure.code : "MIRROR_WRITE_FAILED",
       message: `${what}: ${failure.message}`,

@@ -6,7 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import { AgentHubError, asDelegateError } from "./errors.js";
+import { AgentHubError, asHubError } from "./errors.js";
 import { AgentHub, HUB_PROVIDERS, type TurnDocument } from "./hub/agent-hub.js";
 import type { AgentHubOptions } from "./hub/agent-hub.js";
 import {
@@ -59,7 +59,7 @@ async function guardTool(handler: () => Promise<ToolResult>): Promise<ToolResult
   try {
     return await handler();
   } catch (error) {
-    return failTool(asDelegateError(error));
+    return failTool(asHubError(error));
   }
 }
 
@@ -78,7 +78,7 @@ function turnIsError(turn: TurnDocument): boolean {
   return (
     turn.outcome === "failed" ||
     turn.outcome === "unsupported" ||
-    turn.checkpoint_error !== undefined
+    turn.publish_error !== undefined
   );
 }
 
@@ -104,29 +104,27 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     "hub_start",
     {
       description:
-        "Start a provider-neutral agent session in a hub-owned checkpointed worktree. " +
-        "Providers: omp (RPC v2 only), pi (RPC), agy (stream-json), hermes (ACP); the transport is auto-selected. " +
+        "Start a provider-neutral agent session in a hub-owned isolated worktree under AGENT_HUB_HOME. " +
+        "Providers: omp (RPC v2 only), pi (RPC), agy (stream-json), hermes (ACP); the transport is auto-selected and reported as a fact — callers cannot pin it. " +
         `Shipped ids: ${HUB_PROVIDERS.join(", ")}.`,
       inputSchema: {
         provider: z.enum(HUB_PROVIDERS),
-        transport: z.string().min(1).optional(),
         workspace: workspaceShape,
+        agent: z.string().min(1).optional(),
         permission_policy: z.enum(["deny", "interactive"]).default("deny"),
         max_text_bytes: z.number().int().positive().optional(),
-        allow_dirty: z.boolean().default(false),
       },
     },
-    async ({ provider, transport, workspace, permission_policy, max_text_bytes, allow_dirty }) =>
+    async ({ provider, workspace, agent, permission_policy, max_text_bytes }) =>
       guardTool(async () => {
         const hub = await hubFor(workspace);
         return launchGuarded(hub, async () =>
           okTool(
             await hub.start({
               provider,
-              transport,
+              ...(agent === undefined ? {} : { agent }),
               permission_policy,
-              max_text_bytes,
-              allow_dirty,
+              ...(max_text_bytes === undefined ? {} : { max_text_bytes }),
             }),
           ),
         );
@@ -171,7 +169,7 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
 
   commandTool(
     "hub_prompt",
-    "Send the initial task to an attached session (accepted exactly once, while idle). Settles at the turn boundary; the checkpoint chain is pinned for it.",
+    "Send the initial task to an attached session (accepted exactly once, while idle). Settles at the turn boundary; the turn publishes its exact result identity (sequence + commit + tree + ref).",
     textShape,
     (hub, args) => hub.prompt(args.session_id, requireText(args)),
   );
@@ -239,8 +237,7 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     "hub_close",
     {
       description:
-        "Close an attached session. Teardown (checkpoint, worktree removal, lease release) runs only when shutdown is PROVEN; " +
-        "an unproven stop answers `orphaned` with ownership retained — a later `terminate` close or `hub_gc` finishes the job.",
+        "Close an attached session. Custody finalization captures the final state and RETAINS everything: the isolated worktree, lease, results, and ref stay under custody until an explicit hub_handoff names the exact result and the retention window expires. An unproven stop answers `orphaned` with ownership retained — `hub_gc` reconciles it.",
       inputSchema: {
         ...sessionShape,
         mode: z.enum(["graceful", "terminate"]).default("graceful"),
@@ -251,7 +248,7 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
         const hub = await hubFor(workspace);
         const document = await hub.close(session_id, mode);
         supervisor.retireIdle(hub);
-        return okTool(document, document.cleanup_errors.length > 0);
+        return okTool(document, document.record.status !== "closed");
       }),
   );
 
@@ -259,27 +256,23 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     "hub_resume",
     {
       description:
-        "Adopt a TERMINAL durable session from this repository's store: fresh hub worktree at the checkpoint-chain head, the recorded provider resume handle replayed and identity-verified, the SAME durable line advanced. " +
-        "Unknown ids fail; leased or non-terminal records must be reconciled with hub_gc first.",
+        "Resume a CLOSED durable session on its retained custody worktree — the same durable line, the recorded transport, identity-verified provider resume. " +
+        "Refused once a handoff decision exists, while any lease is live or uncertain, or while the runtime mirror is non-terminal; `hub_gc` reconciles first.",
       inputSchema: {
         session_id: z.string().min(1),
         workspace: workspaceShape,
-        transport: z.string().min(1).optional(),
         permission_policy: z.enum(["deny", "interactive"]).default("deny"),
         max_text_bytes: z.number().int().positive().optional(),
-        allow_dirty: z.boolean().default(false),
       },
     },
-    async ({ session_id, workspace, transport, permission_policy, max_text_bytes, allow_dirty }) =>
+    async ({ session_id, workspace, permission_policy, max_text_bytes }) =>
       guardTool(async () => {
         const hub = await hubFor(workspace);
         return launchGuarded(hub, async () =>
           okTool(
             await hub.resume(session_id, {
-              transport,
               permission_policy,
-              max_text_bytes,
-              allow_dirty,
+              ...(max_text_bytes === undefined ? {} : { max_text_bytes }),
             }),
           ),
         );
@@ -290,7 +283,7 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     "hub_status",
     {
       description:
-        "One session's durable document (lifecycle state + kernel mirror record + lease facts), or every durable session in this repository when no id is given.",
+        "One session's custody document (workspace record + runtime mirror + lease classification + worktree state), or every durable workspace when no id is given.",
       inputSchema: {
         session_id: z.string().min(1).optional(),
         workspace: workspaceShape,
@@ -310,12 +303,29 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     "hub_handoff",
     {
       description:
-        "Result handoff for a released terminal session: the checkpoint chain (ref, commits, reasons), changed files, diff stat, and the human review/adopt command. Never merges anything.",
-      inputSchema: { session_id: z.string().min(1), workspace: workspaceShape },
+        "The consumer's takeover decision on a CLOSED workspace: accepted or discarded, naming the EXACT published head (result_seq + commit, both from hub_status). " +
+        "A matching decision starts the retention window (nothing is deleted here); a mismatch is refused. Decisions are not revisable. Resume is refused after any decision.",
+      inputSchema: {
+        session_id: z.string().min(1),
+        workspace: workspaceShape,
+        decision: z.enum(["accepted", "discarded"]),
+        result_seq: z.number().int().positive(),
+        commit: z.string().min(40),
+        consumer: z.string().min(1).nullable().optional(),
+      },
     },
-    async ({ session_id, workspace }) =>
+    async ({ session_id, workspace, decision, result_seq, commit, consumer }) =>
       guardTool(async () =>
-        okTool(await (await hubFor(workspace)).handoff(session_id)),
+        okTool(
+          await (
+            await hubFor(workspace)
+          ).handoff(session_id, {
+            decision,
+            result_seq,
+            commit,
+            consumer: consumer ?? null,
+          }),
+        ),
       ),
   );
 
@@ -323,13 +333,18 @@ export function createHubServer(dependencies: HubToolDependencies = {}): McpServ
     "hub_gc",
     {
       description:
-        "Safe garbage collection for this repository: re-prove every lease, reap provably-orphaned provider groups, pin surviving worktrees as crash_recovery checkpoints, rewrite orphaned state, release leases last, retry worktree removals, prune. `dry_run` reports every intended action without touching anything.",
-      inputSchema: { workspace: workspaceShape, dry_run: z.boolean().default(false) },
+        "Safe manual reconciliation: recover (re-prove leases, settle provably-dead orphans — deletes nothing) then gc (collect ONLY workspaces whose exact accepted/discarded handoff is on record and whose retention window expired). " +
+        "Never deletes unacknowledged, orphaned, uncertain, or actively referenced work; every retained workspace names the failed precondition. Automatic startup catch-up already runs this pass; this tool is the explicit manual path.",
+      inputSchema: { workspace: workspaceShape },
     },
-    async ({ workspace, dry_run }) =>
+    async ({ workspace }) =>
       guardTool(async () => {
-        const report = await (await hubFor(workspace)).gc({ dry_run });
-        return okTool(report, report.sessions.some((session) => session.outcome === "manual"));
+        const report = await (await hubFor(workspace)).cleanup();
+        const manual =
+          report.recovery.inconsistencies.length > 0
+          || report.recovery.unclaimed.unknown_segments.length > 0
+          || report.cleanup.unclaimed.cleanup_errors.length > 0;
+        return okTool({ recovery: report.recovery, cleanup: report.cleanup }, manual);
       }),
   );
 

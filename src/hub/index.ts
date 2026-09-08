@@ -1,47 +1,57 @@
 /**
  * Agent Hub public package façade (rewrite, P4).
  *
- * The integration layer only: `AgentHub` (kernel + lifecycle), the
- * `WorkspaceLifecycle` it composes, the host supervisor, and the transport
- * bridges to the shipped providers. No delegate/fanout/competition/session/
- * live vocabulary, no workflow modes, no compatibility wrappers.
+ * The integration layer only: `AgentHub` (kernel + P2 custody), the host
+ * supervisor, the attach-wire input pump, and the transport bridges to the
+ * shipped providers. Durable custody vocabulary comes from the canonical
+ * `src/workspace` module — the hub composes it and never duplicates it.
+ * No delegate/fanout/competition/session/live vocabulary, no workflow modes,
+ * no compatibility wrappers, no transport pinning at public boundaries.
  */
 
 export {
   AgentHub,
   HUB_PROVIDERS,
-  HUB_TRANSPORT_BY_PROVIDER,
   HUB_PROCESS_SESSION_QUOTA,
+  HUB_GC_SWEEP_INTERVAL_MS,
   type AgentHubOptions,
+  type HandoffDecisionInput,
+  type HubCleanupDocument,
   type HubCloseDocument,
   type HubStartDocument,
   type HubStatusDocument,
-  type ProviderFactoryLike,
   type ResumeOptions,
   type StartOptions,
   type TurnDocument,
 } from "./agent-hub.js";
 
-export {
-  WorkspaceLifecycle,
-  HUB_SESSION_QUOTA,
-  HUB_REF_NAMESPACE,
-  mergeKernelResume,
-  kernelResumeFromState,
-  projectRecordFromState,
-  type HandoffDocument,
-  type LifecyclePhase,
-  type PreparedLaunch,
-  type ReconcileReport,
-  type ReconcileSessionReport,
-  type WorkspaceLifecycleOptions,
-} from "./workspace-lifecycle.js";
+// The canonical durable custody surface (P2) that the hub's documents carry.
+export { WorkspaceLifecycle } from "../workspace/lifecycle.js";
+export type {
+  CloseInput,
+  FinalizeReport,
+  GcReport,
+  GcRetainCode,
+  HandoffInput,
+  PublishedTurn,
+  RecoveryReport,
+  WorkspaceInspection,
+  WorkspaceLifecycleOptions,
+} from "../workspace/lifecycle.js";
+export type {
+  CustodyStatus,
+  HandoffDecision,
+  WorkspaceHandoff,
+  WorkspaceRecord,
+  WorkspaceResultRecord,
+} from "../workspace/records.js";
 
 export {
   AttachInputPump,
   ATTACH_QUEUE_MAX_COMMANDS,
   ATTACH_QUEUE_MAX_BYTES,
-  ATTACH_CLOSE_DRAIN_DEFAULT_MS,
+  ATTACH_LINE_MAX_BYTES,
+  ATTACH_CHUNK_MAX_BYTES,
   type AttachInputEvent,
 } from "./attach-io.js";
 
@@ -53,11 +63,7 @@ export {
 
 export {
   bridgeTransportFactory,
-  kernelCapabilities,
-  kernelizeResume,
-  liveResumeOf,
   productionBridgedFactories,
   productionBridgedProviderFactories,
   type BridgedTransportFactory,
-  type LaunchFacts,
 } from "./transport-adapter.js";

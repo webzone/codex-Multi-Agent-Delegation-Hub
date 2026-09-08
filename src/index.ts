@@ -2,9 +2,11 @@
  * agent-hub — the public library surface of the rewrite.
  *
  * Provider-neutral by contract: one hub object (`AgentHub`) composing the
- * Git-free interaction core (`InteractionKernel`, P1) and the durable
- * workspace core (`WorkspaceLifecycle`). Interaction crosses ONLY the
- * shipped provider transports, auto-selected per provider:
+ * Git-free interaction core (`InteractionKernel`, P1) and the canonical
+ * durable custody core (`WorkspaceLifecycle`, P2 — AGENT_HUB_HOME-anchored
+ * worktrees, exact results, handoff, retention, conditional GC).
+ * Interaction crosses ONLY the shipped provider transports, auto-selected
+ * per provider:
  *
  *   - omp    → omp-rpc          (RPC v2 dialect only; no v1 fallback)
  *   - pi     → pi-rpc
@@ -12,10 +14,11 @@
  *   - hermes → hermes-acp
  *
  * There is deliberately no delegate / fanout / session / live / competition
- * / judge / auto-merge vocabulary here, and no compatibility aliases for it.
+ * / judge / auto-merge vocabulary here, no transport-pinning on public
+ * requests, and no compatibility aliases for any of it.
  */
 
-export { AgentHubError, asDelegateError } from "./errors.js";
+export { AgentHubError } from "./errors.js";
 
 export {
   AgentHub,
@@ -23,38 +26,42 @@ export {
   processHubSupervisor,
   WorkspaceLifecycle,
   HUB_PROVIDERS,
-  HUB_TRANSPORT_BY_PROVIDER,
   HUB_PROCESS_SESSION_QUOTA,
-  HUB_SESSION_QUOTA,
-  HUB_REF_NAMESPACE,
+  HUB_GC_SWEEP_INTERVAL_MS,
   bridgeTransportFactory,
-  kernelCapabilities,
-  kernelizeResume,
-  liveResumeOf,
   productionBridgedFactories,
   productionBridgedProviderFactories,
   AttachInputPump,
   ATTACH_QUEUE_MAX_COMMANDS,
   ATTACH_QUEUE_MAX_BYTES,
-  ATTACH_CLOSE_DRAIN_DEFAULT_MS,
-  type AttachInputEvent,
+  ATTACH_LINE_MAX_BYTES,
+  ATTACH_CHUNK_MAX_BYTES,
   type AgentHubOptions,
+  type AttachInputEvent,
   type BridgedTransportFactory,
-  type HandoffDocument,
+  type CloseInput,
+  type CustodyStatus,
+  type FinalizeReport,
+  type GcReport,
+  type GcRetainCode,
+  type HandoffDecision,
+  type HandoffDecisionInput,
+  type HandoffInput,
+  type HubCleanupDocument,
   type HubCloseDocument,
   type HubOpen,
   type HubStartDocument,
   type HubStatusDocument,
-  type LaunchFacts,
-  type LifecyclePhase,
-  type PreparedLaunch,
-  type ProviderFactoryLike,
-  type ReconcileReport,
-  type ReconcileSessionReport,
+  type PublishedTurn,
+  type RecoveryReport,
   type ResumeOptions,
   type StartOptions,
   type TurnDocument,
+  type WorkspaceHandoff,
+  type WorkspaceInspection,
   type WorkspaceLifecycleOptions,
+  type WorkspaceRecord,
+  type WorkspaceResultRecord,
 } from "./hub/index.js";
 
 // The interaction core stays directly constructible for embedders that bring
@@ -139,12 +146,3 @@ export {
   type TurnResult,
   type Usage,
 } from "./kernel/index.js";
-
-// Durable lifecycle vocabulary the hub documents carry (types only; the
-// underlying primitives are internal integration surface, not public API).
-export type {
-  CheckpointReason,
-  LiveCheckpoint,
-  LiveSessionState,
-  LiveStatus,
-} from "./live/types.js";

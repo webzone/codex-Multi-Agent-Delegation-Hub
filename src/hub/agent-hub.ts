@@ -1,240 +1,246 @@
-import { AgentHubError, asDelegateError } from "../errors.js";
+import { randomUUID } from "node:crypto";
+
+import { AgentHubError, asHubError } from "../errors.js";
+import { resolveRepositoryIdentity } from "../git.js";
 import type {
   Capabilities,
-  KernelError,
   PermissionDecision,
   PermissionPolicy,
+  ProviderFactory,
   ProviderId,
+  SessionRecord,
   StopMode,
   StopReport,
-  TransportId,
-  TransportFactory,
   TurnResult,
 } from "../kernel/contracts.js";
+import type { StartResult } from "../kernel/interaction-kernel.js";
 import {
   InteractionKernel,
   DEFAULT_MAX_TEXT_BYTES,
   DEFAULT_SESSION_QUOTA,
   type ProbeDocument,
 } from "../kernel/interaction-kernel.js";
+import { WorkspaceLifecycle } from "../workspace/lifecycle.js";
 import type {
-  CheckpointReason,
-  LiveCheckpoint,
-  LiveError,
-  LiveProviderId,
-  LiveSessionState,
-  LiveTransportId,
-} from "../live/types.js";
-import { TERMINAL_STATUSES, liveRefFor } from "../live/state.js";
-import { isLiveProvider, LIVE_TRANSPORT_PAIRINGS } from "../live/provider-registry.js";
-import type { LiveLeaseProbes } from "../live/lease.js";
-import { acquireRepositoryLock } from "../locks.js";
+  FinalizeReport,
+  GcReport,
+  RecoveryReport,
+  WorkspaceInspection,
+  WorkspaceLifecycleOptions,
+} from "../workspace/lifecycle.js";
+import { isWorkspaceSessionId } from "../workspace/home.js";
+import type {
+  HandoffDecision,
+  WorkspaceRecord,
+  WorkspaceResultRecord,
+} from "../workspace/records.js";
 import {
   productionBridgedFactories,
   productionBridgedProviderFactories,
   type BridgedTransportFactory,
 } from "./transport-adapter.js";
-import {
-  WorkspaceLifecycle,
-  type HandoffDocument,
-  type LifecyclePhase,
-  type PreparedLaunch,
-  type ReconcileReport,
-} from "./workspace-lifecycle.js";
 
 /**
  * AgentHub — the public, provider-neutral integration of the rewrite.
  *
- * One object, two cores, exactly as the contract names them:
+ * One object, two cores:
  *
  *   - `kernel` (`InteractionKernel`, P1): all interaction — prompt,
  *     follow_up, steer, cancel, status, permission_response, events,
- *     resume, close. Provider traffic crosses ONLY through the injected
- *     transports (omp RPC v2-only, pi RPC, agy stream-json, hermes ACP),
- *     selected automatically per provider with an honest probe gate.
- *   - `lifecycle` (`WorkspaceLifecycle`, P4 composition of the durable
- *     primitives): worktree + checkpoint chain + lease + durable records
- *     around every session, handoff, and safe GC.
+ *     resume, close. Provider traffic crosses ONLY through the shipped
+ *     bridges (omp RPC v2-only, pi RPC, agy stream-json, hermes ACP),
+ *     auto-selected per provider with the honest-probe gate. Callers never
+ *     pin a transport: the selected transport is reported back as a fact.
+ *   - `lifecycle` (`WorkspaceLifecycle`, P2 — the ONE durable custody
+ *     truth): AGENT_HUB_HOME-anchored records, one isolated worktree per
+ *     session, exact result identity per terminal turn, leases, close/
+ *     handoff/retention custody, recovery, and the only GC deletion path.
  *
- * Every hub-observed terminal boundary pins the checkpoint chain; every
- * kernel durable commit projects onto the lifecycle state; teardown runs
- * only on proven shutdown. The hub adds NO second interaction loop: the
- * kernel owns commands, the lifecycle owns resources, and each durable
- * write serializes through the lifecycle's per-session tail.
+ * Wiring is exclusively through the published seams: `lifecycle.mirror` is
+ * the kernel's `DurableMirror`, `lifecycle.onProviderSpawn` is its spawn
+ * hook, and `kernel.attached()` is the input to `recover`/`gc`.
+ *
+ * Custody rules the hub inherits and never bends:
+ *   - `close` never deletes anything — the worktree, lease, results, and
+ *     ref all stay until an explicit `accepted`/`discarded` handoff names
+ *     the exact result, and then only until the retention window expires;
+ *   - automatic cleanup (startup catch-up + optional bounded sweep) runs
+ *     `recover` + `gc` with this process's attached sessions as the
+ *     reference set, so nothing acknowledged, orphaned, uncertain, or
+ *     actively referenced is ever aged out.
  */
 
 export const HUB_PROVIDERS = ["omp", "pi", "agy", "hermes"] as const;
-export const HUB_TRANSPORT_BY_PROVIDER: Record<(typeof HUB_PROVIDERS)[number], LiveTransportId> = {
-  omp: "omp-rpc",
-  pi: "pi-rpc",
-  agy: "agy-stream-json",
-  hermes: "hermes-acp",
-};
 
 /** The default process-wide session quota (per hub host process). */
 export const HUB_PROCESS_SESSION_QUOTA = DEFAULT_SESSION_QUOTA;
 
-/** A provider/transport pairing the durable store's vocabulary accepts. */
-function assertRecordablePair(provider: ProviderId, transport: TransportId): void {
-  if (!isLiveProvider(provider) || LIVE_TRANSPORT_PAIRINGS[transport as LiveTransportId] !== provider) {
-    throw new AgentHubError(
-      "PROVIDER_UNSUPPORTED",
-      `provider/transport "${provider}/${transport}" is outside the hub's shipped pairings (omp RPC v2, pi RPC, agy stream-json, hermes ACP)`,
-    );
-  }
-}
+/** Bounded default for the periodic custody sweep (15 minutes). */
+export const HUB_GC_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
 
-export interface AgentHubOptions {
-  /** Injected bridges; default: the four shipped production transports. */
+export interface AgentHubOptions extends WorkspaceLifecycleOptions {
+  /** Injected transport bridges; default: the four shipped productions. */
   transportFactories?: readonly BridgedTransportFactory[];
   /** Provider preference/decline logic; default: production pairings. */
-  providerFactories?: readonly ProviderFactoryLike[];
-  now?: () => Date;
+  providerFactories?: readonly ProviderFactory[];
   maxTextBytes?: number;
   processQuota?: number;
-  commonDirQuota?: number;
-  tmpRoot?: string;
-  acquireLock?: typeof acquireRepositoryLock;
-  probes?: LiveLeaseProbes;
-  observeLifecyclePhase?: (phase: LifecyclePhase) => Promise<void> | void;
   newSessionId?: () => string;
-}
-
-/** Kernel-shaped provider factory (the adapter's production wrappers satisfy it). */
-export interface ProviderFactoryLike {
-  readonly provider: ProviderId;
-  readonly transports: readonly TransportId[];
-  selectTransport(factories: readonly TransportFactory[]): TransportFactory | null;
+  /**
+   * Automatic custody cleanup. Default true: after the hub is constructed,
+   * `recover` + `gc` run once (startup catch-up). Never touches anything
+   * attached here, unacknowledged, orphaned, uncertain, or referenced.
+   */
+  autoCleanup?: boolean;
+  /**
+   * Bounded periodic sweep interval for long-lived hosts. 0 (default) means
+   * startup catch-up only; a positive value arms an unref'd interval.
+   */
+  gcIntervalMs?: number;
 }
 
 export interface StartOptions {
   provider: ProviderId;
-  transport?: TransportId;
+  /** Display label for the owning agent (custody record metadata). */
+  agent?: string;
   permission_policy?: PermissionPolicy;
   max_text_bytes?: number;
-  allow_dirty?: boolean;
+  /** Must be a UUID when provided (custody paths are keyed by it). */
   session_id?: string;
 }
 
 export interface ResumeOptions {
-  transport?: TransportId;
   permission_policy?: PermissionPolicy;
   max_text_bytes?: number;
-  allow_dirty?: boolean;
 }
 
-/** Kernel turn result plus the checkpoint pinned for it (null when none). */
+/** The consumer's exact takeover decision on a closed workspace's head. */
+export interface HandoffDecisionInput {
+  decision: HandoffDecision;
+  result_seq: number;
+  commit: string;
+  consumer?: string | null;
+}
+
+/** Kernel turn result plus its published exact result identity (P2). */
 export interface TurnDocument extends TurnResult {
-  checkpoint: LiveCheckpoint | null;
-  /** Set when the terminal boundary could not be pinned; the chain is stale. */
-  checkpoint_error?: { code: string; message: string };
+  /** The exact result the turn published; null when not published. */
+  result: WorkspaceResultRecord | null;
+  /** Why publication legitimately did not happen (non-turn, refused command). */
+  publish_skipped_reason: string | null;
+  /** Set when publication was attempted and failed; the chain is stale. */
+  publish_error?: { code: string; message: string };
 }
 
 export interface HubStartDocument {
   session_id: string;
   provider: string;
+  /** Reported fact, never an input: selection is the hub's alone. */
   transport: string;
-  workspace: string;
+  worktree_path: string;
   capabilities: Capabilities;
   probe: ProbeDocument;
-  record: unknown;
-  state: LiveSessionState;
-  warnings: { code: string; message: string }[];
+  record: SessionRecord;
+  workspace: WorkspaceRecord;
 }
 
 export interface HubCloseDocument {
   session_id: string;
-  record: unknown;
+  record: SessionRecord;
   stop: StopReport | null;
-  state: LiveSessionState | null;
-  checkpoint_taken: boolean;
-  cleanup_errors: { code: string; message: string }[];
+  /** Custody finalization: captured state, retained everything. */
+  finalize: FinalizeReport;
+  /** True when this hub's own lease was released because shutdown was PROVEN. */
+  lease_released: boolean;
 }
 
 export interface HubStatusDocument {
   session_id: string;
   attached_here: boolean;
-  state: LiveSessionState | null;
-  record: unknown;
-  lease: {
-    owned_here: boolean;
-    provider_pid: number | null;
-    provider_pgid: number | null;
-  } | null;
-  ref: string;
+  workspace: WorkspaceRecord;
+  runtime: WorkspaceInspection["runtime"];
+  lease: WorkspaceInspection["lease"];
+  worktree: WorkspaceInspection["worktree"];
 }
 
-function checkpointReasonFor(outcome: TurnResult["outcome"]): CheckpointReason {
-  if (outcome === "cancelled") return "cancel";
-  if (outcome === "failed") return "error";
-  return "turn_end";
-}
-
-/** Project a kernel error onto the durable live vocabulary (provider-agnostic ids → null). */
-function liveErrorOf(error: KernelError): LiveError {
-  return {
-    code: error.code,
-    message: error.message,
-    stage: error.stage,
-    retryable: error.retryable,
-    provider: isLiveProvider(error.provider ?? "") ? (error.provider as LiveProviderId) : null,
-  };
+export interface HubCleanupDocument {
+  recovery: RecoveryReport;
+  cleanup: GcReport;
 }
 
 export class AgentHub {
   readonly kernel: InteractionKernel;
   readonly lifecycle: WorkspaceLifecycle;
 
-  /** Reserved launch resources, visible to the spawn hook during `kernel.start`. */
-  private readonly launches: Map<string, PreparedLaunch>;
+  /** Absolute caller checkout the hub binds sessions to (never mutated). */
+  readonly repositoryCwd: string;
+  private readonly commonDirResolved: string;
   private readonly bridges: readonly BridgedTransportFactory[];
+  private readonly processQuota: number;
+  private sweepTimer: ReturnType<typeof setInterval> | null = null;
+  private lastCleanupReport: HubCleanupDocument | null = null;
   private closed = false;
 
   private constructor(
     kernel: InteractionKernel,
     lifecycle: WorkspaceLifecycle,
     bridges: readonly BridgedTransportFactory[],
-    launches: Map<string, PreparedLaunch>,
+    repositoryCwd: string,
+    commonDir: string,
+    processQuota: number,
   ) {
     this.kernel = kernel;
     this.lifecycle = lifecycle;
     this.bridges = bridges;
-    this.launches = launches;
+    this.repositoryCwd = repositoryCwd;
+    this.commonDirResolved = commonDir;
+    this.processQuota = processQuota;
   }
 
-  /** Bind a hub to one repository workspace (identity resolved eagerly). */
+  /** Bind a hub to one repository checkout (identity resolved eagerly). */
   static async open(workspace: string, options: AgentHubOptions = {}): Promise<AgentHub> {
-    const lifecycle = await WorkspaceLifecycle.open(workspace, {
-      now: options.now,
-      tmpRoot: options.tmpRoot,
-      acquireLock: options.acquireLock,
-      probes: options.probes,
-      commonDirQuota: options.commonDirQuota,
-      observePhase: options.observeLifecyclePhase,
+    const identity = await resolveRepositoryIdentity(workspace);
+    const lifecycle = new WorkspaceLifecycle({
+      ...(options.home === undefined ? {} : { home: options.home }),
+      ...(options.env === undefined ? {} : { env: options.env }),
+      ...(options.now === undefined ? {} : { now: options.now }),
+      ...(options.retentionMs === undefined ? {} : { retentionMs: options.retentionMs }),
+      ...(options.probes === undefined ? {} : { probes: options.probes }),
+      ...(options.lockWaitMs === undefined ? {} : { lockWaitMs: options.lockWaitMs }),
+      ...(options.observePhase === undefined ? {} : { observePhase: options.observePhase }),
+      ...(options.probePid === undefined ? {} : { probePid: options.probePid }),
     });
     const bridges = options.transportFactories ?? productionBridgedFactories();
-    const launches = new Map<string, PreparedLaunch>();
     const kernel = new InteractionKernel({
       transportFactories: bridges,
       providerFactories: options.providerFactories ?? productionBridgedProviderFactories(),
       maxTextBytes: options.maxTextBytes ?? DEFAULT_MAX_TEXT_BYTES,
       maxLiveSessions: options.processQuota ?? HUB_PROCESS_SESSION_QUOTA,
-      newSessionId: options.newSessionId ?? (() => lifecycle.newSessionId()),
-      durable: {
-        commit: (record) => lifecycle.commitMirrorRecord(record),
-      },
-      onProviderSpawn: async (sessionId, facts) => {
-        const prepared = launches.get(sessionId);
-        if (prepared === undefined) {
-          throw new AgentHubError(
-            "SPAWN_UNOWNED",
-            `provider spawn for session "${sessionId}" arrived outside a hub-reserved launch; refusing to record ownership`,
-          );
-        }
-        await lifecycle.recordSpawn(prepared, facts);
-      },
+      ...(options.now === undefined ? {} : { now: options.now }),
+      newSessionId: options.newSessionId ?? (() => randomUUID()),
+      durable: { commit: lifecycle.mirror.commit },
+      onProviderSpawn: lifecycle.onProviderSpawn,
     });
-    return new AgentHub(kernel, lifecycle, bridges, launches);
+    const hub = new AgentHub(
+      kernel,
+      lifecycle,
+      bridges,
+      identity.worktree_root,
+      identity.common_dir,
+      options.processQuota ?? HUB_PROCESS_SESSION_QUOTA,
+    );
+    if (options.autoCleanup !== false) {
+      // Startup catch-up: settle provably-dead orphans, then collect only
+      // expired, decided, unreferenced workspaces. Bounded: one pass.
+      await hub.cleanup();
+    }
+    if (options.gcIntervalMs !== undefined && options.gcIntervalMs > 0) {
+      hub.sweepTimer = setInterval(() => {
+        void hub.cleanup().catch(() => undefined);
+      }, options.gcIntervalMs);
+      hub.sweepTimer.unref?.();
+    }
+    return hub;
   }
 
   /** Process-wide count of sessions this hub's kernel still runs. */
@@ -242,8 +248,19 @@ export class AgentHub {
     return this.kernel.attached().length;
   }
 
+  /** The repository's Git common dir (identity anchor for hub caching). */
   get commonDir(): string {
-    return this.lifecycle.commonDir;
+    return this.commonDirResolved;
+  }
+
+  /** The AGENT_HUB_HOME custody root this hub writes through. */
+  get home(): string {
+    return this.lifecycle.home;
+  }
+
+  /** The most recent startup/sweep/manual cleanup report, if any. */
+  get lastCleanup(): HubCleanupDocument | null {
+    return this.lastCleanupReport;
   }
 
   // ---------------------------------------------------------------------------
@@ -252,189 +269,154 @@ export class AgentHub {
 
   async start(options: StartOptions): Promise<HubStartDocument> {
     this.assertNotClosed();
-    const sessionId = options.session_id ?? this.lifecycle.newSessionId();
-    const selection = await this.kernel.selectTransport(options.provider, options.transport);
-    assertRecordablePair(selection.factory.provider, selection.factory.transport);
-    const bridge = selection.factory as BridgedTransportFactory;
-    const base = this.lifecycle.identity.head;
-    const prepared = await this.lifecycle.reserveLaunchResources(
-      sessionId,
-      options.provider as LiveProviderId,
-      base,
-      { allowDirty: options.allow_dirty },
-    );
-    this.launches.set(sessionId, prepared);
+    const sessionId = options.session_id ?? randomUUID();
+    if (!isWorkspaceSessionId(sessionId)) {
+      throw new AgentHubError(
+        "WORKSPACE_ID_INVALID",
+        `session id "${sessionId}" must be a UUID; custody paths are keyed by it`,
+      );
+    }
+    if (this.activeCount >= this.processQuota) {
+      throw new AgentHubError(
+        "SESSION_QUOTA_EXCEEDED",
+        `this hub process already runs ${this.activeCount} of ${this.processQuota} live sessions`,
+      );
+    }
+    // Selection before provisioning: a probe decline must not litter custody.
+    const selection = await this.kernel.selectTransport(options.provider);
+    const workspace = await this.lifecycle.provision({
+      session_id: sessionId,
+      repository_cwd: this.repositoryCwd,
+      ...(options.agent === undefined ? {} : { agent: options.agent }),
+    });
     try {
       const started = await this.kernel.start({
         provider: options.provider,
-        transport: options.transport,
         session_id: sessionId,
-        workspace: prepared.worktree.path,
+        workspace: workspace.worktree_path,
         resume: null,
         permission_policy: options.permission_policy ?? "deny",
-        max_text_bytes: options.max_text_bytes,
+        ...(options.max_text_bytes === undefined ? {} : { max_text_bytes: options.max_text_bytes }),
       });
-      const facts = bridge.takeLaunchFacts(sessionId);
-      if (facts === null) {
-        throw new AgentHubError(
-          "CAPABILITY_SNAPSHOT_INVALID",
-          `the "${started.record.transport}" transport produced no launch descriptor; the session cannot be recorded honestly`,
-        );
-      }
-      const state = await this.lifecycle.register({
-        session_id: sessionId,
-        provider: started.record.provider as LiveProviderId,
-        transport: started.record.transport as LiveTransportId,
-        identity: this.lifecycle.identity,
-        base,
-        capabilities: facts.capabilities,
-        resume: facts.resume_state ?? fallbackLiveResume(started.record.resume),
-        max_text_bytes: started.record.max_text_bytes,
-        prepared,
-      });
-      return {
-        session_id: sessionId,
-        provider: started.record.provider,
-        transport: started.record.transport,
-        workspace: prepared.worktree.path,
-        capabilities: started.capabilities,
-        probe: started.probe,
-        record: started.record,
-        state,
-        warnings: prepared.warnings,
-      };
+      return this.startDocument(sessionId, started, workspace);
     } catch (error) {
-      throw await this.cleanupFailedLaunch(prepared, error);
-    } finally {
-      this.launches.delete(sessionId);
+      throw await this.finalizeFailedLaunch(sessionId, error);
     }
   }
 
   async resume(sessionId: string, options: ResumeOptions = {}): Promise<HubStartDocument> {
     this.assertNotClosed();
-    if (this.lifecycle.isManaged(sessionId)) {
+    if (this.kernel.attached().some((record) => record.session_id === sessionId)) {
       throw new AgentHubError(
         "SESSION_ALREADY_LIVE",
         `session "${sessionId}" is already running in this hub process`,
       );
     }
-    const prior = await this.lifecycle.loadState(sessionId);
-    if (!TERMINAL_STATUSES.includes(prior.status)) {
+    // Custody refuses resume over a handoff decision, a live/uncertain
+    // lease, or a non-terminal runtime — before anything launches.
+    const workspace = await this.lifecycle.reopenForResume(sessionId);
+    const inspected = await this.lifecycle.inspect(sessionId);
+    if (inspected.worktree.state !== "present") {
       throw new AgentHubError(
-        "SESSION_NOT_RESUMABLE",
-        `session "${sessionId}" is "${prior.status}"; only terminal records resume — run \`agent-hub gc\` first`,
+        "WORKSPACE_WORKTREE_UNAVAILABLE",
+        `cannot resume "${sessionId}": worktree ${workspace.worktree_path} is ${inspected.worktree.state}`,
       );
     }
-    if ((await this.lifecycle.leaseFor(sessionId)) !== undefined) {
+    if (inspected.runtime.state !== "present") {
       throw new AgentHubError(
-        "LIVE_LEASE_EXISTS",
-        `session "${sessionId}" still holds a lease; run \`agent-hub gc\` (or close the owning hub) before resuming`,
+        "WORKSPACE_RUNTIME_MISSING",
+        `cannot resume "${sessionId}": its runtime mirror is ${inspected.runtime.state}`,
       );
     }
-    const selection = await this.kernel.selectTransport(
-      prior.provider,
-      options.transport ?? prior.transport,
-    );
+    const prior = inspected.runtime.record;
+    // Internal pin only: a session resumes on the transport it launched on.
+    const selection = await this.kernel.selectTransport(prior.provider, prior.transport);
     if (selection.factory.transport !== prior.transport) {
       throw new AgentHubError(
         "TRANSPORT_PAIRING_INVALID",
         `session "${sessionId}" was launched on "${prior.transport}"; resuming on "${selection.factory.transport}" is refused`,
       );
     }
-    const bridge = selection.factory as BridgedTransportFactory;
-    const prepared = await this.lifecycle.reserveLaunchResources(
-      sessionId,
-      prior.provider,
-      prior.current_commit,
-      { allowDirty: options.allow_dirty },
-    );
-    this.launches.set(sessionId, prepared);
-    try {
-      const rebound = await this.lifecycle.rebindResumeRecord(sessionId, prepared.worktree.path);
-      const started = await this.kernel.resume(rebound, {
-        transport: options.transport,
+    const started = await this.kernel.resume(
+      { ...prior, workspace: workspace.worktree_path },
+      {
         permission_policy: options.permission_policy ?? "deny",
-        max_text_bytes: options.max_text_bytes,
-      });
-      const facts = bridge.takeLaunchFacts(sessionId);
-      if (facts === null) {
-        throw new AgentHubError(
-          "CAPABILITY_SNAPSHOT_INVALID",
-          `the resumed "${prior.transport}" transport produced no launch descriptor; the session cannot be recorded honestly`,
-        );
-      }
-      const state = await this.lifecycle.register({
-        session_id: sessionId,
-        provider: prior.provider,
-        transport: prior.transport,
-        identity: this.lifecycle.identity,
-        base: prior.base_commit,
-        capabilities: facts.capabilities,
-        resume: facts.resume_state ?? fallbackLiveResume(started.record.resume),
-        max_text_bytes: started.record.max_text_bytes,
-        prepared,
-        continues: { prior_state: prior },
-      });
-      return {
-        session_id: sessionId,
-        provider: started.record.provider,
-        transport: started.record.transport,
-        workspace: prepared.worktree.path,
-        capabilities: started.capabilities,
-        probe: started.probe,
-        record: started.record,
-        state,
-        warnings: prepared.warnings,
-      };
-    } catch (error) {
-      throw await this.cleanupFailedLaunch(prepared, error);
-    } finally {
-      this.launches.delete(sessionId);
-    }
+        ...(options.max_text_bytes === undefined ? {} : { max_text_bytes: options.max_text_bytes }),
+      },
+    );
+    return this.startDocument(sessionId, started, workspace);
+  }
+
+  private startDocument(
+    sessionId: string,
+    started: StartResult,
+    workspace: WorkspaceRecord,
+  ): HubStartDocument {
+    return {
+      session_id: sessionId,
+      provider: started.record.provider,
+      transport: started.record.transport,
+      worktree_path: workspace.worktree_path,
+      capabilities: started.capabilities,
+      probe: started.probe,
+      record: started.record,
+      workspace,
+    };
   }
 
   /**
-   * A launch that rejected after reserving resources returns them only on
-   * proof (never-spawned, or leader+group provably gone); anything else
-   * keeps the lease and worktree for `gc`.
+   * A launch that rejected after provisioning closes custody honestly with
+   * the failure as evidence. Nothing is deleted: the worktree and any
+   * recorded lease stay for recovery/GC to re-prove — handoff still decides.
    */
-  private async cleanupFailedLaunch(
-    prepared: PreparedLaunch,
-    cause: unknown,
-  ): Promise<AgentHubError> {
-    const failure = asDelegateError(cause);
-    const release = await this.lifecycle.releaseIfProviderProvenGone(prepared);
-    if (!release.released) {
+  private async finalizeFailedLaunch(sessionId: string, cause: unknown): Promise<AgentHubError> {
+    const failure = asHubError(cause);
+    try {
+      await this.lifecycle.finalizeClosure({
+        session_id: sessionId,
+        evidence: `start failed: ${failure.code}: ${failure.message}`,
+        runtime_status: "error",
+      });
+    } catch (finalizeError) {
+      const retained = asHubError(finalizeError);
       return new AgentHubError(
         failure.code,
-        `${failure.message}; ${release.retained_reason ?? "launch resources are retained"}`,
+        `${failure.message}; custody could not be closed (${retained.code}: ${retained.message}) and is retained for \`agent-hub gc\` review`,
       );
     }
-    return new AgentHubError(failure.code, failure.message);
+    return new AgentHubError(
+      failure.code,
+      `${failure.message}; the isolated worktree and lease (if any) are retained until an explicit handoff decision`,
+    );
   }
 
   // ---------------------------------------------------------------------------
-  // Real-time commands (kernel owns the gates; hub pins terminal boundaries)
+  // Real-time commands (kernel owns the gates; P2 owns result identity)
   // ---------------------------------------------------------------------------
 
   async prompt(sessionId: string, text: string): Promise<TurnDocument> {
-    return this.runTurn(() => this.kernel.prompt(sessionId, text), sessionId);
+    const turn = await this.kernel.prompt(sessionId, text);
+    return this.publish(turn);
   }
 
   async followUp(sessionId: string, text: string): Promise<TurnDocument> {
-    return this.runTurn(() => this.kernel.followUp(sessionId, text), sessionId);
+    const turn = await this.kernel.followUp(sessionId, text);
+    return this.publish(turn);
   }
 
   async steer(sessionId: string, text: string): Promise<TurnDocument> {
-    return this.runTurn(() => this.kernel.steer(sessionId, text), sessionId);
+    const turn = await this.kernel.steer(sessionId, text);
+    return this.publish(turn);
   }
 
   async cancel(sessionId: string, reason: string | null): Promise<TurnDocument> {
-    return this.runTurn(() => this.kernel.cancel(sessionId, reason), sessionId);
+    const turn = await this.kernel.cancel(sessionId, reason);
+    return this.publish(turn);
   }
 
   async requestStatus(sessionId: string): Promise<TurnDocument> {
-    return this.runTurn(() => this.kernel.requestStatus(sessionId), sessionId);
+    const turn = await this.kernel.requestStatus(sessionId);
+    return this.publish(turn);
   }
 
   async respondPermission(
@@ -443,39 +425,30 @@ export class AgentHub {
     decision: PermissionDecision,
     note: string | null = null,
   ): Promise<TurnDocument> {
-    return this.runTurn(
-      () => this.kernel.respondPermission(sessionId, requestId, decision, note),
-      sessionId,
-    );
+    const turn = await this.kernel.respondPermission(sessionId, requestId, decision, note);
+    return this.publish(turn);
   }
 
   /**
-   * Run one command and, when it settles a TURN (prompt/follow_up), pin the
-   * checkpoint chain at that terminal boundary. A pin that cannot land is
-   * reported on the document (`checkpoint_error`) — never silently.
+   * Publish the exact result identity of a settled command (P2 decides what
+   * is a turn). A publication failure is reported on the document, never
+   * silently — the turn's own result always lands first.
    */
-  private async runTurn(
-    invoke: () => Promise<TurnResult>,
-    sessionId: string,
-  ): Promise<TurnDocument> {
-    const result = await invoke();
-    const isTurn = result.kind === "prompt" || result.kind === "follow_up";
-    if (!isTurn || result.outcome === "unsupported") {
-      return { ...result, checkpoint: null };
-    }
+  private async publish(turn: TurnResult): Promise<TurnDocument> {
     try {
-      const checkpoint = await this.lifecycle.captureCheckpoint(
-        sessionId,
-        checkpointReasonFor(result.outcome),
-        { lastError: result.error === null ? undefined : liveErrorOf(result.error) },
-      );
-      return { ...result, checkpoint };
-    } catch (error) {
-      const failure = asDelegateError(error);
+      const published = await this.lifecycle.publishTurnResult(turn.session_id, turn);
       return {
-        ...result,
-        checkpoint: null,
-        checkpoint_error: { code: failure.code, message: failure.message },
+        ...published.turn,
+        result: published.result,
+        publish_skipped_reason: published.publish_skipped_reason,
+      };
+    } catch (error) {
+      const failure = asHubError(error);
+      return {
+        ...turn,
+        result: null,
+        publish_skipped_reason: null,
+        publish_error: { code: failure.code, message: failure.message },
       };
     }
   }
@@ -502,88 +475,56 @@ export class AgentHub {
   }
 
   async status(sessionId: string): Promise<HubStatusDocument> {
-    const state = await this.lifecycle.loadState(sessionId).catch((error: unknown) => {
-      if (asDelegateError(error).code === "SESSION_NOT_FOUND") {
-        throw new AgentHubError(
-          "SESSION_NOT_FOUND",
-          `no durable session "${sessionId}" in this repository`,
-        );
-      }
-      throw error;
-    });
-    const record = await this.lifecycle.loadMirrorRecord(sessionId).catch(() => null);
-    const lease = await this.lifecycle.leaseFor(sessionId);
+    const inspected = await this.lifecycle.inspect(sessionId);
     return {
       session_id: sessionId,
-      attached_here: this.lifecycle.isManaged(sessionId),
-      state,
-      record,
-      lease:
-        lease === undefined
-          ? null
-          : {
-              owned_here: lease.hub_pid === process.pid,
-              provider_pid: lease.provider_pid,
-              provider_pgid: lease.provider_pgid,
-            },
-      ref: liveRefFor(sessionId),
+      attached_here: this.kernel.attached().some((record) => record.session_id === sessionId),
+      workspace: inspected.workspace,
+      runtime: inspected.runtime,
+      lease: inspected.lease,
+      worktree: inspected.worktree,
     };
   }
 
-  /** Every durable session in this repository's common dir. */
+  /** Every durable workspace under AGENT_HUB_HOME for this hub. */
   async list() {
-    const states = await this.lifecycle.listStates();
-    return states.map((state) => ({
-      ...state,
-      attached_here: this.lifecycle.isManaged(state.live_session_id),
+    const records = await this.lifecycle.list();
+    const attached = new Set(this.kernel.attached().map((record) => record.session_id));
+    return records.map((workspace) => ({
+      workspace,
+      attached_here: attached.has(workspace.session_id),
     }));
   }
 
   // ---------------------------------------------------------------------------
-  // Close / handoff / GC / probe
+  // Close / handoff / cleanup
   // ---------------------------------------------------------------------------
 
+  /**
+   * Kernel close + custody finalize. Retains everything: the isolated
+   * worktree, lease, results, and ref stay under custody until an explicit
+   * `accepted`/`discarded` handoff names this workspace's exact result and
+   * the retention window passes.
+   */
   async close(sessionId: string, mode: StopMode = "graceful"): Promise<HubCloseDocument> {
-    const closed = await this.kernel.close(sessionId, mode);
-    const state = await this.lifecycle.loadState(sessionId).catch(() => null);
-    if (closed.record.status === "closed") {
-      let checkpoint_taken = false;
-      let cleanup_errors: { code: string; message: string }[] = [];
-      if (this.lifecycle.isManaged(sessionId)) {
-        // First close to prove shutdown owns the final boundary and teardown.
-        try {
-          const teardown = await this.lifecycle.finalizeClosed(sessionId);
-          checkpoint_taken = teardown.checkpoint_taken;
-          cleanup_errors = teardown.cleanup_errors;
-        } catch (error) {
-          // Proven shutdown, unpinnable final boundary: retain, report, never
-          // pretend the chain advanced.
-          cleanup_errors = [asDelegateError(error)];
-        }
-      }
-      return {
-        session_id: sessionId,
-        record: closed.record,
-        stop: closed.stop,
-        state: await this.lifecycle.loadState(sessionId).catch(() => state),
-        checkpoint_taken,
-        cleanup_errors,
-      };
+    const { close, finalize } = await this.lifecycle.closeSession(this.kernel, sessionId, mode);
+    let leaseReleased = false;
+    if (close.record.status === "closed") {
+      // Proven shutdown releases the ownership lease; an `orphaned` close
+      // keeps it exactly where it is for recover/gc to re-prove.
+      leaseReleased = await this.lifecycle.releaseClosedLease(sessionId);
     }
-    // Orphaned or degraded: ownership and worktree stay exactly where they
-    // are; `gc` (or a terminate close) finishes the job.
-    this.lifecycle.retainOrphan(sessionId);
     return {
       session_id: sessionId,
-      record: closed.record,
-      stop: closed.stop,
-      state,
-      checkpoint_taken: false,
-      cleanup_errors: [],
+      record: close.record,
+      stop: close.stop,
+      finalize,
+      lease_released: leaseReleased,
     };
   }
 
   async closeAll(): Promise<HubCloseDocument[]> {
+    this.stopSweep();
     const results: HubCloseDocument[] = [];
     for (const record of this.kernel.attached()) {
       results.push(await this.close(record.session_id));
@@ -593,15 +534,35 @@ export class AgentHub {
     return results;
   }
 
-  /** The checkpoint chain as the deliverable; adoption is a human command. */
-  handoff(sessionId: string): Promise<HandoffDocument> {
-    return this.lifecycle.handoff(sessionId);
+  /**
+   * The consumer's exact decision on a closed workspace's published head.
+   * Refused unless `result_seq`/`commit` name the current head exactly; the
+   * retention clock starts at the decision. Nothing is deleted here.
+   */
+  handoff(sessionId: string, decision: HandoffDecisionInput): Promise<WorkspaceRecord> {
+    return this.lifecycle.handoff({
+      session_id: sessionId,
+      decision: decision.decision,
+      result_seq: decision.result_seq,
+      commit: decision.commit,
+      consumer: decision.consumer ?? null,
+    });
   }
 
-  /** Safe GC: reconcile leases/worktrees; `dry_run` reports without acting. */
-  gc(options: { dry_run?: boolean } = {}): Promise<ReconcileReport> {
-    const attached = new Set(this.kernel.attached().map((record) => record.session_id));
-    return this.lifecycle.reconcile(attached, { dryRun: options.dry_run ?? false });
+  /**
+   * The safe manual reconciliation path: `recover` first (re-prove leases,
+   * settle provably-dead orphans, close what the kernel mirror proves
+   * closed — deletes nothing), then `gc` (deletes only workspaces whose
+   * handoff decision is exact, whose retention expired, and whose every
+   * other precondition is provable). Sessions attached here are referenced
+   * by definition and are untouchable.
+   */
+  async cleanup(): Promise<HubCleanupDocument> {
+    const attached = this.kernel.attached();
+    const recovery = await this.lifecycle.recover(attached);
+    const cleanup = await this.lifecycle.gc(attached);
+    this.lastCleanupReport = { recovery, cleanup };
+    return this.lastCleanupReport;
   }
 
   /** Honest probe documents for the shipped providers (launches nothing). */
@@ -628,46 +589,21 @@ export class AgentHub {
   }
 
   /** Wait until every kernel pump has drained (host shutdown seam). */
-  settle(): Promise<void> {
-    return this.kernel.settle();
+  async settle(): Promise<void> {
+    this.stopSweep();
+    await this.kernel.settle();
+  }
+
+  private stopSweep(): void {
+    if (this.sweepTimer !== null) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = null;
+    }
   }
 
   private assertNotClosed(): void {
     if (this.closed) {
       throw new AgentHubError("HUB_CLOSED", "this hub host has been closed; start a new host");
     }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * The transport reported no resume state at all: build the provider's
- * honest zero-facts handle from observed identity only — `verified` can
- * only be true through an actual round trip, which the kernel has already
- * applied to its own handle.
- */
-function fallbackLiveResume(
-  kernelResume: { provider: string; provider_session_id: string | null } | null,
-): LiveSessionState["resume"] {
-  if (kernelResume === null) return null;
-  const base = {
-    provider_session_id: kernelResume.provider_session_id,
-    verified: false as const,
-    verified_via: null,
-  };
-  switch (kernelResume.provider) {
-    case "omp":
-      return { provider: "omp", ...base, last_event_seq: 0 };
-    case "agy":
-      return { provider: "agy", ...base, resume_argv_verified: false };
-    case "pi":
-      return { provider: "pi", ...base, resume_token: null };
-    case "hermes":
-      return { provider: "hermes", ...base, session_load_advertised: false };
-    default:
-      return null;
   }
 }

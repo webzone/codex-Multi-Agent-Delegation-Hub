@@ -8,7 +8,7 @@ export class AgentHubError extends Error {
   }
 }
 
-export function asDelegateError(error: unknown): { code: string; message: string } {
+export function asHubError(error: unknown): { code: string; message: string } {
   if (error instanceof AgentHubError) {
     return { code: error.code, message: error.message };
   }

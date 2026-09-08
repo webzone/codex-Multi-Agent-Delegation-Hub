@@ -23,6 +23,7 @@ export type {
   ProvisionInput,
   PublishedTurn,
   RecoveryReport,
+  WorkspaceInspection,
   WorkspaceLifecycleOptions,
 } from "./lifecycle.js";
 

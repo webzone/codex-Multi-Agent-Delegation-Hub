@@ -31,6 +31,7 @@ import {
   pruneWorktrees,
   removeWorktree,
 } from "./gitops.js";
+import type { WorktreeInspection } from "./gitops.js";
 import {
   classifyLease,
   defaultLeaseProbes,
@@ -240,6 +241,18 @@ const ALL_CAPABILITY_NAMES = [
   "resume",
   "usage_reporting",
 ] as const;
+
+/** Everything `inspect` proves about one session, as a named contract. */
+export interface WorkspaceInspection {
+  workspace: WorkspaceRecord;
+  runtime:
+    | { state: "absent" }
+    | { state: "corrupt" }
+    | { state: "present"; record: SessionRecord; rewritten_by_recovery: boolean };
+  lease: LeaseClassification | { state: "absent" } | { state: "corrupt" };
+  worktree: WorktreeInspection;
+  results: { seq: number; result: WorkspaceResultRecord | "corrupt" }[];
+}
 
 export class WorkspaceLifecycle {
   readonly home: string;
@@ -737,6 +750,122 @@ export class WorkspaceLifecycle {
     });
   }
 
+  /**
+   * The resume boundary for custody (the exact-identity guard for the
+   * kernel's own terminal-record check lives in P1). A closed workspace may
+   * reopen ONLY while no consumer has decided its head: a `handoff` decision
+   * arms retention, and a workspace that may be collected must never accept
+   * new work. Any still-owned lease (live hub, live provider, uncertain or
+   * corrupt proof) refuses the reopen — never a silent takeover.
+   */
+  async reopenForResume(sessionId: string): Promise<WorkspaceRecord> {
+    const pre = await readRecordRaw(this.home, sessionId);
+    if (pre.status === "absent") {
+      fail("WORKSPACE_NOT_FOUND", `no custody record for session "${sessionId}"`);
+    }
+    if (pre.status === "corrupt") {
+      fail("WORKSPACE_STATE_INCONSISTENT", `custody record for "${sessionId}" is corrupt`);
+    }
+    const ctx = this.context(pre.record.repository_cwd);
+    return withWorkspaceLock(ctx, sessionId, async () => {
+      const loaded = await loadWorkspace(ctx, sessionId);
+      if (loaded.status === "inconsistent") {
+        fail("WORKSPACE_STATE_INCONSISTENT", loaded.detail);
+      }
+      if (loaded.status === "absent") {
+        fail("WORKSPACE_NOT_FOUND", `no custody record for session "${sessionId}"`);
+      }
+      const rec = loaded.record;
+      if (rec.custody === "live") {
+        fail("WORKSPACE_LIVE", `session "${sessionId}" custody is still live; there is nothing to resume`);
+      }
+      if (rec.handoff !== null) {
+        fail(
+          "WORKSPACE_HANDOFF_DECIDED",
+          `session "${sessionId}" head result ${rec.handoff.result_seq} @ ${rec.handoff.commit} was decided ${rec.handoff.decision}; a decided workspace is consumer-owned and cannot resume`,
+        );
+      }
+      const runtime = await readRuntimeMirror(this.home, sessionId);
+      if (runtime.status === "absent") {
+        fail("WORKSPACE_RUNTIME_MISSING", `session "${sessionId}" has no runtime mirror to resume from`);
+      }
+      if (runtime.status === "corrupt") {
+        fail("WORKSPACE_STATE_INCONSISTENT", `runtime mirror for "${sessionId}" is corrupt`);
+      }
+      if (!isTerminalRuntimeStatus(runtime.mirror.record.status)) {
+        fail(
+          "WORKSPACE_RUNTIME_LIVE",
+          `runtime mirror for "${sessionId}" still says "${runtime.mirror.record.status}"; recovery must settle it first`,
+        );
+      }
+      const leaseRead = await readLease(this.home, sessionId);
+      if (leaseRead.status === "corrupt") {
+        fail(
+          "WORKSPACE_LEASE_UNCERTAIN",
+          `lease file for "${sessionId}" is corrupt; ownership is unverifiable and takeover is refused`,
+        );
+      }
+      if (leaseRead.status === "present") {
+        const classification = await classifyLease(leaseRead.lease, this.probes);
+        if (classification.state === "foreign-host") {
+          fail(
+            "WORKSPACE_LEASE_FOREIGN",
+            `lease for "${sessionId}" belongs to host ${classification.owner_hostname}; takeover is refused`,
+          );
+        }
+        if (classification.state === "hub-live") {
+          fail("WORKSPACE_LIVE", `a live hub process still owns session "${sessionId}"`);
+        }
+        if (classification.provider.state !== "dead") {
+          fail(
+            "WORKSPACE_LEASE_LIVE",
+            classification.provider.state === "alive"
+              ? `the leased provider process for "${sessionId}" is still alive; recover or reap it before resuming`
+              : `provider ownership for "${sessionId}" is uncertain (${classification.provider.reason})`,
+          );
+        }
+      }
+      const at = this.now().toISOString();
+      return updateRecordCas(ctx, sessionId, rec.revision, (r) => ({
+        ...r,
+        custody: "live" as const,
+        runtime_status: null,
+        closed_at: null,
+        close_evidence: null,
+        last_error: null,
+        revision: r.revision + 1,
+        updated_at: at,
+      }));
+    });
+  }
+
+  /**
+   * Release THIS process's lease once closure is proven by the kernel
+   * mirror (`status: "closed"`, i.e. the provider shutdown was proved). A
+   * released lease is what lets the owning hub resume the session or let
+   * GC collect it; a lease whose provider death was NOT proven (orphaned)
+   * is never released here — only recovery/GC re-proves and releases it.
+   */
+  async releaseClosedLease(sessionId: string): Promise<boolean> {
+    const pre = await readRecordRaw(this.home, sessionId);
+    if (pre.status !== "present") {
+      return false;
+    }
+    const ctx = this.context(pre.record.repository_cwd);
+    return withWorkspaceLock(ctx, sessionId, async () => {
+      const lease = await readLease(this.home, sessionId);
+      if (lease.status !== "present" || lease.lease.hub_pid !== process.pid) {
+        return false;
+      }
+      const runtime = await readRuntimeMirror(this.home, sessionId);
+      if (runtime.status !== "present" || runtime.mirror.record.status !== "closed") {
+        return false;
+      }
+      await deleteLeaseFile(this.home, sessionId);
+      return true;
+    });
+  }
+
   // -------------------------------------------------------------------------
   // Recovery (crash/orphan reconciliation)
   // -------------------------------------------------------------------------
@@ -1231,16 +1360,7 @@ export class WorkspaceLifecycle {
     return out;
   }
 
-  async inspect(sessionId: string): Promise<{
-    workspace: WorkspaceRecord;
-    runtime:
-      | { state: "absent" }
-      | { state: "corrupt" }
-      | { state: "present"; record: SessionRecord; rewritten_by_recovery: boolean };
-    lease: LeaseClassification | { state: "absent" } | { state: "corrupt" };
-    worktree: Awaited<ReturnType<typeof inspectWorktree>>;
-    results: { seq: number; result: WorkspaceResultRecord | "corrupt" }[];
-  }> {
+  async inspect(sessionId: string): Promise<WorkspaceInspection> {
     const raw = await readRecordRaw(this.home, sessionId);
     if (raw.status === "absent") {
       fail("WORKSPACE_NOT_FOUND", `no custody record for session "${sessionId}"`);

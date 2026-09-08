@@ -2,8 +2,10 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { AgentHub, type AgentHubOptions, type ProviderFactoryLike } from "../src/hub/agent-hub.js";
+import { AgentHub, type AgentHubOptions } from "../src/hub/agent-hub.js";
 import { bridgeTransportFactory } from "../src/hub/transport-adapter.js";
+import type { ProviderFactory } from "../src/kernel/contracts.js";
+import type { LeaseProbes } from "../src/workspace/leases.js";
 import type {
   LiveCapabilities,
   LiveCommand,
@@ -17,14 +19,15 @@ import type {
   LiveTransport,
   LiveTransportFactory,
 } from "../src/live/types.js";
-import type { LiveLeaseProbes } from "../src/live/lease.js";
 import { resolveRepositoryIdentity } from "../src/git.js";
 import { createGitRepository } from "./helpers.js";
 
 /**
- * Fakes for the public integration layer. The durable store's vocabulary is
- * fixed to the four shipped pairings, so fakes pose as `omp`/`omp-rpc` — the
- * same rule every live-core fake follows.
+ * Fakes for the public integration layer. The transports pose as
+ * `omp`/`omp-rpc` (the same rule every live-core fake follows); everything
+ * durable runs for real against a temp AGENT_HUB_HOME and a real Git repo,
+ * so result identities, worktrees, refs, leases, and GC are exercised as
+ * shipped code, not mocked.
  */
 
 export function fullHubCapabilities(
@@ -76,6 +79,7 @@ export class HubFakeTransport implements LiveTransport {
     private readonly opts: {
       pid?: number | null;
       resumeState?: "echo";
+      openDelayMs?: number;
     } = {},
   ) {}
 
@@ -89,6 +93,9 @@ export class HubFakeTransport implements LiveTransport {
 
   async open(request: LiveLaunchRequest): Promise<LiveLaunchReport> {
     this.launch = request;
+    if (this.opts.openDelayMs !== undefined && this.opts.openDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.opts.openDelayMs));
+    }
     const pid = this.opts.pid === undefined ? 424_242 : this.opts.pid;
     if (pid !== null) {
       await request.report_process?.({ pid, pgid: pid });
@@ -214,7 +221,11 @@ export class HubFakeFactory implements LiveTransportFactory {
 
   constructor(
     private readonly caps: () => LiveCapabilities = () => fullHubCapabilities(),
-    private readonly transportOptions: { pid?: number | null; resumeState?: "echo" } = {},
+    private readonly transportOptions: {
+      pid?: number | null;
+      resumeState?: "echo";
+      openDelayMs?: number;
+    } = {},
   ) {}
 
   async probe(): Promise<LiveProbeResult> {
@@ -233,7 +244,7 @@ export class HubFakeFactory implements LiveTransportFactory {
 }
 
 /** Kernel-shaped selection (the hub hands kernel factories to this seam). */
-export const hubFakeProviderFactory: ProviderFactoryLike = {
+export const hubFakeProviderFactory: ProviderFactory = {
   provider: "omp",
   transports: ["omp-rpc"],
   selectTransport: (factories) => factories[0] ?? null,
@@ -244,21 +255,21 @@ export function hubFakeProbes(
     alive?: (pid: number) => boolean;
     groupState?: (pgid: number) => "alive" | "gone" | "uncertain";
   } = {},
-): LiveLeaseProbes {
+): LeaseProbes {
   const alive = config.alive ?? ((pid: number) => pid === process.pid);
   return {
     probePid: (pid) => (alive(pid) ? "live" : "dead"),
     startToken: async () => "fake-token",
     killGroup: () => true,
     probeGroup: config.groupState ?? ((pgid) => (alive(pgid) ? "alive" : "gone")),
-    now: () => new Date(),
   };
 }
 
 export interface HubHarness {
   repository: string;
   commonDir: string;
-  tmpRoot: string;
+  /** The temp AGENT_HUB_HOME the hub's P2 custody writes through. */
+  home: string;
   hub: AgentHub;
   factory: HubFakeFactory;
 }
@@ -266,24 +277,44 @@ export interface HubHarness {
 export async function createHubHarness(
   options: {
     capabilities?: () => LiveCapabilities;
-    transportOptions?: { pid?: number | null; resumeState?: "echo" };
+    transportOptions?: { pid?: number | null; resumeState?: "echo"; openDelayMs?: number };
     hubOptions?: AgentHubOptions;
     probe?: LiveProbeResult;
+    /** Override the home (reuse custody across harnesses). Default: fresh temp dir. */
+    home?: string;
   } = {},
 ): Promise<HubHarness> {
   const repository = await createGitRepository();
   const identity = await resolveRepositoryIdentity(repository);
-  const tmpRoot = await mkdtemp(join(tmpdir(), "agent-hub-hub-"));
+  const home = options.home ?? (await mkdtemp(join(tmpdir(), "agent-hub-home-")));
   const factory = new HubFakeFactory(options.capabilities, options.transportOptions);
   if (options.probe !== undefined) factory.probeResult = options.probe;
   const hub = await AgentHub.open(repository, {
+    home,
     transportFactories: [bridgeTransportFactory(factory)],
     providerFactories: [hubFakeProviderFactory],
-    tmpRoot,
     probes: hubFakeProbes(),
+    // Tests opt into cleanup explicitly; per-test determinism first.
+    autoCleanup: false,
     ...options.hubOptions,
   });
-  return { repository, commonDir: identity.common_dir, tmpRoot, hub, factory };
+  return { repository, commonDir: identity.common_dir, home, hub, factory };
+}
+
+/** Build a second hub over the same repo + home (cross-host scenarios). */
+export function hubOptionsFor(
+  harness: Pick<HubHarness, "home">,
+  factory: HubFakeFactory,
+  overrides: AgentHubOptions = {},
+): AgentHubOptions {
+  return {
+    home: harness.home,
+    transportFactories: [bridgeTransportFactory(factory)],
+    providerFactories: [hubFakeProviderFactory],
+    probes: hubFakeProbes(),
+    autoCleanup: false,
+    ...overrides,
+  };
 }
 
 /** Attach a scripted turn to a transport the fake factory already created. */

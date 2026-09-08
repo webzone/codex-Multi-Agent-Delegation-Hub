@@ -2,10 +2,11 @@
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { AgentHubError, asDelegateError } from "./errors.js";
+import { AgentHubError, asHubError } from "./errors.js";
 import {
   AgentHub,
   HUB_PROVIDERS,
+  type HandoffDecisionInput,
   type TurnDocument,
 } from "./hub/agent-hub.js";
 import type { AgentHubOptions } from "./hub/agent-hub.js";
@@ -13,13 +14,11 @@ import {
   AgentHubSupervisor,
   type HubOpen,
 } from "./hub/supervisor.js";
-import {
-  AttachInputPump,
-  ATTACH_CLOSE_DRAIN_DEFAULT_MS,
-} from "./hub/attach-io.js";
+import { AttachInputPump } from "./hub/attach-io.js";
 import { productionBridgedFactories } from "./hub/transport-adapter.js";
 import { isPermissionDecision } from "./kernel/contracts.js";
 import type { PermissionPolicy } from "./kernel/contracts.js";
+import type { HandoffDecision } from "./workspace/records.js";
 
 /**
  * agent-hub — the command-line surface of the rewrite.
@@ -31,45 +30,54 @@ import type { PermissionPolicy } from "./kernel/contracts.js";
  * Real-time interaction (prompt, follow_up, steer, cancel, status,
  * permission) lives in `--attach` mode: long-lived NDJSON — one command
  * per line on stdin, `session`/`event`/`result`/`error`/`close` documents
- * on stdout. A session belongs to the process that launched it; after a
- * hub-process loss, reconcile with `gc` and continue with `resume`.
+ * on stdout. Sessions run in hub-owned isolated worktrees under
+ * AGENT_HUB_HOME; closing never deletes anything — cleanup waits for an
+ * explicit handoff decision and the retention window.
  */
 
-const HELP = `agent-hub — provider-neutral agent sessions with durable, checkpointed workspaces
+const HELP = `agent-hub — provider-neutral agent sessions in durable, isolated workspaces
 
-Providers (transport auto-selected, honest probe gate):
+Providers (transport auto-selected per provider, honest probe gate; the
+transport is reported as a fact and can never be pinned by callers):
   omp    omp-rpc          RPC v2 dialect ONLY — no v1 fallback, ever
   pi     pi-rpc           JSON-RPC over stdio
   agy    agy-stream-json  stream-json
   hermes hermes-acp       Agent Client Protocol (ACP)
 
 Usage:
-  agent-hub start --provider <p> [--transport <t>] [--task TEXT] [--workspace DIR]
+  agent-hub start --provider <p> [--task TEXT] [--workspace DIR]
                   [--permission-policy deny|interactive] [--max-output-bytes N]
-                  [--allow-dirty] [--attach]
+                  [--attach]
       One-shot (requires --task): start → prompt → turn result → close,
-      answering with {session, turn, close, handoff}. With --attach: keep the
+      answering with {session, turn, close, next}. With --attach: keep the
       process attached and drive the session over the NDJSON wire (below);
       --task, when present, is issued as the first prompt.
 
-  agent-hub resume <session-id> [--task TEXT] [--transport <t>] [--workspace DIR]
+  agent-hub resume <session-id> [--task TEXT] [--workspace DIR]
                   [--permission-policy ...] [--attach]
-      Continue a terminal session from its durable record + checkpoint chain.
-      --task is delivered as a follow_up turn.
+      Continue a closed session from its durable custody record (only while
+      no handoff decision has been made). --task is delivered as a
+      follow_up turn.
 
   agent-hub status [session-id] [--workspace DIR]
-      One session's durable document (record + state + lease), or every
-      durable session in this repository when no id is given.
+      One session's custody document (workspace record + runtime mirror +
+      lease + worktree state), or every durable session when no id is given.
 
-  agent-hub handoff <session-id> [--workspace DIR]
-      The checkpoint chain as the deliverable: ref, commits, changed files,
-      and the human review/adopt command. Never merges anything.
+  agent-hub handoff <session-id> --decision accepted|discarded
+                  --result-seq N --commit SHA [--consumer NAME] [--workspace DIR]
+      The consumer's takeover decision. It must name the workspace's exact
+      published head (result sequence + commit) from \`status\` or a turn
+      document, or it is refused. This starts the retention clock (default
+      24 h); nothing is deleted here. Until a decision exists, close/GC
+      never removes the worktree, lease, results, or ref.
 
-  agent-hub gc [--dry-run] [--workspace DIR]
-      Safe reconciliation: re-prove every lease, reap provably-orphaned
-      provider groups, pin surviving worktrees, rewrite to orphaned,
-      release leases last, retry worktree removals, prune. Nothing
-      unprovable is touched. Exit 1 when a session needs manual review.
+  agent-hub gc [--workspace DIR]
+      Safe manual reconciliation: re-prove every lease, settle provably-dead
+      orphans (deletes nothing), then collect ONLY workspaces whose exact
+      handoff decision is on record and whose retention window has expired.
+      Never deletes unacknowledged, orphaned, uncertain, or referenced
+      work; every retained workspace names the precondition that failed.
+      Exit 1 when a session needs manual review.
 
   agent-hub probe [provider ...]
       Honest probe documents (found/version/detail). Launches nothing;
@@ -85,19 +93,19 @@ Attach wire (start/resume --attach):
   -> {"action":"close","mode":"graceful|terminate"}
   <- {"type":"session",...} | {"type":"event",event} | {"type":"result",...}
   <- {"type":"error",error} | {"type":"close",...}
-  Closing stdin EOFs the wire: already-received commands (including one
-  written before startup finished) are delivered and given the drain window
-  (--attach-close-drain-ms, default 5000) to settle before the graceful
-  close — EOF never cancels in-flight work that was received. An explicit
-  {"action":"close"} closes immediately (cancelling a running turn is the
-  kernel's honest behavior for that instruction). Stdin is read eagerly,
-  from before provider startup through the whole session, by a single
-  shared reader bounded to 128 commands / 1 MiB of queued input.
+  An explicit {"action":"close"} closes immediately (cancelling a running
+  turn is the kernel's honest behavior for that instruction) and does NOT
+  wait for stdin EOF — safe with an interactive TTY or FIFO writer left
+  open. Closing stdin EOF is never a cancel: intake stops, every already
+  accepted command settles normally, then the session closes. Stdin is read
+  eagerly, from before provider startup through the whole session, by a
+  single shared reader: 128 commands / 1 MiB queued (backpressure beyond
+  that), 256 KiB per line, 1 MiB per chunk, with fail-closed overflow.
 
 Workspace: --workspace names the Git checkout to bind (default: cwd).
-Sessions run in hub-owned isolated worktrees; the caller checkout is never
-used as the provider workspace. A dirty caller checkout is refused unless
---allow-dirty (the base is a commit either way).
+Sessions run in hub-owned isolated worktrees under AGENT_HUB_HOME (default
+~/.local/share/agent-hub; set AGENT_HUB_HOME); the caller checkout is never
+used as the provider workspace.
 `;
 
 export interface CliIo {
@@ -127,7 +135,6 @@ export type CliCommand =
       workspace: string;
       task: string | null;
       attach: boolean;
-      attach_close_drain_ms: number;
       start: StartArgs;
     }
   | {
@@ -136,20 +143,17 @@ export type CliCommand =
       session_id: string;
       task: string | null;
       attach: boolean;
-      attach_close_drain_ms: number;
       start: StartArgs;
     }
   | { kind: "status"; workspace: string; session_id: string | null }
-  | { kind: "handoff"; workspace: string; session_id: string }
-  | { kind: "gc"; workspace: string; dry_run: boolean }
+  | { kind: "handoff"; workspace: string; session_id: string; decision: HandoffDecisionInput }
+  | { kind: "gc"; workspace: string }
   | { kind: "probe"; providers: string[] };
 
 interface StartArgs {
   provider: string;
-  transport?: string;
   permission_policy: PermissionPolicy;
   max_text_bytes?: number;
-  allow_dirty: boolean;
 }
 
 export class UsageError extends Error {}
@@ -179,6 +183,11 @@ function parsePermissionPolicy(raw: string): PermissionPolicy {
   throw new UsageError(`--permission-policy must be deny or interactive, got "${raw}"`);
 }
 
+function parseHandoffDecision(raw: string): HandoffDecision {
+  if (raw === "accepted" || raw === "discarded") return raw;
+  throw new UsageError(`--decision must be accepted or discarded, got "${raw}"`);
+}
+
 function parseStartArgs(
   argv: string[],
   parseFrom: number,
@@ -187,7 +196,6 @@ function parseStartArgs(
   const start: StartArgs = {
     provider: "",
     permission_policy: "deny",
-    allow_dirty: false,
   };
   let index = parseFrom;
   for (;;) {
@@ -196,18 +204,12 @@ function parseStartArgs(
     if (arg === "--provider" || arg === "-p") {
       start.provider = takeValue(arg, argv, index);
       index += 2;
-    } else if (arg === "--transport") {
-      start.transport = takeValue(arg, argv, index);
-      index += 2;
     } else if (arg === "--permission-policy") {
       start.permission_policy = parsePermissionPolicy(takeValue(arg, argv, index));
       index += 2;
     } else if (arg === "--max-output-bytes") {
       start.max_text_bytes = parseMaxBytes(arg, takeValue(arg, argv, index));
       index += 2;
-    } else if (arg === "--allow-dirty") {
-      start.allow_dirty = true;
-      index += 1;
     } else if (arg === "--task" || arg === "-t") {
       break;
     } else if (arg === "--attach") {
@@ -238,7 +240,6 @@ export function parseCliCommand(argv: string[]): CliCommand {
   let workspace = process.cwd();
   let task: string | null = null;
   let attach = false;
-  let attachDrainMs = ATTACH_CLOSE_DRAIN_DEFAULT_MS;
 
   const consumeCommonTail = (index: number): void => {
     for (let i = index; i < rest.length; i += 1) {
@@ -251,9 +252,6 @@ export function parseCliCommand(argv: string[]): CliCommand {
         i += 1;
       } else if (arg === "--attach") {
         attach = true;
-      } else if (arg === "--attach-close-drain-ms") {
-        attachDrainMs = parseMaxBytes(arg, takeValue(arg, rest, i));
-        i += 1;
       } else if (arg.startsWith("-")) {
         throw new UsageError(`unknown flag "${arg}"`);
       } else {
@@ -266,14 +264,7 @@ export function parseCliCommand(argv: string[]): CliCommand {
     case "start": {
       const { start, next } = parseStartArgs(rest, 0, true);
       consumeCommonTail(next);
-      return {
-        kind: "start",
-        workspace,
-        task,
-        attach,
-        attach_close_drain_ms: attachDrainMs,
-        start,
-      };
+      return { kind: "start", workspace, task, attach, start };
     }
     case "resume": {
       const sessionId = rest[0];
@@ -288,9 +279,8 @@ export function parseCliCommand(argv: string[]): CliCommand {
         session_id: sessionId,
         task,
         attach,
-        attach_close_drain_ms: attachDrainMs,
-        // For resume the provider comes from the durable record; a
-        // --provider flag is not meaningful and is not parsed.
+        // For resume the provider and transport come from the durable
+        // record; neither flag is meaningful and neither is parsed.
         start: { ...start, provider: "" },
       };
     }
@@ -316,7 +306,48 @@ export function parseCliCommand(argv: string[]): CliCommand {
       if (sessionId === undefined || sessionId.startsWith("-")) {
         throw new UsageError("handoff requires <session-id>");
       }
+      let decision: HandoffDecision | null = null;
+      let resultSeq: number | null = null;
+      let commit: string | null = null;
+      let consumer: string | null = null;
       for (let i = 1; i < rest.length; i += 1) {
+        const arg = rest[i];
+        if (arg === "--workspace" || arg === "-w") {
+          workspace = takeValue(arg, rest, i);
+          i += 1;
+        } else if (arg === "--decision") {
+          decision = parseHandoffDecision(takeValue(arg, rest, i));
+          i += 1;
+        } else if (arg === "--result-seq") {
+          resultSeq = parseMaxBytes(arg, takeValue(arg, rest, i));
+          i += 1;
+        } else if (arg === "--commit") {
+          commit = takeValue(arg, rest, i);
+          i += 1;
+        } else if (arg === "--consumer") {
+          consumer = takeValue(arg, rest, i);
+          i += 1;
+        } else {
+          throw new UsageError(`unknown argument "${arg}"`);
+        }
+      }
+      if (decision === null) {
+        throw new UsageError("handoff requires --decision accepted|discarded");
+      }
+      if (resultSeq === null || commit === null) {
+        throw new UsageError(
+          "handoff must name the exact result: --result-seq N --commit SHA (see `agent-hub status <session-id>`)",
+        );
+      }
+      return {
+        kind: "handoff",
+        workspace,
+        session_id: sessionId,
+        decision: { decision, result_seq: resultSeq, commit, consumer },
+      };
+    }
+    case "gc": {
+      for (let i = 0; i < rest.length; i += 1) {
         const arg = rest[i];
         if (arg === "--workspace" || arg === "-w") {
           workspace = takeValue(arg, rest, i);
@@ -325,21 +356,7 @@ export function parseCliCommand(argv: string[]): CliCommand {
           throw new UsageError(`unknown argument "${arg}"`);
         }
       }
-      return { kind: "handoff", workspace, session_id: sessionId };
-    }
-    case "gc": {
-      let dryRun = false;
-      for (let i = 0; i < rest.length; i += 1) {
-        const arg = rest[i];
-        if (arg === "--dry-run") dryRun = true;
-        else if (arg === "--workspace" || arg === "-w") {
-          workspace = takeValue(arg, rest, i);
-          i += 1;
-        } else {
-          throw new UsageError(`unknown argument "${arg}"`);
-        }
-      }
-      return { kind: "gc", workspace, dry_run: dryRun };
+      return { kind: "gc", workspace };
     }
     case "probe": {
       const providers = rest.filter((arg) => arg !== "--");
@@ -372,10 +389,12 @@ interface WireIo {
  *   - queued lines dispatch in arrival order, exactly once; commands
  *     received during the handshake run as the session's first commands;
  *   - an explicit `close` action closes immediately (a running turn
- *     settles `cancelled` — the kernel's honest close semantics);
- *   - EOF is NOT a cancel: it stops intake, then already-dispatched
- *     commands get `drainMs` to settle before the graceful close, so a
- *     first prompt written before startup is never killed by the drain.
+ *     settles `cancelled` — the kernel's honest close semantics) and the
+ *     pump is DISPOSED, never awaited to EOF: an open TTY/FIFO writer
+ *     must not hold the process;
+ *   - EOF is NOT a cancel: intake stops, every already-dispatched command
+ *     settles normally (no bounded drain timer), and only then does the
+ *     session close gracefully.
  */
 async function runAttachWire(
   pump: AttachInputPump,
@@ -383,7 +402,6 @@ async function runAttachWire(
   sessionId: string,
   io: CliIo,
   autoTask: string | null,
-  drainMs: number,
 ): Promise<{ sawError: boolean }> {
   const wire: WireIo = {
     out: (document) => io.stdout.write(`${JSON.stringify(document)}\n`),
@@ -399,7 +417,7 @@ async function runAttachWire(
       }
     } catch (error) {
       sawError = true;
-      wire.out({ type: "error", error: asDelegateError(error) });
+      wire.out({ type: "error", error: asHubError(error) });
     }
   })();
 
@@ -409,7 +427,7 @@ async function runAttachWire(
       .then((document) => wire.out({ type: "result", action, ...document }))
       .catch((error: unknown) => {
         sawError = true;
-        wire.out({ type: "error", action, error: asDelegateError(error) });
+        wire.out({ type: "error", action, error: asHubError(error) });
       });
     inFlight.add(tracked);
     void tracked.finally(() => inFlight.delete(tracked));
@@ -420,10 +438,10 @@ async function runAttachWire(
     try {
       const document = await hub.close(sessionId, mode);
       wire.out({ type: "close", ...document });
-      return document.cleanup_errors.length === 0;
+      return document.record.status === "closed";
     } catch (error) {
       sawError = true;
-      wire.out({ type: "error", action: "close", error: asDelegateError(error) });
+      wire.out({ type: "error", action: "close", error: asHubError(error) });
       return false;
     }
   };
@@ -493,12 +511,12 @@ async function runAttachWire(
         default:
           throw new AgentHubError(
             "COMMAND_INVALID",
-            `unknown action "${String(action)}" (prompt, follow_up, steer, cancel, status, permission, close)`,
+            `unknown action "${String(action)}" (unknown action must be one of prompt, follow_up, steer, cancel, status, permission, close)`,
           );
       }
     } catch (error) {
       sawError = true;
-      wire.out({ type: "error", action: String(action), error: asDelegateError(error) });
+      wire.out({ type: "error", action: String(action), error: asHubError(error) });
       return true;
     }
   };
@@ -519,25 +537,21 @@ async function runAttachWire(
     clean = false;
   }
 
-  if (!closeIssued) {
-    // EOF (or input failure): commands already received must not be
-    // cancelled by the close. Give dispatched work the drain window, then
-    // close gracefully whatever the drain proved.
-    if (inFlight.size > 0) {
-      await Promise.race([
-        Promise.allSettled([...inFlight]),
-        new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, drainMs);
-          timer.unref?.();
-        }),
-      ]);
-    }
+  if (closeIssued) {
+    // The host said close: release stdin right now — never await EOF from
+    // a writer (TTY/FIFO) that may stay open forever.
+    pump.dispose();
+  } else {
+    // EOF (or input failure) is not a cancel: every command already accepted
+    // settles normally — no fixed drain window — and only then does the
+    // session close.
+    await Promise.allSettled([...inFlight]);
     clean = (await closeOnce("graceful")) && clean;
   }
   // Whatever the exit route, every dispatched command's document lands.
   await Promise.allSettled([...inFlight]);
   await eventsTail;
-  await pump.settled().catch(() => undefined);
+  pump.dispose();
   return { sawError: sawError || !clean };
 }
 
@@ -570,7 +584,6 @@ async function runStartLike(
     start: StartArgs;
     task: string | null;
     attach: boolean;
-    attach_close_drain_ms: number;
   },
   io: CliIo,
   deps: CliDependencies,
@@ -582,18 +595,14 @@ async function runStartLike(
         ? await supervisor.launch(hub, () =>
             hub.start({
               provider: args.start.provider,
-              transport: args.start.transport,
               permission_policy: args.start.permission_policy,
-              max_text_bytes: args.start.max_text_bytes,
-              allow_dirty: args.start.allow_dirty,
+              ...(args.start.max_text_bytes === undefined ? {} : { max_text_bytes: args.start.max_text_bytes }),
             }),
           )
         : await supervisor.launch(hub, () =>
             hub.resume(args.session_id as string, {
-              transport: args.start.transport,
               permission_policy: args.start.permission_policy,
-              max_text_bytes: args.start.max_text_bytes,
-              allow_dirty: args.start.allow_dirty,
+              ...(args.start.max_text_bytes === undefined ? {} : { max_text_bytes: args.start.max_text_bytes }),
             }),
           );
     const sessionId = started.session_id;
@@ -603,14 +612,7 @@ async function runStartLike(
           `agent-hub: session ${sessionId} attached; speak NDJSON on stdin (see agent-hub --help), Ctrl-D to end.\n`,
         );
         json(io, { type: "session", ...started });
-        const wire = await runAttachWire(
-          pump as AttachInputPump,
-          hub,
-          sessionId,
-          io,
-          args.task,
-          args.attach_close_drain_ms,
-        );
+        const wire = await runAttachWire(pump as AttachInputPump, hub, sessionId, io, args.task);
         return wire.sawError ? 1 : 0;
       }
       if (args.task === null) {
@@ -626,24 +628,26 @@ async function runStartLike(
           ? await hub.prompt(sessionId, args.task)
           : await hub.followUp(sessionId, args.task);
       const closed = await hub.close(sessionId);
-      let handoff: unknown = null;
-      let handoffError: { code: string; message: string } | null = null;
-      try {
-        handoff = await hub.handoff(sessionId);
-      } catch (error) {
-        handoffError = asDelegateError(error);
-      }
       json(io, {
         session: started,
         turn,
         close: closed,
-        handoff,
-        ...(handoffError !== null ? { handoff_error: handoffError } : {}),
+        next:
+          turn.result === null
+            ? {
+                handoff_command: null,
+                note: "this turn published no result identity; decide on the published head shown by `agent-hub status`",
+              }
+            : {
+                handoff_command: `agent-hub handoff ${sessionId} --decision accepted --result-seq ${turn.result.seq} --commit ${turn.result.commit}`,
+                discard_command: `agent-hub handoff ${sessionId} --decision discarded --result-seq ${turn.result.seq} --commit ${turn.result.commit}`,
+              },
       });
-      const cleanClose = closed.cleanup_errors.length === 0;
+      const cleanClose = closed.record.status === "closed";
       const turnOk =
         (turn.outcome === "succeeded" || turn.outcome === "cancelled") &&
-        turn.checkpoint_error === undefined;
+        turn.publish_error === undefined &&
+        turn.result !== null;
       return turnOk && cleanClose ? 0 : 1;
     } finally {
       supervisor.retireIdle(hub);
@@ -658,7 +662,7 @@ async function runStartLike(
 /**
  * Attaches the single eager stdin reader the moment an attached command is
  * recognized — before hub construction, provider launch, or workspace
- * reservation — so input written during the handshake is queued, not raced.
+ * provisioning — so input written during the handshake is queued, not raced.
  */
 function attachPump(
   attach: boolean,
@@ -718,14 +722,18 @@ export async function runCli(
         });
       case "handoff":
         return await withHub(command, deps, async (hub) => {
-          json(io, await hub.handoff(command.session_id));
+          json(io, await hub.handoff(command.session_id, command.decision));
           return 0;
         });
       case "gc":
         return await withHub(command, deps, async (hub) => {
-          const report = await hub.gc({ dry_run: command.dry_run });
-          json(io, report);
-          return report.sessions.some((session) => session.outcome === "manual") ? 1 : 0;
+          const report = await hub.cleanup();
+          json(io, { recovery: report.recovery, cleanup: report.cleanup });
+          const manual =
+            report.recovery.inconsistencies.length > 0
+            || report.recovery.unclaimed.unknown_segments.length > 0
+            || report.cleanup.unclaimed.cleanup_errors.length > 0;
+          return manual ? 1 : 0;
         });
       case "probe": {
         const bridges = deps.hubOptions?.transportFactories ?? productionBridgedFactories();
@@ -746,7 +754,7 @@ export async function runCli(
       }
     }
   } catch (error) {
-    json(io, { error: asDelegateError(error) });
+    json(io, { error: asHubError(error) });
     return 1;
   }
 }

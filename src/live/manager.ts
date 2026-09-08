@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 
 import { deferred, type Deferred } from "../deferred.js";
-import { asDelegateError, AgentHubError } from "../errors.js";
+import { asHubError, AgentHubError } from "../errors.js";
 import { assertCleanUnlessAllowed } from "../execution.js";
 import { resolveRepositoryIdentity } from "../git.js";
 import { acquireRepositoryLock, type RepositoryLock } from "../locks.js";
@@ -567,7 +567,7 @@ export class LiveSessionManager {
         if (removal.cleanup_error) {
           throw new AgentHubError(
             "LIVE_WORKTREE_RETAINED",
-            `${asDelegateError(error).message}; the fresh worktree at ${worktree.path} could not be removed (${removal.cleanup_error.message}) and its lease stays as the audit trail`,
+            `${asHubError(error).message}; the fresh worktree at ${worktree.path} could not be removed (${removal.cleanup_error.message}) and its lease stays as the audit trail`,
           );
         }
       }
@@ -578,7 +578,7 @@ export class LiveSessionManager {
       } catch (releaseError) {
         warnings.push({
           code: "LIVE_ADMIN_LOCK_RELEASE_FAILED",
-          message: `worktree resources were claimed but the live-admin lock was not released cleanly: ${asDelegateError(releaseError).message}`,
+          message: `worktree resources were claimed but the live-admin lock was not released cleanly: ${asHubError(releaseError).message}`,
         });
       }
     }
@@ -710,7 +710,7 @@ export class LiveSessionManager {
     processFacts: LiveProviderProcessFacts | null,
     cause: unknown,
   ): Promise<AgentHubError> {
-    const failure = asDelegateError(cause);
+    const failure = asHubError(cause);
     let stop: LiveStopReport;
     try {
       stop = await transport.stop("terminate");
@@ -759,7 +759,7 @@ export class LiveSessionManager {
         code: "LIVE_ADMIN_LOCK_UNAVAILABLE",
         message:
           `the live-admin lock could not be acquired, so no worktree mutation was attempted: ` +
-          `${asDelegateError(error).message}; the worktree at ${worktree.path} and its lease are retained`,
+          `${asHubError(error).message}; the worktree at ${worktree.path} and its lease are retained`,
       });
       return null;
     });
@@ -777,7 +777,7 @@ export class LiveSessionManager {
       } catch (releaseError) {
         errors.push({
           code: "LIVE_ADMIN_LOCK_RELEASE_FAILED",
-          message: `worktree operations finished but the live-admin lock release failed: ${asDelegateError(releaseError).message}`,
+          message: `worktree operations finished but the live-admin lock release failed: ${asHubError(releaseError).message}`,
         });
       }
     }
@@ -789,7 +789,7 @@ export class LiveSessionManager {
     try {
       await removeLiveLease(this.options.commonDir, lease.live_session_id, lease.token);
     } catch (error) {
-      errors.push(asDelegateError(error));
+      errors.push(asHubError(error));
     }
     return errors;
   }
@@ -1043,7 +1043,7 @@ export class LiveSessionManager {
         try {
           await session.transport.send(command);
         } catch (error) {
-          const failure = asDelegateError(error);
+          const failure = asHubError(error);
           throw new AgentHubError(
             failure.code,
             `live follow-up delivery failed: ${failure.message}`,
@@ -1091,7 +1091,7 @@ export class LiveSessionManager {
       await session.transport.send(command);
     } catch (error) {
       session.turn = null;
-      const failure = asDelegateError(error);
+      const failure = asHubError(error);
       throw new AgentHubError(failure.code, `live command dispatch failed: ${failure.message}`);
     }
     return result.promise;
@@ -1294,7 +1294,7 @@ export class LiveSessionManager {
       }
     } catch (error) {
       if (!session.closing && !session.torn_down) {
-        await this.crashSafely(session, asDelegateError(error));
+        await this.crashSafely(session, asHubError(error));
       }
     } finally {
       session.pump.resolve();
@@ -1534,7 +1534,7 @@ export class LiveSessionManager {
     cause: unknown,
     what: string,
   ): LiveError {
-    const failure = asDelegateError(cause);
+    const failure = asHubError(cause);
     return {
       code: cause instanceof AgentHubError ? failure.code : "LIVE_STATE_WRITE_FAILED",
       message: `${what}: ${failure.message}`,
@@ -1654,7 +1654,7 @@ export class LiveSessionManager {
       session.queue_bytes -= nextItem.bytes;
       void this.dispatchTurn(session, nextItem.command, nextItem.result, fromProviderQueue).catch(
         (error) => {
-          const failure = asDelegateError(error);
+          const failure = asHubError(error);
           nextItem.result.resolve(
             this.failedResult(session, nextItem.command, failure.code, failure.message),
           );
@@ -2016,7 +2016,7 @@ export class LiveSessionManager {
         state: structuredClone(session.state),
         stop,
         checkpoint_taken: false,
-        cleanup_errors: [session.degrade ?? asDelegateError(error)],
+        cleanup_errors: [session.degrade ?? asHubError(error)],
       };
     }
     const cleanupErrors = await this.teardown(session);
@@ -2065,7 +2065,7 @@ export class LiveSessionManager {
       try {
         results.push({ live_session_id: id, ...(await this.close(id)) });
       } catch (error) {
-        const failure = asDelegateError(error);
+        const failure = asHubError(error);
         results.push({
           live_session_id: id,
           state: session ? structuredClone(session.state) : ({} as LiveSessionState),
@@ -2187,7 +2187,7 @@ export class LiveSessionManager {
           try {
             state = await loadLiveState({ commonDir, repositoryCwd, liveSessionId: lease.live_session_id });
           } catch (error) {
-            const failure = asDelegateError(error);
+            const failure = asHubError(error);
             if (failure.code === "LIVE_SESSION_NOT_FOUND") {
               return { kind: "cleaned", detail: "no state record: the launch never completed", worktreePath: lease.worktree_path };
             }
@@ -2201,7 +2201,7 @@ export class LiveSessionManager {
           try {
             await inspectLiveWorktree(repositoryCwd, lease.worktree_path);
           } catch (error) {
-            const failure = asDelegateError(error);
+            const failure = asHubError(error);
             if (failure.code !== "LIVE_WORKTREE_MISSING") {
               return { kind: "manual", detail: failure.message, worktreePath: null };
             }
@@ -2309,7 +2309,7 @@ export class LiveSessionManager {
             live_session_id: lease.live_session_id,
             outcome: action.kind,
             detail:
-              `${action.detail}; worktree cleanup refused: ${asDelegateError(error).message}; ` +
+              `${action.detail}; worktree cleanup refused: ${asHubError(error).message}; ` +
               `lease and worktree retained (never release a lease whose worktree cleanup did not run under the admin lock)`,
           });
           continue;
@@ -2331,14 +2331,14 @@ export class LiveSessionManager {
           try {
             await adminLock.release();
           } catch (lockReleaseError) {
-            detail = `${detail}; live-admin lock release: ${asDelegateError(lockReleaseError).message}`;
+            detail = `${detail}; live-admin lock release: ${asHubError(lockReleaseError).message}`;
           }
         }
       }
       try {
         await removeLiveLease(commonDir, lease.live_session_id, lease.token);
       } catch (error) {
-        detail = `${detail}; lease release reported: ${asDelegateError(error).message}`;
+        detail = `${detail}; lease release reported: ${asHubError(error).message}`;
       }
       if (releaseError) {
         detail = `${detail}; recovery lock release: ${releaseError.message}`;

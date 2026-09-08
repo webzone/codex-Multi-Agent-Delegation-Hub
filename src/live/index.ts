@@ -1,4 +1,4 @@
-import { AgentHubError, asDelegateError } from "../errors.js";
+import { AgentHubError, asHubError } from "../errors.js";
 import { StringDecoder } from "node:string_decoder";
 import { isLiveRecord } from "./provider-registry.js";
 import { createLiveManager } from "./bootstrap.js";
@@ -181,7 +181,7 @@ export function toLiveError(
       provider,
     };
   }
-  const { code, message } = asDelegateError(error);
+  const { code, message } = asHubError(error);
   return liveError(code, message, context.stage, false, context.provider);
 }
 
@@ -452,7 +452,7 @@ export async function runLiveSession(
       try {
         page = manager.eventsAfter(sessionId, cursor);
       } catch (error) {
-        if (asDelegateError(error).code === "LIVE_SESSION_NOT_FOUND") {
+        if (asHubError(error).code === "LIVE_SESSION_NOT_FOUND") {
           // The runner's own `close` just tore the session (and its ring)
           // down. That is this runner's terminal path, not ring expiry:
           // stop the relay quietly — never a spurious error document and
@@ -665,9 +665,9 @@ export async function runLiveSession(
       status: "orphaned",
       stop: { status: "orphaned", exit_code: null, exit_signal: null, waited_ms: 0 },
       checkpoint_taken: false,
-      cleanup_errors: [asDelegateError(error)],
+      cleanup_errors: [asHubError(error)],
     };
-    io.stderr(`agent-hub live: close failed: ${asDelegateError(error).message}`);
+    io.stderr(`agent-hub live: close failed: ${asHubError(error).message}`);
   }
   await Promise.allSettled(pendingResults);
   relayStopped = true;

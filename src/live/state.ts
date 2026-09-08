@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 
-import { asDelegateError, AgentHubError } from "../errors.js";
+import { asHubError, AgentHubError } from "../errors.js";
 import { acquireRepositoryLock, type RepositoryLock } from "../locks.js";
 import { runGit } from "../git.js";
 import { runProcess } from "../process.js";
@@ -250,11 +250,11 @@ export async function withLiveLock<T>(
     try {
       await lock.release();
     } catch (releaseError) {
-      const failure = asDelegateError(error);
+      const failure = asHubError(error);
       throw new AgentHubError(
         failure.code,
         `${failure.message} (and the live session lock could not be released either: ${
-          asDelegateError(releaseError).message
+          asHubError(releaseError).message
         })`,
       );
     }
@@ -265,7 +265,7 @@ export async function withLiveLock<T>(
     await lock.release();
     return { value, releaseError: null };
   } catch (releaseError) {
-    const failure = asDelegateError(releaseError);
+    const failure = asHubError(releaseError);
     return {
       value,
       releaseError: new AgentHubError(
