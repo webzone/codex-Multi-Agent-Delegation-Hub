@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { acquireRepositoryLock } from "../src/locks.js";
 import {
@@ -20,6 +20,7 @@ import type { WorkspaceLeaseRecord } from "../src/workspace/index.js";
 import { WORKSPACE_LEASE_SCHEMA, WORKSPACE_RUNTIME_SCHEMA_VERSION } from "../src/workspace/index.js";
 import type { WorkspaceRecord } from "../src/workspace/records.js";
 import { workspaceRefFor } from "../src/workspace/records.js";
+import * as gitops from "../src/workspace/gitops.js";
 import { sessionRecord, textEvent } from "./kernel-fakes.js";
 import { fakeProbes, makeFixture } from "./workspace-fakes.js";
 import type { Fixture } from "./workspace-fakes.js";
@@ -560,6 +561,44 @@ describe("workspace GC — the only deletion path", () => {
       expect(report.unclaimed.cleanup_errors).toEqual([]);
       expect(report.pruned_repositories).toHaveLength(1);
     } finally {
+      await fx.cleanup();
+    }
+  });
+
+  it("retains custody when tombstone continuation cannot remove the worktree", async () => {
+    const fx = await makeFixture({ retentionMs: RETENTION_MS });
+    const removal = vi.spyOn(gitops, "removeWorktree").mockResolvedValue({
+      removed: false,
+      reason: "simulated removal failure",
+    });
+    try {
+      const { id, head } = await shippedWorkspace(fx);
+      await writeJsonAtomic(tombstonePath(fx.home, id), {
+        schema: "agent-hub-workspace-deleted/v1",
+        session_id: id,
+        hub_home: fx.home,
+        repository_cwd: fx.repo,
+        worktree_path: worktreePath(fx.home, id),
+        head_commit: head,
+        last_result_seq: 1,
+        decision: "accepted",
+        deleted_at: "2026-09-07T00:00:00.000Z",
+      });
+      await runGit(fx.repo, ["update-ref", "-d", workspaceRefFor(id)]);
+
+      fx.clock.advance(RETENTION_MS + 1);
+      const report = await fx.lc.gc();
+
+      expect(removal).toHaveBeenCalled();
+      expect(report.deleted).toEqual([]);
+      expect(report.retained).toEqual([
+        { session_id: id, code: "worktree-remove-failed", detail: "simulated removal failure" },
+      ]);
+      expect(await exists(worktreePath(fx.home, id))).toBe(true);
+      expect(await exists(workspaceRecordPath(fx.home, id))).toBe(true);
+      expect(await exists(leasePath(fx.home, id))).toBe(true);
+    } finally {
+      removal.mockRestore();
       await fx.cleanup();
     }
   });

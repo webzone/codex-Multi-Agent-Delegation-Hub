@@ -1212,7 +1212,11 @@ export class WorkspaceLifecycle {
           && tomb.head_commit === rec0.head_commit
           && (await probeRef(rec0.repository_cwd, rec0.ref)) === null
         ) {
-          await completeDeletion(id, rec0, tomb, pruned);
+          const continuation = await completeDeletion(id, rec0, tomb, pruned);
+          if (!continuation.removed) {
+            retain("worktree-remove-failed", continuation.reason);
+            return;
+          }
           report.deleted.push({
             session_id: id,
             last_result_seq: tomb.last_result_seq,
@@ -1497,7 +1501,7 @@ async function completeDeletion(
   rec: WorkspaceRecord,
   tomb: Tombstone,
   pruned: Set<string>,
-): Promise<void> {
+): Promise<{ removed: true } | { removed: false; reason: string }> {
   if (tomb.hub_home === "") {
     fail("WORKSPACE_PATH_UNSAFE", `tombstone for ${sessionId} names no hub home; nothing may be deleted`);
   }
@@ -1507,11 +1511,13 @@ async function completeDeletion(
   ) {
     fail("WORKSPACE_PATH_UNSAFE", `refusing to complete deletion of non-custodial path ${rec.worktree_path}`);
   }
-  await removeWorktree(rec.repository_cwd, tomb.worktree_path);
+  const removal = await removeWorktree(rec.repository_cwd, tomb.worktree_path);
+  if (!removal.removed) return removal;
   pruned.add(rec.repository_cwd);
   await pruneWorktrees(rec.repository_cwd).catch(() => undefined);
   await removeCustodyTree(tomb.hub_home, sessionId);
   await deleteLeaseFile(tomb.hub_home, sessionId).catch(() => undefined);
+  return { removed: true };
 }
 
 /** Seed SessionRecord for a dead orphan that never committed a runtime mirror. */
