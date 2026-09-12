@@ -21,6 +21,23 @@
 export { AgentHubError } from "./errors.js";
 
 export {
+  CHATGPT_PAIR_PROVIDERS,
+  CHATGPT_PAIR_SCHEMA,
+  assertChatGptPairRepository,
+  chatGptDoctor,
+  inspectChatGptPair,
+  isChatGptPairProvider,
+  pairRepository,
+  readChatGptPair,
+  resolveChatGptStateHome,
+  resolvePairedWorkspace,
+  unpairRepository,
+  type ChatGptPair,
+  type ChatGptPairProvider,
+  type ChatGptPairStatus,
+} from "./chatgpt/index.js";
+
+export {
   AgentHub,
   AgentHubSupervisor,
   processHubSupervisor,
@@ -51,6 +68,7 @@ export {
   type HubCloseDocument,
   type HubOpen,
   type HubStartDocument,
+  type HubWaitDocument,
   type HubStatusDocument,
   type PublishedTurn,
   type RecoveryReport,
@@ -104,6 +122,7 @@ export {
   type CapabilitySupport,
   type CloseResult,
   type Command,
+  type CommandAccepted,
   type CommandKind,
   type CommandOutcome,
   type DurableMirror,

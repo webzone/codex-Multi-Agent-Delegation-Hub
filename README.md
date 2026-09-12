@@ -190,6 +190,7 @@ If `agent_hub` is already listed by `codex mcp list`, do not add it again.
 untouched unless `--repair-mcp` is supplied. Restart Codex if the tools do not
 appear in the current session. The server
 provides `hub_probe`, `hub_start`, `hub_prompt`, `hub_follow_up`, `hub_steer`,
+`hub_submit_prompt`, `hub_submit_follow_up`, `hub_wait`,
 `hub_cancel`, `hub_command_status`, `hub_events`, `hub_permission`,
 `hub_close`, `hub_resume`, `hub_status`, `hub_handoff`, and `hub_gc`.
 
@@ -233,6 +234,55 @@ agent-hub start --provider omp --workspace "$PWD" --attach
 如果探测不到 v2 证据，Agent Hub 会拒绝启动，而不是猜测旧协议。provider
 完成后，先审查精确的 commit/tree，再决定接受或丢弃；最后让
 `agent-hub gc` 或自动 GC 清理已经过 retention 期的废弃 worktree。
+
+### Use from ChatGPT web
+
+ChatGPT 网页端使用“一对一配对”：一个 ChatGPT Project 对应一个 Agent
+Hub pairing 和一个 Git checkout。配对会锁定 workspace，网页端不能通过
+MCP 参数访问其他仓库。
+
+```sh
+agent-hub chatgpt pair --name my-project --workspace "$PWD"
+agent-hub chatgpt status
+agent-hub chatgpt doctor
+```
+
+命令会返回 `pair_id`。配对文件位于
+`~/.local/state/agent-hub/chatgpt/pairs/`（可用
+`AGENT_HUB_CHATGPT_STATE_HOME` 改变），目录权限为 0700、文件权限为
+0600。文件只保存仓库身份和 provider/权限策略，不保存凭证、提示词、
+transcript 或 provider 输出。断开网页连接时只删除配对：
+
+```sh
+agent-hub chatgpt unpair <pair-id>
+```
+
+`unpair` 不会删除 `AGENT_HUB_HOME`、isolated worktree、保留结果或运行中
+session。
+
+把下面的受限 MCP 命令交给你使用的 Secure MCP Tunnel，再将 tunnel 的
+MCP endpoint 添加到 ChatGPT Project 的自定义 MCP app/connector：
+
+```sh
+agent-hub-web-mcp --pair <pair-id>
+```
+
+Agent Hub 不自行开启公网 HTTP 端口；普通 `agent-hub-mcp` 仍可供本机或
+其他 MCP host 使用。`agent-hub-web-mcp` 是独立的、fail-closed 网页端入口，
+缺少或多出 `--pair <pair-id>` 参数时会直接退出，绝不会退回通用 MCP。
+`agent-hub-mcp --pair` 仍可作为显式的兼容调用。每个 Project 都应使用自己的
+pairing，不要跨仓库复用 pair id。网页端 façade 不暴露 `workspace` 参数，
+只使用配对文件中的 canonical checkout。
+
+网页端长任务建议使用异步工具：`hub_submit_prompt` 或
+`hub_submit_follow_up` 在 provider（或有界 hub 队列）接受命令后立即返回
+`command_id`，然后用 `hub_wait` 携带有界 `timeout_ms` 等待。返回
+`pending` 不是失败；使用返回的 `next_cursor` 重新连接并继续读取事件。
+浏览器或 tunnel 短暂断开时，只要同一个 MCP process 仍在运行，就可以继续
+`hub_wait`。MCP process 重启后，旧的 async `command_id` 不保证还能等待；此时
+应先用 `hub_status`、`hub_gc` 和 `hub_resume` 恢复 durable session，再发送新命令。
+浏览器关闭不会自动关闭 Agent Hub session。审查精确的 `result_seq` 和
+`commit` 后再执行 `hub_handoff`。
 
 ### Use from another MCP-capable AI agent
 
@@ -400,9 +450,11 @@ with the count that tripped it.
 
 ## MCP server
 
-`agent-hub-mcp` speaks MCP over stdio and exposes the same surface as tools:
+`agent-hub-mcp` speaks MCP over stdio and exposes the same surface as tools;
+`agent-hub-web-mcp --pair <pair-id>` is the restricted web façade:
 
-`hub_start`, `hub_prompt`, `hub_follow_up`, `hub_steer`, `hub_cancel`,
+`hub_start`, `hub_prompt`, `hub_follow_up`, `hub_submit_prompt`,
+`hub_submit_follow_up`, `hub_wait`, `hub_steer`, `hub_cancel`,
 `hub_command_status`, `hub_permission`, `hub_events`, `hub_close`,
 `hub_resume`, `hub_status`, `hub_handoff`, `hub_gc`, `hub_probe`.
 
@@ -421,8 +473,10 @@ Client configuration (Claude Desktop / any MCP host):
 Every call for a session must name the same `workspace` so it routes back to
 the hub process that owns the session (hubs are cached per Git common dir;
 the 8-session quota is total for the process, not per repository). Sessions
-are in-process state: after the MCP host restarts, `hub_gc` reconciles and
-`hub_resume` adopts the durable records.
+and async command handles are in-process state: a browser disconnect can use
+`hub_wait` again while this process lives, but after the MCP host restarts
+the old command handle is not guaranteed. Run `hub_gc` and `hub_resume` to
+adopt the durable session, then submit a new command.
 
 ## Library
 

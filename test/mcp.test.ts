@@ -23,6 +23,8 @@ interface McpHarness {
   client: Client;
   repository: string;
   factory: HubFakeFactory;
+  hubOptions: AgentHubOptions;
+  supervisor: AgentHubSupervisor;
   cleanup: () => Promise<void>;
 }
 
@@ -45,7 +47,8 @@ async function mcpHarness(
   };
   // Each harness gets its own supervisor so in-flight process quotas never
   // couple unrelated test files to each other.
-  const server = createHubServer({ hubOptions, supervisor: new AgentHubSupervisor() });
+  const supervisor = new AgentHubSupervisor();
+  const server = createHubServer({ hubOptions, supervisor });
   const client = new Client({ name: "hub-test", version: "0.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -53,6 +56,8 @@ async function mcpHarness(
     client,
     repository,
     factory,
+    hubOptions,
+    supervisor,
     cleanup: async () => {
       await client.close();
       await removeDirectory(repository);
@@ -105,6 +110,9 @@ describe("MCP tool surface", () => {
       "hub_start",
       "hub_status",
       "hub_steer",
+      "hub_submit_follow_up",
+      "hub_submit_prompt",
+      "hub_wait",
     ]);
     // No legacy vocabulary anywhere in descriptions/schemas.
     const blob = JSON.stringify(tools.tools);
@@ -165,6 +173,71 @@ describe("MCP tool surface", () => {
       arguments: { workspace: world.repository },
     });
     expect((payload(status)["sessions"] as unknown[])).toHaveLength(1);
+    await world.cleanup();
+  });
+
+  it("accepts an async prompt and returns the settled turn with a cursor", async () => {
+    const world = await mcpHarness();
+    const sessionId = await startSession(world.client, world.repository);
+    const accepted = await world.client.callTool({
+      name: "hub_submit_prompt",
+      arguments: { session_id: sessionId, workspace: world.repository, text: "async task" },
+    });
+    expect(isError(accepted)).toBe(false);
+    const commandId = payload(accepted)["command_id"] as string;
+    expect(commandId).toMatch(/[0-9a-f-]{36}/);
+
+    const waited = await world.client.callTool({
+      name: "hub_wait",
+      arguments: {
+        session_id: sessionId,
+        command_id: commandId,
+        workspace: world.repository,
+        after: 0,
+        timeout_ms: 1_000,
+      },
+    });
+    expect(isError(waited)).toBe(false);
+    expect(payload(waited)["status"]).toBe("completed");
+    expect((payload(waited)["turn"] as { outcome: string }).outcome).toBe("succeeded");
+    expect((payload(waited)["next_cursor"] as number)).toBeGreaterThan(0);
+    await world.client.callTool({
+      name: "hub_close",
+      arguments: { session_id: sessionId, workspace: world.repository },
+    });
+    await world.cleanup();
+  });
+
+  it("does not allow an async command handle to cross sessions", async () => {
+    const world = await mcpHarness();
+    const firstSession = await startSession(world.client, world.repository);
+    const secondSession = await startSession(world.client, world.repository);
+    const accepted = await world.client.callTool({
+      name: "hub_submit_prompt",
+      arguments: { session_id: firstSession, workspace: world.repository, text: "first" },
+    });
+    const commandId = payload(accepted)["command_id"] as string;
+
+    const wrongSession = await world.client.callTool({
+      name: "hub_wait",
+      arguments: {
+        session_id: secondSession,
+        command_id: commandId,
+        workspace: world.repository,
+        timeout_ms: 1_000,
+      },
+    });
+    expect(isError(wrongSession)).toBe(true);
+    expect(JSON.stringify(payload(wrongSession))).toContain("COMMAND_NOT_FOUND");
+
+    await world.client.callTool({
+      name: "hub_close",
+      arguments: { session_id: firstSession, workspace: world.repository },
+    });
+    await world.client.callTool({
+      name: "hub_close",
+      arguments: { session_id: secondSession, workspace: world.repository },
+    });
     await world.cleanup();
   });
 
@@ -307,6 +380,35 @@ describe("MCP tool surface", () => {
     });
     expect(isError(resumed)).toBe(false);
     expect(payload(resumed)["session_id"]).toBe(sessionId);
+    await world.cleanup();
+  });
+
+  it("applies the provider allowlist before a restricted resume", async () => {
+    const world = await mcpHarness({}, { resumeEcho: true });
+    const sessionId = await startSession(world.client, world.repository);
+    await world.client.callTool({
+      name: "hub_close",
+      arguments: { session_id: sessionId, workspace: world.repository },
+    });
+
+    const restrictedServer = createHubServer({
+      hubOptions: world.hubOptions,
+      supervisor: world.supervisor,
+      paired: true,
+      defaultWorkspace: world.repository,
+      allowedProviders: ["pi"],
+      resolveWorkspace: async () => world.repository,
+    });
+    const restrictedClient = new Client({ name: "restricted-test", version: "0.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([restrictedServer.connect(serverTransport), restrictedClient.connect(clientTransport)]);
+    const resumed = await restrictedClient.callTool({
+      name: "hub_resume",
+      arguments: { session_id: sessionId },
+    });
+    expect(isError(resumed)).toBe(true);
+    expect(JSON.stringify(payload(resumed))).toContain("PROVIDER_FORBIDDEN");
+    await restrictedClient.close();
     await world.cleanup();
   });
 

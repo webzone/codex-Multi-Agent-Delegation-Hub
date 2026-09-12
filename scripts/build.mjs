@@ -11,6 +11,6 @@ const exitCode = await new Promise((resolve, reject) => {
 });
 if (exitCode !== 0) process.exit(exitCode);
 
-for (const entrypoint of ["cli.js", "mcp.js"]) {
+for (const entrypoint of ["cli.js", "mcp.js", "web-mcp.js"]) {
   await chmod(new URL(`../dist/${entrypoint}`, import.meta.url), 0o755);
 }

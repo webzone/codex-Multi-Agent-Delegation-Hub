@@ -4,6 +4,7 @@ import { AgentHubError, asHubError } from "../errors.js";
 import { resolveRepositoryIdentity } from "../git.js";
 import type {
   Capabilities,
+  CommandAccepted,
   PermissionDecision,
   PermissionPolicy,
   ProviderFactory,
@@ -170,6 +171,22 @@ export interface HubCleanupDocument {
   cleanup: GcReport;
 }
 
+export interface HubWaitDocument {
+  session_id: string;
+  command_id: string;
+  status: "pending" | "completed";
+  events: unknown[];
+  next_cursor: number;
+  cursor_status: "ok" | "expired";
+  earliest_replayable_cursor?: number;
+  turn?: TurnDocument;
+}
+
+interface AsyncCommand {
+  sessionId: string;
+  completion: Promise<TurnDocument>;
+}
+
 export class AgentHub {
   readonly kernel: InteractionKernel;
   readonly lifecycle: WorkspaceLifecycle;
@@ -180,6 +197,7 @@ export class AgentHub {
   private readonly bridges: readonly BridgedTransportFactory[];
   private readonly processQuota: number;
   private readonly pendingCommands = new Map<string, Set<Promise<unknown>>>();
+  private readonly asyncCommands = new Map<string, AsyncCommand>();
   private readonly gcCoordinator: GcCoordinator | null;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
   private lastCleanupReport: HubCleanupDocument | null = null;
@@ -424,8 +442,84 @@ export class AgentHub {
     return this.trackCommand(sessionId, async () => this.publish(await this.kernel.prompt(sessionId, text)));
   }
 
+  async submitPrompt(sessionId: string, text: string): Promise<CommandAccepted> {
+    const accepted = await this.kernel.submitPrompt(sessionId, text);
+    this.trackAsyncCommand(sessionId, accepted.command_id);
+    return accepted;
+  }
+
   async followUp(sessionId: string, text: string): Promise<TurnDocument> {
     return this.trackCommand(sessionId, async () => this.publish(await this.kernel.followUp(sessionId, text)));
+  }
+
+  async submitFollowUp(sessionId: string, text: string): Promise<CommandAccepted> {
+    const accepted = await this.kernel.submitFollowUp(sessionId, text);
+    this.trackAsyncCommand(sessionId, accepted.command_id);
+    return accepted;
+  }
+
+  private trackAsyncCommand(sessionId: string, commandId: string): void {
+    const completion = this.trackCommand(sessionId, async () =>
+      this.publish(await this.kernel.waitForCommand(sessionId, commandId)),
+    );
+    const command: AsyncCommand = { sessionId, completion };
+    this.asyncCommands.set(commandId, command);
+    const cleanup = (): void => {
+      // Keep a completed command available briefly for a reconnecting web
+      // client, without allowing an unbounded long-running hub to leak them.
+      const timer = setTimeout(() => {
+        if (this.asyncCommands.get(commandId) === command) this.asyncCommands.delete(commandId);
+      }, 10 * 60 * 1000);
+      timer.unref?.();
+    };
+    void completion.then(cleanup, cleanup);
+  }
+
+  async wait(
+    sessionId: string,
+    commandId: string,
+    options: { after?: number; timeoutMs?: number } = {},
+  ): Promise<HubWaitDocument> {
+    const command = this.asyncCommands.get(commandId);
+    if (command === undefined || command.sessionId !== sessionId) {
+      throw new AgentHubError(
+        "COMMAND_NOT_FOUND",
+        `no async command "${commandId}" is known for session "${sessionId}"`,
+      );
+    }
+    const completion = command.completion;
+    const timeoutMs = Math.max(0, Math.min(options.timeoutMs ?? 0, 120_000));
+    let turn: TurnDocument | undefined;
+    let status: HubWaitDocument["status"] = "pending";
+    const completed = completion.then((document) => {
+      turn = document;
+      status = "completed";
+    });
+    if (timeoutMs === 0) {
+      await Promise.race([completed, Promise.resolve()]);
+    } else {
+      await Promise.race([
+        completed,
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    }
+    const replay = this.eventsAfter(sessionId, options.after ?? 0);
+    const document: HubWaitDocument = {
+      session_id: sessionId,
+      command_id: commandId,
+      status,
+      events: replay.status === "ok" ? replay.events : [],
+      next_cursor: replay.status === "ok" ? replay.next_cursor : replay.earliest_replayable_cursor,
+      cursor_status: replay.status,
+      ...(replay.status === "expired"
+        ? { earliest_replayable_cursor: replay.earliest_replayable_cursor }
+        : {}),
+      ...(turn === undefined ? {} : { turn }),
+    };
+    return document;
   }
 
   async steer(sessionId: string, text: string): Promise<TurnDocument> {

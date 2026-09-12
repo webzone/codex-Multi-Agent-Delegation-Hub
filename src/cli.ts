@@ -4,6 +4,13 @@ import { fileURLToPath } from "node:url";
 
 import { AgentHubError, asHubError } from "./errors.js";
 import {
+  chatGptDoctor,
+  inspectChatGptPair,
+  pairRepository,
+  readChatGptPair,
+  unpairRepository,
+} from "./chatgpt/pairing.js";
+import {
   codexStatus,
   installCodex,
   uninstallCodex,
@@ -64,6 +71,18 @@ Usage:
   agent-hub codex uninstall [--codex-home DIR]
       Remove only integration files still owned by Agent Hub; durable session
       data under AGENT_HUB_HOME is never removed.
+
+  agent-hub chatgpt pair --name NAME [--workspace DIR] [--state-home DIR]
+      Bind one ChatGPT Project to one Git checkout and write a restricted
+      pairing record. The record contains repository identity and policy, not
+      credentials, task text, or transcripts.
+  agent-hub chatgpt status [PAIR-ID] [--state-home DIR]
+      Inspect one pairing, or all pairings when no id is supplied.
+  agent-hub chatgpt unpair <PAIR-ID> [--state-home DIR]
+      Remove only the pairing record; Agent Hub sessions and retained results
+      remain under AGENT_HUB_HOME.
+  agent-hub chatgpt doctor [--state-home DIR]
+      Check every pairing and its repository identity.
 
   agent-hub start --provider <p> [--task TEXT] [--workspace DIR]
                   [--permission-policy deny|interactive] [--max-output-bytes N]
@@ -177,6 +196,14 @@ export type CliCommand =
       task: string | null;
       attach: boolean;
       start: StartArgs;
+    }
+  | {
+      kind: "chatgpt";
+      action: "pair" | "status" | "unpair" | "doctor";
+      workspace?: string;
+      name?: string;
+      pair_id?: string;
+      state_home?: string;
     }
   | { kind: "status"; workspace: string; session_id: string | null }
   | { kind: "handoff"; workspace: string; session_id: string; decision: HandoffDecisionInput }
@@ -336,6 +363,61 @@ export function parseCliCommand(argv: string[]): CliCommand {
         ...(codexHome === undefined ? {} : { codex_home: codexHome }),
         force_skill: forceSkill,
         repair_mcp: repairMcp,
+      };
+    }
+    case "chatgpt": {
+      const action = rest[0];
+      if (action !== "pair" && action !== "status" && action !== "unpair" && action !== "doctor") {
+        throw new UsageError("chatgpt requires pair, status, unpair, or doctor");
+      }
+      let chatgptWorkspace: string | undefined;
+      let name: string | undefined;
+      let pairId: string | undefined;
+      let stateHome: string | undefined;
+      let positional: string | undefined;
+      for (let i = 1; i < rest.length; i += 1) {
+        const arg = rest[i];
+        if (arg === "--workspace" || arg === "-w") {
+          chatgptWorkspace = takeValue(arg, rest, i);
+          i += 1;
+        } else if (arg === "--name") {
+          name = takeValue(arg, rest, i);
+          i += 1;
+        } else if (arg === "--state-home") {
+          stateHome = takeValue(arg, rest, i);
+          i += 1;
+        } else if (arg.startsWith("-")) {
+          throw new UsageError(`unknown argument "${arg}"`);
+        } else if (positional === undefined) {
+          positional = arg;
+        } else {
+          throw new UsageError(`unexpected argument "${arg}"`);
+        }
+      }
+      if (action === "pair") {
+        if (name === undefined) throw new UsageError("chatgpt pair requires --name NAME");
+        if (positional !== undefined) throw new UsageError("chatgpt pair does not accept a positional argument");
+        return {
+          kind: "chatgpt",
+          action,
+          workspace: chatgptWorkspace ?? process.cwd(),
+          name,
+          ...(stateHome === undefined ? {} : { state_home: stateHome }),
+        };
+      }
+      if (action === "unpair" && positional === undefined) {
+        throw new UsageError("chatgpt unpair requires <pair-id>");
+      }
+      if (action === "status" && positional !== undefined) pairId = positional;
+      if (action === "unpair") pairId = positional;
+      if (action === "doctor" && positional !== undefined) {
+        throw new UsageError("chatgpt doctor does not accept a positional argument");
+      }
+      return {
+        kind: "chatgpt",
+        action,
+        ...(pairId === undefined ? {} : { pair_id: pairId }),
+        ...(stateHome === undefined ? {} : { state_home: stateHome }),
       };
     }
     case "start": {
@@ -788,6 +870,27 @@ export async function runCli(
               ? await codexStatus(options)
               : await uninstallCodex(options);
         json(io, result);
+        return 0;
+      }
+      case "chatgpt": {
+        if (command.action === "pair") {
+          json(io, await pairRepository({ workspace: command.workspace as string, name: command.name as string, ...(command.state_home === undefined ? {} : { stateHome: command.state_home }) }));
+          return 0;
+        }
+        if (command.action === "status") {
+          if (command.pair_id === undefined) {
+            json(io, await chatGptDoctor(command.state_home));
+          } else {
+            json(io, await inspectChatGptPair(await readChatGptPair(command.pair_id, command.state_home)));
+          }
+          return 0;
+        }
+        if (command.action === "unpair") {
+          await unpairRepository(command.pair_id as string, command.state_home);
+          json(io, { action: "unpair", pair_id: command.pair_id });
+          return 0;
+        }
+        json(io, await chatGptDoctor(command.state_home));
         return 0;
       }
       case "start":

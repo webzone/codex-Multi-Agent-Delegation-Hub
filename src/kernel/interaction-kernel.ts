@@ -13,6 +13,7 @@ import {
   type CancelCommand,
   type Capabilities,
   type Command,
+  type CommandAccepted,
   type CommandKind,
   type FollowUpCommand,
   type KernelError,
@@ -217,6 +218,7 @@ interface LiveSession {
 export class InteractionKernel {
   private readonly options: ResolvedOptions;
   private readonly sessions = new Map<SessionId, LiveSession>();
+  private readonly commandResults = new Map<string, Promise<TurnResult>>();
   private readonly clock: () => Date;
 
   constructor(options: KernelOptions) {
@@ -719,6 +721,42 @@ export class InteractionKernel {
     };
   }
 
+  private rememberCommand(commandId: string, result: Promise<TurnResult>): void {
+    this.commandResults.set(commandId, result);
+    // A rejected dispatch is still observable through waitForCommand, but it
+    // must not become an unhandled rejection when the synchronous API is the
+    // caller. Retain command promises for the lifetime of the kernel; the
+    // bounded follow-up queue and one-prompt rule keep pending state finite;
+    // settled command identities are retained only for a reconnect window.
+    void result.catch(() => undefined);
+    const timer = setTimeout(() => {
+      if (this.commandResults.get(commandId) === result) this.commandResults.delete(commandId);
+    }, 10 * 60 * 1000);
+    timer.unref?.();
+  }
+
+  private accepted(command: PromptCommand | FollowUpCommand): CommandAccepted {
+    return {
+      session_id: command.session_id,
+      command_id: command.command_id,
+      kind: command.kind,
+      accepted_at: this.now().toISOString(),
+    };
+  }
+
+  private requireSubmitCapability(
+    session: LiveSession,
+    kind: "prompt" | "follow_up",
+  ): void {
+    const claim = session.record.capabilities[kind];
+    if (claim.support === "unsupported" || claim.support === "signal") {
+      throw new AgentHubError(
+        "CAPABILITY_UNSUPPORTED",
+        `the launch capability snapshot for session "${session.id}" marks "${kind}" undeliverable; the command was refused pre-dispatch`,
+      );
+    }
+  }
+
   /** The initial task, exactly once, while the session sits idle. */
   async prompt(id: SessionId, text: string): Promise<TurnResult> {
     const session = this.must(id);
@@ -746,6 +784,33 @@ export class InteractionKernel {
     });
   }
 
+  /** Accept the initial task and return before the turn settles. */
+  async submitPrompt(id: SessionId, text: string): Promise<CommandAccepted> {
+    const session = this.must(id);
+    this.requireSubmitCapability(session, "prompt");
+    if (session.prompt_accepted) {
+      throw new AgentHubError(
+        "PROMPT_ALREADY_ACCEPTED",
+        `session "${id}" accepted its one prompt already; use followUp`,
+      );
+    }
+    if (session.status !== "idle" || session.turn !== null) {
+      throw new AgentHubError(
+        "SESSION_NOT_IDLE",
+        `session "${id}" is ${session.status}; the prompt is accepted only while idle before the first turn`,
+      );
+    }
+    const command: PromptCommand = { kind: "prompt", text, ...this.issued(id) };
+    session.prompt_accepted = true;
+    try {
+      const accepted = await this.dispatchTurnAccepted(session, command);
+      return accepted.accepted;
+    } catch (error) {
+      session.prompt_accepted = false;
+      throw error;
+    }
+  }
+
   /** Next-turn input: delivered now when idle, queued while a turn runs. */
   async followUp(id: SessionId, text: string): Promise<TurnResult> {
     const session = this.must(id);
@@ -753,6 +818,22 @@ export class InteractionKernel {
     if (claim.support === "unsupported" || claim.support === "signal") {
       return this.refused(session, "follow_up");
     }
+    const accepted = await this.acceptFollowUp(id, text);
+    return accepted.result;
+  }
+
+  /** Accept a follow-up and return before its turn settles. */
+  async submitFollowUp(id: SessionId, text: string): Promise<CommandAccepted> {
+    return (await this.acceptFollowUp(id, text)).accepted;
+  }
+
+  private async acceptFollowUp(
+    id: SessionId,
+    text: string,
+  ): Promise<{ accepted: CommandAccepted; result: Promise<TurnResult> }> {
+    const session = this.must(id);
+    this.requireSubmitCapability(session, "follow_up");
+    const claim = session.record.capabilities.follow_up;
     const bytes = Buffer.byteLength(text, "utf8");
     if (bytes > this.options.queueMaxMessageBytes) {
       throw new AgentHubError(
@@ -785,11 +866,13 @@ export class InteractionKernel {
         await this.deliver(session, command, "follow-up");
         session.provider_queued.push({ command, bytes, result });
         session.queue_bytes += bytes;
-        return result.promise;
+        this.rememberCommand(command.command_id, result.promise);
+        return { accepted: this.accepted(command), result: result.promise };
       }
       session.queue.push({ command, bytes, result });
       session.queue_bytes += bytes;
-      return result.promise;
+      this.rememberCommand(command.command_id, result.promise);
+      return { accepted: this.accepted(command), result: result.promise };
     }
 
     if (session.status !== "idle") {
@@ -798,7 +881,28 @@ export class InteractionKernel {
         `session "${id}" is ${session.status}; follow-ups need idle or running`,
       );
     }
-    return this.dispatchTurn(session, command, result);
+    const accepted = await this.dispatchTurnAccepted(session, command, result);
+    return { accepted: accepted.accepted, result: accepted.result };
+  }
+
+  /** Await a previously accepted async command without exposing its promise. */
+  async waitForCommand(id: SessionId, commandId: string): Promise<TurnResult> {
+    const session = this.sessions.get(id);
+    if (session === undefined) {
+      throw new AgentHubError("SESSION_NOT_FOUND", `no session "${id}" in this kernel process`);
+    }
+    const result = this.commandResults.get(commandId);
+    if (result === undefined) {
+      throw new AgentHubError(
+        "COMMAND_NOT_FOUND",
+        `no async command "${commandId}" is known for session "${id}"`,
+      );
+    }
+    const turn = await result;
+    if (turn.session_id !== session.id) {
+      throw new AgentHubError("COMMAND_NOT_FOUND", `command "${commandId}" belongs to another session`);
+    }
+    return turn;
   }
 
   /** Mid-turn guidance; native or hub-queued claims only, turn in flight only. */
@@ -1249,6 +1353,16 @@ export class InteractionKernel {
     result: Deferred<TurnResult> = deferred<TurnResult>(),
     alreadyDelivered = false,
   ): Promise<TurnResult> {
+    const accepted = await this.dispatchTurnAccepted(session, command, result, alreadyDelivered);
+    return accepted.result;
+  }
+
+  private async dispatchTurnAccepted(
+    session: LiveSession,
+    command: PromptCommand | FollowUpCommand,
+    result: Deferred<TurnResult> = deferred<TurnResult>(),
+    alreadyDelivered = false,
+  ): Promise<{ accepted: CommandAccepted; result: Promise<TurnResult> }> {
     session.turn = {
       command,
       started_at: this.now().toISOString(),
@@ -1260,17 +1374,19 @@ export class InteractionKernel {
       streams: new Map(),
       delivered: alreadyDelivered,
     };
+    this.rememberCommand(command.command_id, result.promise);
     if (alreadyDelivered) {
-      return result.promise;
+      return { accepted: this.accepted(command), result: result.promise };
     }
     try {
       await session.transport.send(command);
     } catch (error) {
       session.turn = null;
       const failure = asHubError(error);
+      result.reject(new AgentHubError(failure.code, `command dispatch failed: ${failure.message}`));
       throw new AgentHubError(failure.code, `command dispatch failed: ${failure.message}`);
     }
-    return result.promise;
+    return { accepted: this.accepted(command), result: result.promise };
   }
 
   private settleTurn(session: LiveSession): Promise<TurnResult> {

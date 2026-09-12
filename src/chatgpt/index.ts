@@ -1,0 +1,16 @@
+export {
+  CHATGPT_PAIR_PROVIDERS,
+  CHATGPT_PAIR_SCHEMA,
+  assertChatGptPairRepository,
+  chatGptDoctor,
+  inspectChatGptPair,
+  isChatGptPairProvider,
+  pairRepository,
+  readChatGptPair,
+  resolveChatGptStateHome,
+  resolvePairedWorkspace,
+  unpairRepository,
+  type ChatGptPair,
+  type ChatGptPairProvider,
+  type ChatGptPairStatus,
+} from "./pairing.js";

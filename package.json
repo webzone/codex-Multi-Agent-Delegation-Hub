@@ -30,7 +30,8 @@
   ],
   "bin": {
     "agent-hub": "./dist/cli.js",
-    "agent-hub-mcp": "./dist/mcp.js"
+    "agent-hub-mcp": "./dist/mcp.js",
+    "agent-hub-web-mcp": "./dist/web-mcp.js"
   },
   "scripts": {
     "build": "node scripts/build.mjs",

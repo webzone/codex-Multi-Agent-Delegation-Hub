@@ -52,6 +52,7 @@ export {
   type CapabilityName,
   type CapabilitySupport,
   type Command,
+  type CommandAccepted,
   type CommandKind,
   type CommandOutcome,
   type ErrorStage,

@@ -142,11 +142,54 @@ with `gc` or close sessions; do not kill locks or leases by hand unless
 ## MCP clients
 
 The same surface exists as MCP tools (`agent-hub-mcp`): `hub_start`,
-`hub_prompt`, `hub_follow_up`, `hub_steer`, `hub_cancel`,
+`hub_prompt`, `hub_follow_up`, `hub_submit_prompt`, `hub_submit_follow_up`,
+`hub_wait`, `hub_steer`, `hub_cancel`,
 `hub_command_status`, `hub_permission`, `hub_events`, `hub_close`,
 `hub_resume`, `hub_status`, `hub_handoff`, `hub_gc`, `hub_probe`. Keep every
-call for one session on the same server process and the same `workspace`; after
-a host restart, `hub_gc` then `hub_resume` adopt.
+call for one session on the same server process and the same `workspace`. A
+browser/tunnel disconnect can continue while the same MCP process remains
+alive. After an MCP host restart, the old async command handle is not
+guaranteed; use `hub_status`, `hub_gc`, and `hub_resume`, then submit a new
+command.
 Consume events by cursor (`hub_events`): seqs are gapless, `next_cursor` is
 your resume point, and an `expired` verdict names the oldest replayable
 cursor — resynchronize from durable state, never from a guess.
+
+## ChatGPT web Project pairing
+
+为 ChatGPT 网页端创建一对一配对：
+
+```sh
+agent-hub chatgpt pair --name my-project --workspace "$PWD"
+agent-hub chatgpt status
+agent-hub chatgpt doctor
+```
+
+把 `pair_id` 对应的受限 MCP 命令交给 Secure MCP Tunnel，并在 ChatGPT
+Project 的自定义 MCP app/connector 中使用 tunnel endpoint：
+
+```sh
+agent-hub-web-mcp --pair <pair-id>
+```
+
+`agent-hub-web-mcp` 是独立的 fail-closed 入口；缺少或多出
+`--pair <pair-id>` 参数时退出并报错，绝不会退回通用 MCP。受限 façade
+只接受配对的 Git checkout，tool schema 不接受调用方提供的 `workspace`，
+provider 只允许 `omp`、`agy`、`pi`、`hermes`，并在每次请求时重新验证
+pairing 和仓库身份。普通 `agent-hub-mcp` 仍用于本机 MCP host；
+`agent-hub-mcp --pair` 是同一受限入口的兼容调用。配对文件权限为 0600，且不含凭证、
+提示词、transcript 或 provider 输出。
+
+网页端长任务使用 `hub_submit_prompt` / `hub_submit_follow_up` 取得
+`command_id`，再用有界 `hub_wait` 获取事件、状态和最终 turn。收到
+`pending` 时继续用 `next_cursor` 重连；这只保证同一 MCP process 存活期间的
+浏览器/tunnel 断线续接。MCP process 重启后，旧 command handle 不保证可用，
+应通过 `hub_status`/`hub_gc`/`hub_resume` 恢复 durable session 后重新提交。
+审查精确结果后再 `hub_handoff`。只断开网页配对而不动 session 时：
+
+```sh
+agent-hub chatgpt unpair <pair-id>
+```
+
+这不会删除 Agent Hub 的 durable session、结果或 worktree；清理由正常的
+handoff 和 `agent-hub gc` 规则负责。

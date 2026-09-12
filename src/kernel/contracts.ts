@@ -575,6 +575,14 @@ export interface TurnResult {
   error: KernelError | null;
 }
 
+/** Immediate acknowledgement for a command submitted through the async API. */
+export interface CommandAccepted {
+  session_id: SessionId;
+  command_id: string;
+  kind: "prompt" | "follow_up";
+  accepted_at: string;
+}
+
 // ---------------------------------------------------------------------------
 // The durable session record (Git-free by construction)
 // ---------------------------------------------------------------------------

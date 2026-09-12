@@ -20,6 +20,7 @@ describe("distribution contract", () => {
     expect(packageJson.bin).toEqual({
       "agent-hub": "./dist/cli.js",
       "agent-hub-mcp": "./dist/mcp.js",
+      "agent-hub-web-mcp": "./dist/web-mcp.js",
     });
     await expect(access(new URL("skills/agent-hub/SKILL.md", root))).resolves.toBeUndefined();
     expect(await file("skills/agent-hub/SKILL.md")).toContain("name: agent-hub");

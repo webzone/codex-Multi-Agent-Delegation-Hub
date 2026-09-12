@@ -38,6 +38,7 @@ describe("package surface", () => {
     expect(pkg.bin).toEqual({
       "agent-hub": "./dist/cli.js",
       "agent-hub-mcp": "./dist/mcp.js",
+      "agent-hub-web-mcp": "./dist/web-mcp.js",
     });
     expect(pkg.scripts.hub).toBe("tsx src/cli.ts");
     expect(pkg.scripts.mcp).toBe("tsx src/mcp.ts");

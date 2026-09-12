@@ -19,6 +19,7 @@ export {
   type HubCleanupDocument,
   type HubCloseDocument,
   type HubStartDocument,
+  type HubWaitDocument,
   type HubStatusDocument,
   type ResumeOptions,
   type StartOptions,
